@@ -255,6 +255,12 @@ static inline void print_debug(const char *format, ...)
 #endif
 }
 
+struct end2end_rdma_lat {
+	u64 wr_id_;
+	u64 start_time_us_;
+	u64 end_time_us_;
+};
+
 extern u64 rmda_ops_count;
 extern u64 cq_notify_count;
 extern u64 cq_get_count;

@@ -30,6 +30,9 @@ module_param_named(rmsize, remote_mem_size, int, 0644);
 int __init rswap_cpu_init(void)
 {
 	int ret = 0;
+
+	tracing_on();
+
 	ret = rswap_client_init(server_ip, server_port, remote_mem_size);
 	if (unlikely(ret)) {
 		printk(KERN_ERR "%s, rswap_rdma_client_init failed.\n",
@@ -70,6 +73,8 @@ void __exit rswap_cpu_exit(void)
 
 	rswap_deregister_frontswap();
 	printk(" Remove CPU Server module DONE.\n");
+
+	tracing_off();
 	return;
 }
 

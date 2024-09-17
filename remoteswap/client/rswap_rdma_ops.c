@@ -1,7 +1,22 @@
+#include <linux/ktime.h>
+#include <linux/mutex.h>
+#include <linux/types.h>
+#include <linux/tracepoint.h>
+
 #include <linux/swap_stats.h>
 #include <linux/hermit.h>
 
 #include "rswap_rdma.h"
+
+struct end2end_rdma_lat** qp_store_lat;
+struct end2end_rdma_lat** qp_sync_load_lat;
+struct end2end_rdma_lat** qp_async_load_lat;
+
+struct mutex* qp_store_mutex;
+struct mutex* qp_sync_load_mutex;
+struct mutex* qp_async_load_mutex;
+
+u64 list_size;
 
 /**
  * Wait for the finish of ALL the outstanding rdma_request
@@ -60,6 +75,156 @@ void drain_all_rdma_queues(int target_mem_server)
 	}
 }
 
+int _get_free_idx(struct end2end_rdma_lat* rdma_lat_list)
+{
+	int idx = 0;
+
+	for (idx = 0; idx < (RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH); idx += 1) {
+		if (rdma_lat_list[idx].wr_id_ == 0) {
+			return idx;
+		}
+	}
+	return -1;
+}
+
+// 0: success
+// -1: failed
+int _init_lat_entry(struct end2end_rdma_lat* rdma_lat_list, struct mutex* mtx, u64 wr_id)
+{
+	int nr_try_times = 0;
+	int free_idx = -1;
+	int success = -1;
+	u64 cur_time_us;
+	ktime_t kt;
+
+	while(1) {
+		if (nr_try_times == 10) {
+			printk("WARN, nr_try_times == 10\n");
+		}
+
+		free_idx = _get_free_idx(rdma_lat_list);
+		if (free_idx == -1 || free_idx >= (RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH)) {
+			printk("(FREE_IDX BUG!! free_idx == -1\n");
+			return -1;
+		}
+
+		mutex_lock(mtx);
+		if (rdma_lat_list[free_idx].wr_id_ == 0) {
+			kt = ktime_get();
+			cur_time_us = ktime_to_us(kt);
+			rdma_lat_list[free_idx].wr_id_ = wr_id;
+			rdma_lat_list[free_idx].start_time_us_ = cur_time_us;
+
+			success = 0;
+		}
+		mutex_unlock(mtx);
+
+		if (success == 0) {
+			break;
+		}
+		nr_try_times += 1;
+	}
+	return success;
+}
+
+void record_start_time(u64 wr_id, int cpu, enum rdma_queue_type type) 
+{
+	if (cpu >= list_size) {
+		printk("BUG!! cpu > list_size, %d - %lld\n", cpu, list_size);
+		return;
+	}
+
+	switch (type) {
+		case QP_STORE:
+			_init_lat_entry(qp_store_lat[cpu], &qp_store_mutex[cpu], wr_id);
+			break;
+
+		case QP_LOAD_SYNC:
+			_init_lat_entry(qp_sync_load_lat[cpu], &qp_sync_load_mutex[cpu], wr_id);
+			break;
+
+		case QP_LOAD_ASYNC:
+			_init_lat_entry(qp_async_load_lat[cpu], &qp_async_load_mutex[cpu], wr_id);
+			break;
+
+		case NUM_QP_TYPE:
+			printk("(NUM_QP_TYPE)BUG!!\n");
+			break;
+	}
+}
+
+int _get_target_idx(struct end2end_rdma_lat* rdma_lat_list, u64 wr_id)
+{
+	int idx = 0;
+
+	for (idx = 0; idx < (RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH); idx += 1) {
+		if (rdma_lat_list[idx].wr_id_ == wr_id) {
+			return idx;
+		}
+	}
+	return -1;
+}
+
+int _caculate_lat(struct end2end_rdma_lat* rdma_lat_list, struct mutex* mtx, u64 wr_id, enum rdma_queue_type type)
+{
+	int success = -1;
+	int target_idx = -1;
+	u64 cur_time_us;
+	ktime_t kt;
+
+	target_idx = _get_target_idx(rdma_lat_list, wr_id);
+	if (target_idx == -1) {
+		printk("TARGET_IDX BUG!! target_idx == -1\n");
+		return -1;
+	}
+	if (rdma_lat_list[target_idx].wr_id_ != wr_id) {
+		printk("TARGET WR_ID BUG!! wr_id not match\n");
+		return -1;
+	}
+	if (rdma_lat_list[target_idx].start_time_us_ == 0) {
+		printk("START_TIME_US BUG!! start_time_us == 0\n");
+		return -1;
+	}
+
+	kt = ktime_get();
+	cur_time_us = ktime_to_us(kt);
+	trace_printk("type: %d lat: %llu\n", type, cur_time_us - rdma_lat_list[target_idx].start_time_us_);
+
+	mutex_lock(mtx);
+	rdma_lat_list[target_idx].wr_id_ = 0;
+	rdma_lat_list[target_idx].start_time_us_ = 0;
+	rdma_lat_list[target_idx].end_time_us_ = 0;
+	mutex_unlock(mtx);
+
+	return success;
+}
+
+void dump_lat(u64 wr_id, int cpu, enum rdma_queue_type type)
+{
+	if (cpu >= list_size) {
+		printk("BUG!! cpu > list_size, %d - %lld\n", cpu, list_size);
+		return;
+	}
+
+	switch (type) {
+		case QP_STORE:
+			_caculate_lat(qp_store_lat[cpu], &qp_store_mutex[cpu], wr_id, type);
+			break;
+
+		case QP_LOAD_SYNC:
+			_caculate_lat(qp_sync_load_lat[cpu], &qp_sync_load_mutex[cpu], wr_id, type);
+			break;
+
+		case QP_LOAD_ASYNC:
+			_caculate_lat(qp_async_load_lat[cpu], &qp_async_load_mutex[cpu], wr_id, type);
+			break;
+
+		case NUM_QP_TYPE:
+			printk("(NUM_QP_TYPE)BUG!!\n");
+			break;
+	}
+}
+
 /**
  * The callback function for rdma requests.
  */
@@ -85,18 +250,26 @@ void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 	}
 	get_rdma_queue_cpu_type(&rdma_session_global, rdma_queue, &cpu, &type);
 	if (type == QP_STORE) { // STORE requests
+		dump_lat(wc->wr_id, cpu, type);
+
 		// set_page_writeback(rdma_req->page);
 		unlock_page(rdma_req->page);
 		// end_page_writeback(rdma_req->page);
 	} else if (type == QP_LOAD_SYNC) { // LOAD SYNC requests
+		dump_lat(wc->wr_id, cpu, type);
+
 		// originally called in swap_readpage(). Moved here for asynchrony.
 		SetPageUptodate(rdma_req->page);
 		if (unlock)
 			unlock_page(rdma_req->page);
 	} else if (type == QP_LOAD_ASYNC) { // LOAD ASYNC requests
+		dump_lat(wc->wr_id, cpu, type);
+
 		// originally called in swap_readpage(). Moved here for asynchrony.
 		SetPageUptodate(rdma_req->page);
 		unlock_page(rdma_req->page);
+	} else {
+		printk("Err cq handle cpu: %d type: %d\n", cpu, type);
 	}
 
 	atomic_dec(&rdma_queue->rdma_post_counter);
@@ -113,11 +286,22 @@ int fs_enqueue_send_wr(struct rdma_session_context *rdma_session,
 	const struct ib_send_wr *bad_wr;
 	int test;
 
+	int cpu;
+	enum rdma_queue_type type;
+
 	rdma_req->rdma_queue = rdma_queue;
+
+	get_rdma_queue_cpu_type(rdma_session, rdma_queue, &cpu, &type);
+	if (type != rdma_queue->type) {
+		printk("RDMA_QUEUE_TYPE BUG!! %d - %d\n", type, rdma_queue->type);
+	}
 
 	while (1) {
 		test = atomic_inc_return(&rdma_queue->rdma_post_counter);
 		if (test < RDMA_SEND_QUEUE_DEPTH - 16) {
+
+			record_start_time((u64)rdma_req, cpu, type);
+
 			ret = ib_post_send(
 				rdma_queue->qp,
 				(struct ib_send_wr *)&rdma_req->rdma_wr,
@@ -456,9 +640,11 @@ void rswap_deregister_frontswap(void)
 	pr_info("frontswap ops deregistered\n");
 }
 
+
 int rswap_client_init(char *_server_ip, int _server_port, int _mem_size)
 {
 	int ret = 0;
+	int idx = 0;
 	printk(KERN_INFO "%s, start \n", __func__);
 
 	// online cores decide the parallelism. e.g. number of QP, CP etc.
@@ -469,6 +655,23 @@ int rswap_client_init(char *_server_ip, int _server_port, int _mem_size)
 	rdma_session_global.remote_mem_pool.remote_mem_size = _mem_size;
 	rdma_session_global.remote_mem_pool.chunk_num =
 		_mem_size / REGION_SIZE_GB;
+
+	// init lat measure related struct
+	qp_store_lat = (struct end2end_rdma_lat**)kzalloc(online_cores * sizeof(struct end2end_rdma_lat*), GFP_KERNEL);
+	qp_sync_load_lat = (struct end2end_rdma_lat**)kzalloc(online_cores * sizeof(struct end2end_rdma_lat*), GFP_KERNEL);
+	qp_async_load_lat = (struct end2end_rdma_lat**)kzalloc(online_cores * sizeof(struct end2end_rdma_lat*), GFP_KERNEL);
+
+	for (idx = 0; idx < online_cores; idx += 1) {
+		qp_store_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
+		qp_sync_load_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
+		qp_async_load_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
+	}
+
+	qp_store_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
+	qp_sync_load_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
+	qp_async_load_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
+
+	list_size = online_cores;
 
 	pr_info("%s, num_queues : %d (Can't exceed the slots on Memory server) \n",
 		__func__, num_queues);
