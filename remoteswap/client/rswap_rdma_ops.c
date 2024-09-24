@@ -97,10 +97,10 @@ int _init_lat_entry(struct end2end_rdma_lat* rdma_lat_list, struct mutex* mtx, u
 	u64 cur_time_us;
 	ktime_t kt;
 
-	while(1) {
-		if (nr_try_times == 10) {
-			printk("WARN, nr_try_times == 10\n");
-		}
+	//while(1) {
+		// if (nr_try_times == 10) {
+		// 	printk("WARN, nr_try_times == 10\n");
+		// }
 
 		free_idx = _get_free_idx(rdma_lat_list);
 		if (free_idx == -1 || free_idx >= (RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH)) {
@@ -108,22 +108,31 @@ int _init_lat_entry(struct end2end_rdma_lat* rdma_lat_list, struct mutex* mtx, u
 			return -1;
 		}
 
-		mutex_lock(mtx);
+		
+		//mutex_lock(mtx);
 		if (rdma_lat_list[free_idx].wr_id_ == 0) {
+			rdma_lat_list[free_idx].wr_id_ = wr_id;
+			
 			kt = ktime_get();
 			cur_time_us = ktime_to_us(kt);
-			rdma_lat_list[free_idx].wr_id_ = wr_id;
 			rdma_lat_list[free_idx].start_time_us_ = cur_time_us;
-
 			success = 0;
+		} else {
+			printk("init_lat_entry conflict\n");
 		}
-		mutex_unlock(mtx);
+		//mutex_unlock(mtx);
 
-		if (success == 0) {
-			break;
-		}
-		nr_try_times += 1;
-	}
+		// if (success == 0) {
+		// 	kt = ktime_get();
+		// 	cur_time_us = ktime_to_us(kt);
+		// 	rdma_lat_list[free_idx].start_time_us_ = cur_time_us;
+
+		// 	//break;
+		// } else {
+		// 	printk("init_lat_entry conflict\n");
+		// }
+		//nr_try_times += 1;
+	//}
 	return success;
 }
 
@@ -190,11 +199,11 @@ int _caculate_lat(struct end2end_rdma_lat* rdma_lat_list, struct mutex* mtx, u64
 	cur_time_us = ktime_to_us(kt);
 	trace_printk("type: %d lat: %llu\n", type, cur_time_us - rdma_lat_list[target_idx].start_time_us_);
 
-	mutex_lock(mtx);
+	//mutex_lock(mtx);
 	rdma_lat_list[target_idx].wr_id_ = 0;
-	rdma_lat_list[target_idx].start_time_us_ = 0;
-	rdma_lat_list[target_idx].end_time_us_ = 0;
-	mutex_unlock(mtx);
+	// rdma_lat_list[target_idx].start_time_us_ = 0;
+	// rdma_lat_list[target_idx].end_time_us_ = 0;
+	//mutex_unlock(mtx);
 
 	return success;
 }
@@ -661,15 +670,19 @@ int rswap_client_init(char *_server_ip, int _server_port, int _mem_size)
 	qp_sync_load_lat = (struct end2end_rdma_lat**)kzalloc(online_cores * sizeof(struct end2end_rdma_lat*), GFP_KERNEL);
 	qp_async_load_lat = (struct end2end_rdma_lat**)kzalloc(online_cores * sizeof(struct end2end_rdma_lat*), GFP_KERNEL);
 
+	qp_store_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
+	qp_sync_load_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
+	qp_async_load_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
+
 	for (idx = 0; idx < online_cores; idx += 1) {
 		qp_store_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
 		qp_sync_load_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
 		qp_async_load_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
-	}
 
-	qp_store_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
-	qp_sync_load_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
-	qp_async_load_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
+		mutex_init(&qp_store_mutex[idx]);
+		mutex_init(&qp_sync_load_mutex[idx]);
+		mutex_init(&qp_async_load_mutex[idx]);
+	}
 
 	list_size = online_cores;
 

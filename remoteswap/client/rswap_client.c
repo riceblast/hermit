@@ -32,6 +32,7 @@ int __init rswap_cpu_init(void)
 	int ret = 0;
 
 	tracing_on();
+	//tracing_off();
 
 	ret = rswap_client_init(server_ip, server_port, remote_mem_size);
 	if (unlikely(ret)) {
