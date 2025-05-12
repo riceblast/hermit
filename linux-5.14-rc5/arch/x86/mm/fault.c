@@ -1646,26 +1646,26 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 	 */
 	state = irqentry_enter(regs);
 
-	pf_ts_end = get_cycles_end();
-	adc_pf_breakdown_end(pf_breakdown, ADC_TRAP_TO_KERNEL,
-			     pf_ts_end - pf_ts_stt);
-	adc_pf_breakdown_stt(pf_breakdown, ADC_LOCK_GET_PTE, pf_ts_stt);
+	// pf_ts_end = get_cycles_end();
+	// adc_pf_breakdown_end(pf_breakdown, ADC_TRAP_TO_KERNEL,
+	// 		     pf_ts_end - pf_ts_stt);
+	// adc_pf_breakdown_stt(pf_breakdown, ADC_LOCK_GET_PTE, pf_ts_stt);
 
 	instrumentation_begin();
 	handle_page_fault_profiling(regs, error_code, address, &adc_pf_bits,
 				    pf_breakdown);
 	instrumentation_end();
 
-	pf_ts_end = get_cycles_end();
-	adc_pf_breakdown_end(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK, pf_ts_end);
-	adc_pf_breakdown_end(pf_breakdown, ADC_TOTAL_PF, pf_ts_end - pf_ts_stt);
-	adc_pf_breakdown_stt(pf_breakdown, ADC_RET_TO_USER, pf_ts_end);
+	// pf_ts_end = get_cycles_end();
+	// adc_pf_breakdown_end(pf_breakdown, ADC_SET_PAGEMAP_UNLOCK, pf_ts_end);
+	// adc_pf_breakdown_end(pf_breakdown, ADC_TOTAL_PF, pf_ts_end - pf_ts_stt);
+	// adc_pf_breakdown_stt(pf_breakdown, ADC_RET_TO_USER, pf_ts_end);
 
 	irqentry_exit_profiling(regs, state, NULL);
 
 	// [RMGrid] profiling
-	pf_ts_end = get_cycles_end();
-	adc_pf_breakdown_end(pf_breakdown, ADC_RET_TO_USER, pf_ts_end);
-	record_adc_pf_time(adc_pf_bits, pf_breakdown[ADC_TOTAL_PF]);
-	parse_adc_pf_breakdown(adc_pf_bits, pf_breakdown);
+	// pf_ts_end = get_cycles_end();
+	// adc_pf_breakdown_end(pf_breakdown, ADC_RET_TO_USER, pf_ts_end);
+	// record_adc_pf_time(adc_pf_bits, pf_breakdown[ADC_TOTAL_PF]);
+	// parse_adc_pf_breakdown(adc_pf_bits, pf_breakdown);
 }
