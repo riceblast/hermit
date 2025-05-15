@@ -1,4 +1,8 @@
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "rswap_server.hpp"
 
@@ -128,7 +132,15 @@ void init_memory_pool(struct context *rdma_ctx) {
 
   size_t REGION_SIZE = ONE_GB * REGION_SIZE_GB;
   size_t heap_size = REGION_SIZE * region_num;
-  void *heap_start = malloc(heap_size);
+  //void *heap_start = malloc(heap_size);
+	void *heap_start = mmap(
+    NULL,                          // 让内核选择地址
+    heap_size,                     // 映射的总大小
+    PROT_READ | PROT_WRITE,        // 可读可写
+    MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,   // 匿名映射，不与文件关联
+    -1,                            // 文件描述符，匿名映射时设为 -1
+    0                              // 偏移量为 0
+);
   print_debug(stderr, "%s, Register Semeru Space: 0x%llx, size : 0x%llx. \n",
               __func__, (unsigned long long)heap_start,
               (unsigned long long)heap_size);
