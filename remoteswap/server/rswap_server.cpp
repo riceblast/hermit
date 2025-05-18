@@ -3,8 +3,14 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <iostream>
+#include <cassert>
+#include <thread>
+#include <vector>
 
 #include "rswap_server.hpp"
+
+using namespace::std;
 
 struct context *global_rdma_ctx = NULL;
 int rdma_queue_count = 0;
@@ -13,6 +19,41 @@ size_t region_num = 0;
 
 int online_cores = 0;
 int rdma_num_queues = 0;
+
+void touch_pages_thread(uint64_t* start_addr, size_t size_bytes, uint64_t* base_addr, size_t region_size, int thread_id) {
+    size_t page_size = 4096;
+    size_t pages = size_bytes / page_size;
+    // std::cout << "Thread " << thread_id << " start, pages: " << pages << std::endl;
+
+    for (size_t i = 0; i < pages; i++) {
+        uint64_t* current_addr = start_addr + i * (page_size / sizeof(uint64_t));
+        assert((uintptr_t)current_addr >= (uintptr_t)base_addr);
+        assert((uintptr_t)current_addr < (uintptr_t)base_addr + region_size);
+
+        *current_addr = 0;
+
+        // // 每处理1000页输出一次进度
+        // if (i > 0 && i % 1000 == 0) {
+        //     std::cout << "Thread " << thread_id << " processed " << i << " pages" << std::endl;
+        // }
+    }
+    // std::cout << "Thread " << thread_id << " done" << std::endl;
+}
+
+void touch_pages_parallel(void* addr, size_t region_size, int num_threads) {
+    size_t chunk_size = region_size / num_threads;
+    uint64_t* base = (uint64_t*)addr;
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_threads; i++) {
+        uint64_t* thread_start = base + (chunk_size / sizeof(uint64_t)) * i;
+        size_t thread_size = (i == num_threads - 1) ? (region_size - chunk_size * i) : chunk_size;
+        threads.emplace_back(touch_pages_thread, thread_start, thread_size, base, region_size, i);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+}
 
 inline enum rdma_queue_type get_qp_type(int idx) {
   unsigned type = idx / online_cores;
@@ -137,10 +178,16 @@ void init_memory_pool(struct context *rdma_ctx) {
     NULL,                          // 让内核选择地址
     heap_size,                     // 映射的总大小
     PROT_READ | PROT_WRITE,        // 可读可写
-    MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,   // 匿名映射，不与文件关联
+    MAP_PRIVATE | MAP_ANONYMOUS,   // 匿名映射，不与文件关联
     -1,                            // 文件描述符，匿名映射时设为 -1
     0                              // 偏移量为 0
-);
+); 
+
+	// 多线程触发页面映射
+  uint64_t num_alloc_thread = 16;
+  printf("%lu threads init mmap space\n", num_alloc_thread);
+	touch_pages_parallel(heap_start, heap_size, num_alloc_thread);
+
   print_debug(stderr, "%s, Register Semeru Space: 0x%llx, size : 0x%llx. \n",
               __func__, (unsigned long long)heap_start,
               (unsigned long long)heap_size);
