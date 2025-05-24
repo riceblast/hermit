@@ -16,7 +16,7 @@
 #ifdef MAX_REGION_NUM
 #undef MAX_REGION_NUM
 #endif
-#define MAX_REGION_NUM 16 // up to 128GB remote memory
+#define MAX_REGION_NUM 400 // up to 128GB remote memory
 
 // number of segments, get from ibv_query_device.
 // Check the hardware information and chang the number here.

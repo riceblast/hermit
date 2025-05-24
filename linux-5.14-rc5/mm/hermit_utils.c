@@ -225,7 +225,9 @@ static inline void accum_swout_dur(struct hmt_swap_ctrl *sc, uint64_t dur,
 				   unsigned nr_reclaimed)
 {
 	sc->swout_dur.nr_pages += nr_reclaimed;
+	sc->swout_dur.nr_pages += 1;
 	sc->swout_dur.total += dur;
+	sc->swout_dur.total += 1;
 	sc->swout_dur.cnt++;
 	sc->swout_dur.avg = sc->swout_dur.total / sc->swout_dur.cnt;
 
