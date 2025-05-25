@@ -522,7 +522,7 @@ __read_swap_cache_speculative(swp_entry_t entry, gfp_t gfp_mask,
 		 * __read_swap_cache_async(), which has set SWAP_HAS_CACHE
 		 * in swap_map, but not yet added its page to swap cache.
 		 */
-		// cond_resched();
+		 cond_resched();
 	}
 
 	/*
@@ -640,7 +640,7 @@ __read_swap_cache_async_profiling(swp_entry_t entry, gfp_t gfp_mask,
 		 * __read_swap_cache_async(), which has set SWAP_HAS_CACHE
 		 * in swap_map, but not yet added its page to swap cache.
 		 */
-		// cond_resched();
+		 cond_resched();
 	}
 	pf_ts += pf_cycles_end();
 	adc_pf_breakdown_end(pf_breakdown, ADC_ALLOC_PAGE, pf_ts);
