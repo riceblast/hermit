@@ -8,7 +8,7 @@
 #define RSWAP_KERNEL_SUPPORT 3
 #define RMGRID_CPU_FREQ 2100 // in MHz
 // # maximum memory supported in KB. For now support 400GB at most.
-#define RMGRID_MAX_MEM (400UL * 1024 * 1024 * 1024)
+#define RMGRID_MAX_MEM (3200UL * 1024 * 1024 * 1024)
 
 //#define ADC_PROFILE_PF_BREAKDOWN
 // #define ADC_VM
