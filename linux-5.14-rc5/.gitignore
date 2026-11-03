@@ -171,3 +171,5 @@ sphinx_*/
 .cache
 __pycache__
 *.pyc
+
+localversion.hermit

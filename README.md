@@ -20,8 +20,8 @@ Next we will use Ubuntu 20.04 as an example to show how to build and install the
 ```bash
 sudo vim /etc/default/grub
 
-# Set the boot kernel version as 5.14-rc5
-GRUB_DEFAULT="Advanced options for Ubuntu>Ubuntu, with Linux 5.14-rc5"
+# Set the boot kernel version (available after installing the kernel below)
+GRUB_DEFAULT="Advanced options for Ubuntu>Ubuntu, with Linux 5.14.0-rc5-hermit-syscall-v2"
 
 # Change the value of GRUB_CMDLINE_LINUX to set transparent hugepage as madvise:
 GRUB_CMDLINE_LINUX="transparent_hugepage=madvise"
@@ -37,10 +37,9 @@ cd hermit/linux-5.14-rc5
 
 # In case new kernel options are prompted, press enter to use the default options.
 cp config .config
-sudo ./build_kernel.sh build
-sudo ./build_kernel.sh install
-# (optional) install built kernel only.
-# sudo ./build_kernel.sh replace
+make -j8 LOCALVERSION=
+sudo make LOCALVERSION= INSTALL_MOD_STRIP=1 modules_install
+sudo make LOCALVERSION= install
 sudo reboot
 ```
 
@@ -80,6 +79,32 @@ To ensure stats are in correct time metrics, please set CPU frequency in kernel 
 We offer a helper script [`tools/hermit/syscaller.py`](linux-5.14-rc5/tools/hermit/syscaller.py) to collect and reset stats counters.
 * `python3 tools/hermit/syscaller.py stats` will show the page fault handling latencies, breakdowns, and other statistics about swap in `dmesg`. It also prints the prefetching contribution and accuracy in the terminal.
 * `python3 tools/hermit/syscaller.py reset` will reset the stats and latencies numbers in kernel, which enables recollecting stats for the next run.
+
+The statistics interface uses project-local syscall numbers on x86-64:
+`1000` for reset and `1001` for query. These numbers must match
+`arch/x86/entry/syscalls/syscall_64.tbl` and are not reserved by upstream Linux;
+check for conflicts when upgrading the kernel. The former numbers `451` and
+`452` conflict with Linux `cachestat` and `fchmodat2` and are not supported as
+aliases. On this 5.14 kernel they now return `ENOSYS`.
+
+Deploy the kernel and this statistics script together, and update any external
+programs that hard-code the old numbers. The script reports syscall failures
+instead of treating failed queries as zero counters. It never retries the old
+numbers. Statistics collection, reporting, reset behavior, and swap/RDMA
+algorithms are otherwise unchanged. The `stats` command also reads cgroup-v1
+statistics separately from the global syscall statistics.
+
+`localversion.hermit` gives this kernel the suffix `-hermit-syscall-v2`, keeping
+its image and module directory separate from the previous kernel. Use the build
+and install commands above rather than the legacy `build_kernel.sh install`
+command, which deletes existing images.
+
+Keep the previous kernel and its modules available for rollback. Rebuild any
+out-of-tree drivers against the new kernel before using them. Installing does
+not switch the running kernel; reboot into the new version before using the
+updated statistics script. After booting, verification can include checking
+`uname -r`, querying/resetting statistics, and repeating the previously failing
+archive extraction while checking file permissions.
 
 ## Reference
 Please refer to our NSDI'23 paper, [Hermit: Low-Latency, High-Throughput, and Transparent Remote Memory via Feedback-Directed Asynchrony](https://www.usenix.org/conference/nsdi23/presentation/qiao) for more details.

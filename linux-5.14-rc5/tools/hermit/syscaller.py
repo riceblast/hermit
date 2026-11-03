@@ -1,40 +1,54 @@
 import ctypes
+import errno
 import sys
 import os
 from collections import defaultdict
 
 CGROUP_PATH = '/sys/fs/cgroup/memory'
 
-SYS_RESET_SWAP_STAT = 451
-SYS_GET_SWAP_STATS = 452
+# Project-local x86 syscall numbers; keep in sync with syscall_64.tbl.
+SYS_RESET_SWAP_STAT = 1000
+SYS_GET_SWAP_STATS = 1001
 
 DISABLE_SYSCALL = False
 
 # syscalls
+def check_syscall_result(result):
+    if result == -1:
+        error = ctypes.get_errno()
+        if error == errno.ENOSYS:
+            raise OSError(error, 'Hermit statistics syscall is unavailable; '
+                          'boot the matching Hermit kernel and use its statistics tool')
+        raise OSError(error, os.strerror(error))
+    return result
+
+
 def reset_swap_stats():
     if DISABLE_SYSCALL:
         return
-    libc = ctypes.CDLL(None)
+    libc = ctypes.CDLL(None, use_errno=True)
     syscall = libc.syscall
-    syscall.restype = ctypes.c_int
+    syscall.restype = ctypes.c_long
+    syscall.argtypes = (ctypes.c_long,)
 
-    return syscall(SYS_RESET_SWAP_STAT)
+    return check_syscall_result(syscall(SYS_RESET_SWAP_STAT))
 
 
 def get_swap_stats():
     if DISABLE_SYSCALL:
         return 0,0,0
-    libc = ctypes.CDLL(None)
+    libc = ctypes.CDLL(None, use_errno=True)
     syscall = libc.syscall
-    syscall.restype = ctypes.c_int
+    syscall.restype = ctypes.c_long
     syscall.argtypes = ctypes.c_long, ctypes.POINTER(
         ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
 
     c_ondemand_swap_num = ctypes.c_int()
     c_prefetch_swap_num = ctypes.c_int()
     c_hiton_swap_cache_num = ctypes.c_int()
-    syscall(SYS_GET_SWAP_STATS, ctypes.byref(c_ondemand_swap_num), ctypes.byref(
-        c_prefetch_swap_num), ctypes.byref(c_hiton_swap_cache_num))
+    check_syscall_result(syscall(
+        SYS_GET_SWAP_STATS, ctypes.byref(c_ondemand_swap_num),
+        ctypes.byref(c_prefetch_swap_num), ctypes.byref(c_hiton_swap_cache_num)))
 
     ondemand_swap_num = c_ondemand_swap_num.value
     prefetch_swap_num = c_prefetch_swap_num.value
