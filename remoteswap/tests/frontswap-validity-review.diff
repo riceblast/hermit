@@ -1,0 +1,60 @@
+# REVIEW ONLY: these bitmap changes are already included in the working tree.
+# This isolates correctness changes from managed lifecycle/SRCU changes.
+# Do not apply this diff to the current working tree a second time.
+--- a/linux-5.14-rc5/mm/frontswap.c
++++ b/linux-5.14-rc5/mm/frontswap.c
+@@ -230,15 +230,15 @@
+ static inline void __frontswap_set(struct swap_info_struct *sis,
+ 				   pgoff_t offset)
+ {
+-	set_bit(offset, sis->frontswap_map);
+-	atomic_inc(&sis->frontswap_pages);
++	if (!test_and_set_bit(offset, sis->frontswap_map))
++		atomic_inc(&sis->frontswap_pages);
+ }
+ 
+ static inline void __frontswap_clear(struct swap_info_struct *sis,
+ 				     pgoff_t offset)
+ {
+-	clear_bit(offset, sis->frontswap_map);
+-	atomic_dec(&sis->frontswap_pages);
++	if (test_and_clear_bit(offset, sis->frontswap_map))
++		atomic_dec(&sis->frontswap_pages);
+ }
+ 
+ /*
+@@ -261,17 +261,12 @@
+ 	VM_BUG_ON(!PageLocked(page));
+ 	VM_BUG_ON(sis == NULL);
+ 
+-	// /*
+-	//  * If a dup, we must remove the old page first; we can't leave the
+-	//  * old page no matter if the store of the new page succeeds or fails,
+-	//  * and we can't rely on the new page replacing the old page as we may
+-	//  * not store to the same implementation that contains the old page.
+-	//  */
+-	// if (__frontswap_test(sis, offset)) {
+-	// 	__frontswap_clear(sis, offset);
+-	// 	for_each_frontswap_ops(ops)
+-	// 		ops->invalidate_page(type, offset);
+-	// }
++	/* Retire an old copy even if the new store will fall back to disk. */
++	if (__frontswap_test(sis, offset)) {
++		__frontswap_clear(sis, offset);
++		for_each_frontswap_ops(ops)
++			ops->invalidate_page(type, offset);
++	}
+ 
+ 	/* Try to store in each implementation, until one succeeds. */
+ 	for_each_frontswap_ops(ops) {
+@@ -335,8 +330,8 @@
+ 	VM_BUG_ON(!PageLocked(page));
+ 	VM_BUG_ON(sis == NULL);
+ 
+-	// if (!__frontswap_test(sis, offset))
+-	// 	return -1;
++	if (!__frontswap_test(sis, offset))
++		return -1;
+ 
+ 	/* Try loading from each implementation, until one succeeds. */
+ 	for_each_frontswap_ops(ops) {

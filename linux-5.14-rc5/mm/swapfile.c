@@ -2472,12 +2472,15 @@ static void _enable_swap_info(struct swap_info_struct *p)
 	add_to_avail_list(p);
 }
 
-static void enable_swap_info(struct swap_info_struct *p, int prio,
+static int enable_swap_info(struct swap_info_struct *p, int prio,
 				unsigned char *swap_map,
 				struct swap_cluster_info *cluster_info,
 				unsigned long *frontswap_map)
 {
-	frontswap_init(p->type, frontswap_map);
+	int error = frontswap_init(p->type, frontswap_map);
+
+	if (error)
+		return error;
 	spin_lock(&swap_lock);
 	spin_lock(&p->lock);
 	setup_swap_info(p, prio, swap_map, cluster_info);
@@ -2492,6 +2495,7 @@ static void enable_swap_info(struct swap_info_struct *p, int prio,
 	_enable_swap_info(p);
 	spin_unlock(&p->lock);
 	spin_unlock(&swap_lock);
+	return 0;
 }
 
 static void reinsert_swap_info(struct swap_info_struct *p)
@@ -3329,7 +3333,12 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	if (swap_flags & SWAP_FLAG_PREFER)
 		prio =
 		  (swap_flags & SWAP_FLAG_PRIO_MASK) >> SWAP_FLAG_PRIO_SHIFT;
-	enable_swap_info(p, prio, swap_map, cluster_info, frontswap_map);
+	error = enable_swap_info(p, prio, swap_map, cluster_info, frontswap_map);
+	if (error) {
+		mutex_unlock(&swapon_mutex);
+		inode->i_flags &= ~S_SWAPFILE;
+		goto free_swap_address_space;
+	}
 
 	pr_info("Adding %uk swap on %s.  Priority:%d extents:%d across:%lluk %s%s%s%s%s\n",
 		p->pages<<(PAGE_SHIFT-10), name->name, p->prio,

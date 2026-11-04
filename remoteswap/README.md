@@ -1,4 +1,14 @@
 # Remoteswap
+
+**Development stage: Patch 1 (dual-server connection tests only).**
+Use [the Patch 1 smoke-test guide](tests/patch1-smoke.md) for the current
+build and operator-run tests. The Client now expects two Servers, registers
+an unloadable exclusive Frontswap backend, and deliberately rejects
+`swapon` until Patch 2/3 provide striping and multi-session I/O completion.
+The historical single-server swap/deployment instructions below do not apply
+to this intermediate stage. The management script connects/disconnects only;
+it does not create or activate a swapfile.
+
 A RDMA-based remote swap system for remote memory and disaggregated clusters. The codebase is larged adopted from Fastswap (https://github.com/clusterfarmem/fastswap) and Canvas (https://github.com/uclasystem/canvas), but is enhanced with our optimizations.
 
 ## Prerequisites

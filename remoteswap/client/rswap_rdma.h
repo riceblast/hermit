@@ -35,6 +35,7 @@
 #include <linux/smp.h>
 
 #include "constants.h"
+#include "rswap_ops.h"
 #include "utils.h"
 
 // for the qp. Find the max number without warning.
@@ -139,7 +140,9 @@ struct rswap_rdma_queue {
 	enum rdma_queue_state state;
 	wait_queue_head_t sem;
 	spinlock_t cq_lock;
-	uint8_t freed;
+	bool connect_started;
+	int error;
+	int expected_message;
 	atomic_t rdma_post_counter;
 
 	int q_index;
@@ -164,6 +167,14 @@ struct rswap_rdma_dev {
  * Each Remote Memory Server has a dedicated rdma_session_context as controller.
  */
 struct rdma_session_context {
+	unsigned int server_id;
+	unsigned int expected_chunks;
+	unsigned int timeout_ms;
+	unsigned long deadline;
+	bool stopping;
+	bool send_mapped;
+	bool recv_mapped;
+	int error; /* First setup error on any queue in this session. */
 	struct rswap_rdma_dev *rdma_dev; // The RDMA device of cpu server.
 	struct rswap_rdma_queue *rdma_queues; // point to multiple QP
 
@@ -211,7 +222,6 @@ void bind_remote_memory_chunks(struct rdma_session_context *rdma_session);
 int rswap_disconnect_and_collect_resource(
 	struct rdma_session_context *rdma_session);
 void rswap_free_buffers(struct rdma_session_context *rdma_session);
-void rswap_free_rdma_structure(struct rdma_session_context *rdma_session);
 
 // functions for 2-sided RDMA.
 void two_sided_message_done(struct ib_cq *cq, struct ib_wc *wc);
@@ -228,12 +238,10 @@ void drain_all_rdma_queues(int target_mem_server);
 /*
  * Global var definition
  */
-extern struct rdma_session_context rdma_session_global;
+extern struct rdma_session_context rdma_sessions[RSWAP_NUM_SERVERS];
 
 extern int online_cores;
 extern int num_queues;
-extern char *server_ip;
-extern uint16_t server_port;
 
 /**
  * Debug functions

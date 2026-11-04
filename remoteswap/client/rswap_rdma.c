@@ -1,915 +1,537 @@
 #include "rswap_rdma.h"
+#include <linux/jiffies.h>
+#include <linux/overflow.h>
 
-/* Global vars */
-struct rdma_session_context rdma_session_global;
-int online_cores; // Control the parallelism
-int num_queues; // Total #(queues)
+struct rdma_session_context rdma_sessions[RSWAP_NUM_SERVERS];
+int online_cores;
+int num_queues; /* Per session. */
+u64 rmda_ops_count;
+u64 cq_notify_count;
+u64 cq_get_count;
 
-char *server_ip; // the memory server ip
-uint16_t server_port; // the memory server port
-
-// Debug
-u64 rmda_ops_count = 0;
-u64 cq_notify_count = 0;
-u64 cq_get_count = 0;
-
-// Utilities functions
-inline enum rdma_queue_type get_qp_type(int idx)
+enum rdma_queue_type get_qp_type(int idx)
 {
-	unsigned type = idx / online_cores;
-
-	if (type < NUM_QP_TYPE) {
-		return type;
-	} else {
-		pr_err("wrong rdma queue type %d\n", idx / online_cores);
-		return QP_STORE;
-	}
-
-	return QP_STORE;
+	return idx / online_cores;
 }
 
-inline struct rswap_rdma_queue *
-get_rdma_queue(struct rdma_session_context *rdma_session, unsigned int cpu,
-	       enum rdma_queue_type type)
+struct rswap_rdma_queue *get_rdma_queue(struct rdma_session_context *session,
+		unsigned int cpu, enum rdma_queue_type type)
 {
-	if (type < NUM_QP_TYPE) {
-		return &(rdma_session->rdma_queues[cpu + online_cores * type]);
-	} else {
-		BUG();
-	}
-	return &(rdma_session->rdma_queues[cpu]);
+	if (WARN_ON(cpu >= online_cores || type >= NUM_QP_TYPE))
+		return NULL;
+	return &session->rdma_queues[cpu + online_cores * type];
 }
 
-inline void get_rdma_queue_cpu_type(struct rdma_session_context *rdma_session,
-				    struct rswap_rdma_queue *rdma_queue,
-				    unsigned int *cpu,
-				    enum rdma_queue_type *type)
+void get_rdma_queue_cpu_type(struct rdma_session_context *session,
+		struct rswap_rdma_queue *queue, unsigned int *cpu,
+		enum rdma_queue_type *type)
 {
-	struct rswap_rdma_queue *start = rdma_session->rdma_queues;
-	int qid = rdma_queue - start;
-	*cpu = qid % online_cores;
-	*type = qid / online_cores;
+	*cpu = queue->q_index % online_cores;
+	*type = queue->type;
 }
 
-/**
- * Util functions for two-sided RDMA.
- */
-int handle_recv_wr(struct rswap_rdma_queue *rdma_queue, struct ib_wc *wc)
+static void queue_error(struct rswap_rdma_queue *queue, int error)
 {
-	int ret = 0;
-	struct rdma_session_context *rdma_session = rdma_queue->rdma_session;
+	cmpxchg(&queue->error, 0, error < 0 ? error : -EIO);
+	cmpxchg(&queue->rdma_session->error, 0, error < 0 ? error : -EIO);
+	wake_up_all(&queue->sem);
+}
 
-	if (wc->byte_len != sizeof(struct message)) {
-		pr_err("%s, Received bogus data, size %d\n", __func__,
-		       wc->byte_len);
-		ret = -1;
-		goto out;
+/* Initialization runs in process context; never use the I/O busy-drain here. */
+static int wait_queue_state(struct rswap_rdma_queue *queue,
+		enum rdma_queue_state state)
+{
+	struct rdma_session_context *session = queue->rdma_session;
+	long ret;
+
+	for (;;) {
+		if (READ_ONCE(session->error))
+			return READ_ONCE(session->error);
+		if (READ_ONCE(queue->error))
+			return READ_ONCE(queue->error);
+		if (READ_ONCE(session->stopping))
+			return -ESHUTDOWN;
+		if (READ_ONCE(queue->state) == state &&
+		    !atomic_read(&queue->rdma_post_counter))
+			return 0;
+		if (time_after_eq(jiffies, session->deadline)) {
+			pr_err("rswap: server=%u queue=%d timeout waiting for state=%d\n",
+			       session->server_id, queue->q_index, state);
+			return -ETIMEDOUT;
+		}
+		if (queue->cq && queue->cq->poll_ctx == IB_POLL_DIRECT) {
+			ib_process_cq_direct(queue->cq, 16);
+			if (READ_ONCE(queue->error) ||
+			    (READ_ONCE(queue->state) == state &&
+			     !atomic_read(&queue->rdma_post_counter)))
+				continue;
+		}
+		ret = wait_event_interruptible_timeout(queue->sem,
+			READ_ONCE(queue->error) || READ_ONCE(session->stopping) ||
+			(READ_ONCE(queue->state) == state &&
+			 !atomic_read(&queue->rdma_post_counter)), 1);
+		if (ret < 0)
+			return ret;
+		cond_resched();
 	}
+}
 
-	if (unlikely(rdma_queue->state < CONNECTED)) {
-		print_debug(KERN_ERR "%s, RDMA is not connected\n", __func__);
-		return -1;
-	}
+int handle_recv_wr(struct rswap_rdma_queue *queue, struct ib_wc *wc)
+{
+	struct rdma_session_context *session = queue->rdma_session;
+	struct message *msg = session->rdma_recv_req.recv_buf;
+	unsigned int i;
+	u64 end;
 
-	switch (rdma_session->rdma_recv_req.recv_buf->type) {
+	ib_dma_sync_single_for_cpu(session->rdma_dev->dev,
+		session->rdma_recv_req.recv_dma_addr, sizeof(*msg), DMA_BIDIRECTIONAL);
+	if (wc->byte_len != sizeof(*msg) || msg->type != queue->expected_message)
+		return -EPROTO;
+
+	switch (msg->type) {
 	case AVAILABLE_TO_QUERY:
-		print_debug(
-			"%s, Received AVAILABLE_TO_QUERY, memory server is ready.\n ",
-			__func__);
-		rdma_queue->state = MEMORY_SERVER_AVAILABLE;
-
-		wake_up_interruptible(&rdma_queue->sem);
+		WRITE_ONCE(queue->state, MEMORY_SERVER_AVAILABLE);
 		break;
 	case FREE_SIZE:
-
-		pr_info("%s, Received FREE_SIZE, avaible chunk number : %d \n ",
-			__func__,
-			rdma_session->rdma_recv_req.recv_buf->mapped_chunk);
-
-		rdma_session->remote_mem_pool.chunk_num =
-			rdma_session->rdma_recv_req.recv_buf->mapped_chunk;
-		rdma_queue->state = FREE_MEM_RECV;
-
-		ret = init_remote_chunk_list(rdma_session);
-		if (unlikely(ret)) {
-			pr_err("Initialize the remote chunk failed. \n");
-		}
-
-		wake_up_interruptible(&rdma_queue->sem);
+		if (msg->mapped_chunk != session->expected_chunks)
+			return -ENOSPC;
+		WRITE_ONCE(queue->state, FREE_MEM_RECV);
 		break;
 	case GOT_CHUNKS:
-
-		bind_remote_memory_chunks(rdma_session);
-
-		rdma_queue->state = RECEIVED_CHUNKS;
-		wake_up_interruptible(&rdma_queue->sem);
-
+		if (msg->mapped_chunk != session->expected_chunks)
+			return -EPROTO;
+		for (i = 0; i < session->expected_chunks; i++) {
+			if (!msg->buf[i] || (msg->buf[i] & (PAGE_SIZE - 1)) ||
+			    msg->mapped_size[i] != (u64)REGION_SIZE_GB * ONE_GB ||
+			    check_add_overflow(msg->buf[i], msg->mapped_size[i], &end))
+				return -EPROTO;
+		}
+		bind_remote_memory_chunks(session);
+		WRITE_ONCE(queue->state, RECEIVED_CHUNKS);
 		break;
 	default:
-		pr_err("%s, Recieved WRONG RDMA message %d \n", __func__,
-		       rdma_session->rdma_recv_req.recv_buf->type);
-		ret = -1;
-		goto out;
+		return -EPROTO;
 	}
-
-out:
-	return ret;
+	return 0;
 }
 
 void two_sided_message_done(struct ib_cq *cq, struct ib_wc *wc)
 {
-	struct rswap_rdma_queue *rdma_queue = cq->cq_context;
+	struct rswap_rdma_queue *queue = cq->cq_context;
 	int ret = 0;
 
-	if (wc->status != IB_WC_SUCCESS) {
-		pr_err("%s, cq completion failed with wr_id 0x%llx status %d,  status name %s, opcode %d,\n",
-		       __func__, wc->wr_id, wc->status,
-		       rdma_wc_status_name(wc->status), wc->opcode);
-		goto out;
-	}
-
-	switch (wc->opcode) {
-	case IB_WC_RECV:
-		pr_err("%s, Got a WC from CQ, IB_WC_RECV. \n", __func__);
-
-		ret = handle_recv_wr(rdma_queue, wc);
-		if (unlikely(ret)) {
-			pr_err("%s, recv wc error: %d\n", __func__, ret);
-			goto out;
+	if (!READ_ONCE(queue->rdma_session->stopping)) {
+		if (wc->status != IB_WC_SUCCESS)
+			ret = -EIO;
+		else if (wc->opcode == IB_WC_RECV)
+			ret = handle_recv_wr(queue, wc);
+		else if (wc->opcode != IB_WC_SEND)
+			ret = -EPROTO;
+		if (ret) {
+			pr_err("rswap: server=%u queue=%d control completion status=%d error=%d\n",
+			       queue->rdma_session->server_id, queue->q_index,
+			       wc->status, ret);
+			queue_error(queue, ret);
 		}
-		break;
-	case IB_WC_SEND:
-		pr_err("%s, Got a WC from CQ, IB_WC_SEND. 2-sided RDMA post done. \n",
-		       __func__);
-		break;
-	default:
-		pr_err("%s:%d Unexpected opcode %d, Shutting down\n", __func__,
-		       __LINE__, wc->opcode);
-		goto out;
 	}
-	atomic_dec(&rdma_queue->rdma_post_counter);
-out:
-	return;
+	/* Errors and WR_FLUSH_ERR consume a posted WR just like success. */
+	atomic_dec(&queue->rdma_post_counter);
+	wake_up_all(&queue->sem);
 }
 
-/**
- * Send a RDMA message to remote server.
- * Used for RDMA connection build.
- */
-int send_message_to_remote(struct rdma_session_context *rdma_session,
-			   int rdma_queue_ind, int message_type, int chunk_num)
+static int post_control_recv(struct rdma_session_context *session,
+		struct rswap_rdma_queue *queue, int expected)
 {
-	int ret = 0;
-	const struct ib_recv_wr *recv_bad_wr;
-	const struct ib_send_wr *send_bad_wr;
-	struct rswap_rdma_queue *rdma_queue;
+	const struct ib_recv_wr *bad;
+	int ret;
 
-	rdma_queue = &(rdma_session->rdma_queues[rdma_queue_ind]);
-	rdma_session->rdma_send_req.send_buf->type = message_type;
-	rdma_session->rdma_send_req.send_buf->mapped_chunk = chunk_num;
-
-	ret = ib_post_recv(rdma_queue->qp, &rdma_session->rdma_recv_req.rq_wr,
-			   &recv_bad_wr);
-	if (ret) {
-		pr_err("%s, Post 2-sided message to receive data failed.\n",
-		       __func__);
-		goto err;
-	}
-	atomic_inc(&rdma_queue->rdma_post_counter);
-
-	print_debug(
-		"Send a Message to memory server. send_buf->type : %d, %s \n",
-		message_type, rdma_message_print(message_type));
-	ret = ib_post_send(rdma_queue->qp, &rdma_session->rdma_send_req.sq_wr,
-			   &send_bad_wr);
-	if (ret) {
-		pr_err("%s: BIND_SINGLE MSG send error %d\n", __func__, ret);
-		goto err;
-	}
-	atomic_inc(&rdma_queue->rdma_post_counter);
-
-err:
+	queue->expected_message = expected;
+	ib_dma_sync_single_for_device(session->rdma_dev->dev,
+		session->rdma_recv_req.recv_dma_addr, sizeof(struct message), DMA_BIDIRECTIONAL);
+	atomic_inc(&queue->rdma_post_counter);
+	ret = ib_post_recv(queue->qp, &session->rdma_recv_req.rq_wr, &bad);
+	if (ret)
+		atomic_dec(&queue->rdma_post_counter);
 	return ret;
 }
 
-/**
- * Check the available memory size on this session/memory server
- */
-int rswap_query_available_memory(struct rdma_session_context *rdma_session)
+int send_message_to_remote(struct rdma_session_context *session,
+		int index, int type, int chunks)
 {
-	int ret = 0;
-	struct rswap_rdma_queue *rdma_queue;
+	struct rswap_rdma_queue *queue = &session->rdma_queues[index];
+	const struct ib_send_wr *bad;
+	int ret;
 
-	rdma_queue = &(rdma_session->rdma_queues[num_queues - 1]);
-	wait_event_interruptible(rdma_queue->sem,
-				 rdma_queue->state == MEMORY_SERVER_AVAILABLE);
-	pr_info("%s, All %d rdma queues are prepared well. Query its available memory. \n",
-		__func__, num_queues);
-
-	rdma_queue = &(rdma_session->rdma_queues[0]);
-	ret = send_message_to_remote(rdma_session, 0, QUERY, 0);
-	if (ret) {
-		pr_err("%s, Post 2-sided message to remote server failed.\n",
-		       __func__);
-		goto err;
-	}
-
-	drain_rdma_queue(rdma_queue);
-	wait_event_interruptible(rdma_queue->sem,
-				 rdma_queue->state == FREE_MEM_RECV);
-
-	pr_info("%s: Got %d free memory chunks from remote memory server. Request for Chunks \n",
-		__func__, rdma_session->remote_mem_pool.chunk_num);
-
-err:
+	ret = post_control_recv(session, queue,
+		type == QUERY ? FREE_SIZE : GOT_CHUNKS);
+	if (ret)
+		return ret;
+	ib_dma_sync_single_for_cpu(session->rdma_dev->dev,
+		session->rdma_send_req.send_dma_addr, sizeof(struct message), DMA_BIDIRECTIONAL);
+	session->rdma_send_req.send_buf->type = type;
+	session->rdma_send_req.send_buf->mapped_chunk = chunks;
+	ib_dma_sync_single_for_device(session->rdma_dev->dev,
+		session->rdma_send_req.send_dma_addr, sizeof(struct message), DMA_BIDIRECTIONAL);
+	atomic_inc(&queue->rdma_post_counter);
+	ret = ib_post_send(queue->qp, &session->rdma_send_req.sq_wr, &bad);
+	if (ret)
+		atomic_dec(&queue->rdma_post_counter);
 	return ret;
 }
 
-/**
- * Post a 2-sided request for chunk mapping.
- */
-int rswap_request_for_chunk(struct rdma_session_context *rdma_session)
+int rswap_query_available_memory(struct rdma_session_context *session)
 {
-	int ret = 0;
-	struct rswap_rdma_queue *rdma_queue;
-	int chunk_num = rdma_session->remote_mem_pool.chunk_num;
+	int ret = send_message_to_remote(session, 0, QUERY, 0);
 
-	rdma_queue = &(rdma_session->rdma_queues[0]);
-	if (chunk_num == 0 || rdma_session == NULL) {
-		pr_err("%s, current memory server has no available memory at all. Exit. \n",
-		       __func__);
-		goto err;
-	}
-
-	ret = send_message_to_remote(rdma_session, 0, REQUEST_CHUNKS,
-				     chunk_num);
-	if (ret) {
-		pr_err("%s, Post 2-sided message to remote server failed.\n",
-		       __func__);
-		goto err;
-	}
-
-	drain_rdma_queue(rdma_queue);
-	wait_event_interruptible(rdma_queue->sem,
-				 rdma_queue->state == RECEIVED_CHUNKS);
-
-	pr_info("%s, Got %d chunks from memory server.\n", __func__, chunk_num);
-err:
-	return ret;
+	if (ret)
+		return ret;
+	ret = wait_queue_state(&session->rdma_queues[0], FREE_MEM_RECV);
+	if (ret)
+		return ret;
+	/* Allocate in process context, not from a CQ/softirq callback. */
+	return init_remote_chunk_list(session);
 }
 
-/**
- * The rdma CM event handler function
- */
-int rswap_rdma_cm_event_handler(struct rdma_cm_id *cma_id,
-				struct rdma_cm_event *event)
+int rswap_request_for_chunk(struct rdma_session_context *session)
 {
-	int ret = 0;
-	struct rswap_rdma_queue *rdma_queue = cma_id->context;
+	int ret = send_message_to_remote(session, 0, REQUEST_CHUNKS,
+					 session->expected_chunks);
 
-	print_debug("cma_event type %d, type_name: %s \n", event->event,
-		    rdma_cm_message_print(event->event));
+	return ret ? ret : wait_queue_state(&session->rdma_queues[0], RECEIVED_CHUNKS);
+}
+
+int rswap_rdma_cm_event_handler(struct rdma_cm_id *id,
+		struct rdma_cm_event *event)
+{
+	struct rswap_rdma_queue *queue = id->context;
+	int ret;
+
+	if (READ_ONCE(queue->rdma_session->stopping))
+		return 0;
 	switch (event->event) {
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
-		rdma_queue->state = ADDR_RESOLVED;
-		print_debug(
-			"%s,  get RDMA_CM_EVENT_ADDR_RESOLVED. Send RDMA_ROUTE_RESOLVE to Memory server \n",
-			__func__);
-
-		ret = rdma_resolve_route(cma_id, 2000);
-		if (ret) {
-			pr_err("%s,rdma_resolve_route error %d\n", __func__,
-			       ret);
-		}
+		ret = rdma_resolve_route(id, 2000);
+		if (ret)
+			queue_error(queue, ret);
 		break;
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
-		print_debug(
-			"%s : RDMA_CM_EVENT_ROUTE_RESOLVED, wake up rdma_queue->sem\n ",
-			__func__);
-
-		rdma_queue->state = ROUTE_RESOLVED;
-		wake_up_interruptible(&rdma_queue->sem);
-		break;
-	case RDMA_CM_EVENT_CONNECT_REQUEST: // Receive RDMA connection request
-		pr_err("Receive but Not Handle : RDMA_CM_EVENT_CONNECT_REQUEST \n");
+		WRITE_ONCE(queue->state, ROUTE_RESOLVED);
+		wake_up_all(&queue->sem);
 		break;
 	case RDMA_CM_EVENT_ESTABLISHED:
-		rdma_queue->state = CONNECTED;
-		wake_up_interruptible(&rdma_queue->sem);
+		/* The ready message can complete before this CM event. */
 		break;
 	case RDMA_CM_EVENT_ADDR_ERROR:
 	case RDMA_CM_EVENT_ROUTE_ERROR:
 	case RDMA_CM_EVENT_CONNECT_ERROR:
 	case RDMA_CM_EVENT_UNREACHABLE:
 	case RDMA_CM_EVENT_REJECTED:
-		pr_err("%s, cma event %d, event name %s, error code %d \n",
-		       __func__, event->event,
-		       rdma_cm_message_print(event->event), event->status);
-		rdma_queue->state = ERROR;
-		wake_up_interruptible(&rdma_queue->sem);
-		break;
 	case RDMA_CM_EVENT_DISCONNECTED:
-		printk("%s, Receive DISCONNECTED  signal \n", __func__);
-
-		if (rdma_queue->freed) {
-			print_debug(
-				"%s, RDMA disconnect evetn, requested by client. \n",
-				__func__);
-		} else {
-			print_debug(
-				"%s, RDMA disconnect evetn, requested by client. \n",
-				__func__);
-
-			rdma_disconnect(rdma_queue->cm_id);
-		}
+	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+	case RDMA_CM_EVENT_ADDR_CHANGE:
+		queue_error(queue, event->status < 0 ? event->status : -ECONNRESET);
 		break;
 	case RDMA_CM_EVENT_TIMEWAIT_EXIT:
-
-		rdma_queue->state = CM_DISCONNECT;
-
-		wake_up_interruptible(&rdma_queue->sem);
-		break;
-	case RDMA_CM_EVENT_DEVICE_REMOVAL:
-		pr_err("%s, cma detected device removal!!!!\n", __func__);
-		return -1;
 		break;
 	default:
-		pr_err("%s,oof bad type!\n", __func__);
-		wake_up_interruptible(&rdma_queue->sem);
-		break;
+		queue_error(queue, -EPROTO);
 	}
-	return ret;
+	/* Destruction belongs to process-context cleanup, never CM auto-destroy. */
+	return 0;
 }
 
-static int
-rdma_resolve_ip_to_ib_device(struct rdma_session_context *rdma_session,
-			     struct rswap_rdma_queue *rdma_queue)
+static int rdma_resolve_ip_to_ib_device(struct rdma_session_context *session,
+		struct rswap_rdma_queue *queue)
 {
-	int ret;
-	struct sockaddr_storage sin;
-	struct sockaddr_in *sin4 = (struct sockaddr_in *)&sin;
-
-	sin4->sin_family = AF_INET;
-	memcpy((void *)&(sin4->sin_addr.s_addr), rdma_session->addr, 4);
-	sin4->sin_port = rdma_session->port;
-
-	ret = rdma_resolve_addr(rdma_queue->cm_id, NULL,
-				(struct sockaddr *)&sin, 2000);
-	if (ret) {
-		pr_err("%s, rdma_resolve_ip_to_ib_device error %d\n", __func__,
-		       ret);
-		return ret;
-	} else {
-	}
-
-	wait_event_interruptible(rdma_queue->sem,
-				 rdma_queue->state >= ROUTE_RESOLVED);
-	if (rdma_queue->state != ROUTE_RESOLVED) {
-		pr_err("%s, addr/route resolution did not resolve: state %d\n",
-		       __func__, rdma_queue->state);
-		return -EINTR;
-	}
-
-	return ret;
-}
-
-/**
- * Build the Queue Pair (QP).
- *
- */
-int rswap_create_qp(struct rdma_session_context *rdma_session,
-		    struct rswap_rdma_queue *rdma_queue)
-{
-	struct ib_qp_init_attr init_attr;
+	struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = session->port };
 	int ret;
 
-	memset(&init_attr, 0, sizeof(init_attr));
-	init_attr.cap.max_send_wr = rdma_session->send_queue_depth;
-	init_attr.cap.max_recv_wr = rdma_session->recv_queue_depth;
-	init_attr.cap.max_recv_sge = MAX_REQUEST_SGL;
-
-	init_attr.cap.max_send_sge = MAX_REQUEST_SGL;
-	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
-	init_attr.qp_type = IB_QPT_RC;
-
-	init_attr.send_cq = rdma_queue->cq;
-	init_attr.recv_cq = rdma_queue->cq;
-
-	ret = rdma_create_qp(rdma_queue->cm_id, rdma_session->rdma_dev->pd,
-			     &init_attr);
-	if (!ret) {
-		rdma_queue->qp = rdma_queue->cm_id->qp;
-	} else {
-		pr_err("%s:  Create QP falied. errno : %d \n", __func__, ret);
-	}
-
-	return ret;
+	memcpy(&addr.sin_addr.s_addr, session->addr, 4);
+	ret = rdma_resolve_addr(queue->cm_id, NULL, (struct sockaddr *)&addr, 2000);
+	return ret ? ret : wait_queue_state(queue, ROUTE_RESOLVED);
 }
 
-int rswap_create_rdma_queue(struct rdma_session_context *rdma_session,
-			    int rdma_queue_index)
+int rswap_create_qp(struct rdma_session_context *session,
+		struct rswap_rdma_queue *queue)
 {
-	int ret = 0;
-	struct rdma_cm_id *cm_id;
-	struct rswap_rdma_queue *rdma_queue;
-	int cq_num_cqes;
-	int comp_vector = 0;
-
-	rdma_queue = &(rdma_session->rdma_queues[rdma_queue_index]);
-	cm_id = rdma_queue->cm_id;
-
-	if (rdma_session->rdma_dev == NULL) {
-		rdma_session->rdma_dev =
-			kzalloc(sizeof(struct rswap_rdma_dev), GFP_KERNEL);
-
-		rdma_session->rdma_dev->pd = ib_alloc_pd(
-			cm_id->device, IB_ACCESS_LOCAL_WRITE |
-					       IB_ACCESS_REMOTE_READ |
-					       IB_ACCESS_REMOTE_WRITE);
-		rdma_session->rdma_dev->dev =
-			rdma_session->rdma_dev->pd->device;
-
-		if (IS_ERR(rdma_session->rdma_dev->pd)) {
-			pr_err("%s, ib_alloc_pd failed\n", __func__);
-			goto err;
-		}
-		pr_info("%s, created pd %p\n", __func__,
-			rdma_session->rdma_dev->pd);
-
-		setup_rdma_session_comm_buffer(rdma_session);
-	}
-
-	cq_num_cqes =
-		rdma_session->send_queue_depth + rdma_session->recv_queue_depth;
-	if (rdma_queue->type == QP_LOAD_ASYNC) {
-		rdma_queue->cq =
-			ib_alloc_cq(cm_id->device, rdma_queue, cq_num_cqes,
-				    comp_vector, IB_POLL_SOFTIRQ);
-	} else {
-		rdma_queue->cq =
-			ib_alloc_cq(cm_id->device, rdma_queue, cq_num_cqes,
-				    comp_vector, IB_POLL_DIRECT);
-	}
-
-	if (IS_ERR(rdma_queue->cq)) {
-		pr_err("%s, ib_create_cq failed\n", __func__);
-		ret = PTR_ERR(rdma_queue->cq);
-		goto err;
-	}
-
-	ret = rswap_create_qp(rdma_session, rdma_queue);
-	if (ret) {
-		pr_err("%s, failed: %d\n", __func__, ret);
-		goto err;
-	}
-
-err:
-	return ret;
-}
-
-/**
- * Reserve two RDMA wr for receive/send meesages
- * 		rdma_session_context->rq_wr
- * 		rdma_session_context->send_sgl
- * Post these 2 WRs to receive/send controll messages.
- */
-void rswap_setup_message_wr(struct rdma_session_context *rdma_session)
-{
-	rdma_session->rdma_recv_req.recv_sgl.addr =
-		rdma_session->rdma_recv_req.recv_dma_addr;
-	rdma_session->rdma_recv_req.recv_sgl.length = sizeof(struct message);
-	rdma_session->rdma_recv_req.recv_sgl.lkey =
-		rdma_session->rdma_dev->pd->local_dma_lkey;
-
-	rdma_session->rdma_recv_req.rq_wr.sg_list =
-		&(rdma_session->rdma_recv_req.recv_sgl);
-	rdma_session->rdma_recv_req.rq_wr.num_sge = 1;
-	rdma_session->rdma_recv_req.cqe.done = two_sided_message_done;
-	rdma_session->rdma_recv_req.rq_wr.wr_cqe =
-		&(rdma_session->rdma_recv_req.cqe);
-
-	rdma_session->rdma_send_req.send_sgl.addr =
-		rdma_session->rdma_send_req.send_dma_addr;
-	rdma_session->rdma_send_req.send_sgl.length = sizeof(struct message);
-	rdma_session->rdma_send_req.send_sgl.lkey =
-		rdma_session->rdma_dev->pd->local_dma_lkey;
-
-	rdma_session->rdma_send_req.sq_wr.opcode = IB_WR_SEND;
-	rdma_session->rdma_send_req.sq_wr.send_flags = IB_SEND_SIGNALED;
-	rdma_session->rdma_send_req.sq_wr.sg_list =
-		&rdma_session->rdma_send_req.send_sgl;
-	rdma_session->rdma_send_req.sq_wr.num_sge = 1;
-	rdma_session->rdma_send_req.cqe.done = two_sided_message_done;
-	rdma_session->rdma_send_req.sq_wr.wr_cqe =
-		&(rdma_session->rdma_send_req.cqe);
-
-	return;
-}
-
-int rswap_setup_buffers(struct rdma_session_context *rdma_session)
-{
-	int ret = 0;
-
-	rdma_session->rdma_recv_req.recv_buf =
-		kzalloc(sizeof(struct message), GFP_KERNEL);
-	rdma_session->rdma_send_req.send_buf =
-		kzalloc(sizeof(struct message), GFP_KERNEL);
-
-	rdma_session->rdma_recv_req.recv_dma_addr =
-		ib_dma_map_single(rdma_session->rdma_dev->dev,
-				  rdma_session->rdma_recv_req.recv_buf,
-				  sizeof(struct message), DMA_BIDIRECTIONAL);
-	rdma_session->rdma_send_req.send_dma_addr =
-		ib_dma_map_single(rdma_session->rdma_dev->dev,
-				  rdma_session->rdma_send_req.send_buf,
-				  sizeof(struct message), DMA_BIDIRECTIONAL);
-
-	print_debug(
-		"%s, Got dma/bus address 0x%llx, for the recv_buf 0x%llx \n",
-		__func__,
-		(unsigned long long)rdma_session->rdma_recv_req.recv_dma_addr,
-		(unsigned long long)rdma_session->rdma_recv_req.recv_buf);
-	print_debug(
-		"%s, Got dma/bus address 0x%llx, for the send_buf 0x%llx \n",
-		__func__,
-		(unsigned long long)rdma_session->rdma_send_req.send_dma_addr,
-		(unsigned long long)rdma_session->rdma_send_req.send_buf);
-
-	rswap_setup_message_wr(rdma_session);
-	print_debug(KERN_INFO "%s, allocated & registered buffers...\n",
-		    __func__);
-	print_debug(KERN_INFO "%s is done. \n", __func__);
-
-	return ret;
-}
-
-/**
- * All the PD, QP, CP are setted up, connect to remote IB servers.
- * This will send a CM event to remote IB server && get a CM event response back.
- */
-int rswap_connect_remote_memory_server(
-	struct rdma_session_context *rdma_session, int rdma_queue_inx)
-{
-	struct rdma_conn_param conn_param;
+	struct ib_qp_init_attr attr = {};
 	int ret;
-	struct rswap_rdma_queue *rdma_queue;
-	const struct ib_recv_wr *bad_wr;
 
-	rdma_queue = &(rdma_session->rdma_queues[rdma_queue_inx]);
-	memset(&conn_param, 0, sizeof conn_param);
-	conn_param.responder_resources = 1;
-	conn_param.initiator_depth = 1;
-	conn_param.retry_count = 10;
+	attr.cap.max_send_wr = session->send_queue_depth;
+	attr.cap.max_recv_wr = session->recv_queue_depth;
+	attr.cap.max_recv_sge = MAX_REQUEST_SGL;
+	attr.cap.max_send_sge = MAX_REQUEST_SGL;
+	attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+	attr.qp_type = IB_QPT_RC;
+	attr.send_cq = queue->cq;
+	attr.recv_cq = queue->cq;
+	ret = rdma_create_qp(queue->cm_id, session->rdma_dev->pd, &attr);
+	if (!ret)
+		queue->qp = queue->cm_id->qp;
+	return ret;
+}
 
-	atomic_inc(&rdma_queue->rdma_post_counter);
-	ret = ib_post_recv(rdma_queue->qp, &rdma_session->rdma_recv_req.rq_wr,
-			   &bad_wr);
-	if (ret) {
-		pr_err("%s: post a 2-sided RDMA message error \n", __func__);
-		goto err;
+int rswap_create_rdma_queue(struct rdma_session_context *session, int index)
+{
+	struct rswap_rdma_queue *queue = &session->rdma_queues[index];
+	struct ib_device *dev = queue->cm_id->device;
+	struct ib_pd *pd;
+	int ret;
+
+	if (!session->rdma_dev) {
+		session->rdma_dev = kzalloc(sizeof(*session->rdma_dev), GFP_KERNEL);
+		if (!session->rdma_dev)
+			return -ENOMEM;
+		/* The Client needs a local DMA key, not a remotely accessible PD. */
+		pd = ib_alloc_pd(dev, 0);
+		if (IS_ERR(pd))
+			return PTR_ERR(pd);
+		session->rdma_dev->pd = pd;
+		session->rdma_dev->dev = dev;
+		ret = setup_rdma_session_comm_buffer(session);
+		if (ret)
+			return ret;
+	} else if (session->rdma_dev->dev != dev) {
+		return -EXDEV;
 	}
-
-	ret = rdma_connect(rdma_queue->cm_id, &conn_param);
-	if (ret) {
-		pr_err("%s, rdma_connect error %d\n", __func__, ret);
+	queue->cq = ib_alloc_cq(dev, queue,
+		session->send_queue_depth + session->recv_queue_depth, 0,
+		queue->type == QP_LOAD_ASYNC ? IB_POLL_SOFTIRQ : IB_POLL_DIRECT);
+	if (IS_ERR(queue->cq)) {
+		ret = PTR_ERR(queue->cq);
+		queue->cq = NULL;
 		return ret;
 	}
-
-	wait_event_interruptible(rdma_queue->sem,
-				 rdma_queue->state >= CONNECTED);
-	if (rdma_queue->state == ERROR) {
-		pr_err("%s, Received ERROR response, state %d\n", __func__,
-		       rdma_queue->state);
-		return -1;
-	}
-
-	drain_rdma_queue(rdma_queue);
-
-err:
-	return ret;
+	return rswap_create_qp(session, queue);
 }
 
-/**
- * Invoke this information after getting the free size of remote memory pool.
- * Initialize the chunk_list based on the chunk size and remote free memory size.
- *
- *
- * More Explanation:
- * 	Record the address of the mapped chunk:
- * 		remote_rkey : Used by the client, read/write data here.
- * 		remote_addr : The actual virtual address of the mapped chunk ?
- *
- */
-int init_remote_chunk_list(struct rdma_session_context *rdma_session)
+void rswap_setup_message_wr(struct rdma_session_context *session)
 {
-	int ret = 0;
-	uint32_t i;
+	struct two_sided_rdma_recv *recv = &session->rdma_recv_req;
+	struct two_sided_rdma_send *send = &session->rdma_send_req;
 
-	rdma_session->remote_mem_pool.chunks = (struct remote_chunk *)kzalloc(
-		sizeof(struct remote_chunk) *
-			rdma_session->remote_mem_pool.chunk_num,
-		GFP_KERNEL);
-
-	for (i = 0; i < rdma_session->remote_mem_pool.chunk_num; i++) {
-		rdma_session->remote_mem_pool.chunks[i].chunk_state = EMPTY;
-		rdma_session->remote_mem_pool.chunks[i].remote_addr = 0x0;
-		rdma_session->remote_mem_pool.chunks[i].mapped_size = 0x0;
-		rdma_session->remote_mem_pool.chunks[i].remote_rkey = 0x0;
-	}
-
-	return ret;
+	recv->recv_sgl.addr = recv->recv_dma_addr;
+	recv->recv_sgl.length = sizeof(struct message);
+	recv->recv_sgl.lkey = session->rdma_dev->pd->local_dma_lkey;
+	recv->rq_wr.sg_list = &recv->recv_sgl;
+	recv->rq_wr.num_sge = 1;
+	recv->cqe.done = two_sided_message_done;
+	recv->rq_wr.wr_cqe = &recv->cqe;
+	send->send_sgl.addr = send->send_dma_addr;
+	send->send_sgl.length = sizeof(struct message);
+	send->send_sgl.lkey = session->rdma_dev->pd->local_dma_lkey;
+	send->sq_wr.sg_list = &send->send_sgl;
+	send->sq_wr.num_sge = 1;
+	send->sq_wr.opcode = IB_WR_SEND;
+	send->sq_wr.send_flags = IB_SEND_SIGNALED;
+	send->cqe.done = two_sided_message_done;
+	send->sq_wr.wr_cqe = &send->cqe;
 }
 
-/**
- * Get a chunk mapping 2-sided RDMA message.
- * Bind these chunks to the cient in order.
- */
-void bind_remote_memory_chunks(struct rdma_session_context *rdma_session)
+int rswap_setup_buffers(struct rdma_session_context *session)
 {
-	int i;
-	int chunk_num = rdma_session->remote_mem_pool.chunk_num;
+	struct ib_device *dev = session->rdma_dev->dev;
 
-	for (i = 0; i < chunk_num; i++) {
-		if (rdma_session->rdma_recv_req.recv_buf->rkey[i]) {
-			rdma_session->remote_mem_pool.chunks[i].remote_rkey =
-				rdma_session->rdma_recv_req.recv_buf->rkey[i];
-			rdma_session->remote_mem_pool.chunks[i].remote_addr =
-				rdma_session->rdma_recv_req.recv_buf->buf[i];
-			rdma_session->remote_mem_pool.chunks[i].mapped_size =
-				rdma_session->rdma_recv_req.recv_buf
-					->mapped_size[i];
-			rdma_session->remote_mem_pool.chunks[i].chunk_state =
-				MAPPED;
-
-			print_debug(
-				KERN_INFO
-				"Got chunk[%d] : remote_addr : 0x%llx, remote_rkey: 0x%x, mapped_size: 0x%llx \n",
-				i,
-				rdma_session->remote_mem_pool.chunks[i]
-					.remote_addr,
-				rdma_session->remote_mem_pool.chunks[i]
-					.remote_rkey,
-				rdma_session->remote_mem_pool.chunks[i]
-					.mapped_size);
-		}
-	}
+	session->rdma_recv_req.recv_buf = kzalloc(sizeof(struct message), GFP_KERNEL);
+	session->rdma_send_req.send_buf = kzalloc(sizeof(struct message), GFP_KERNEL);
+	if (!session->rdma_recv_req.recv_buf || !session->rdma_send_req.send_buf)
+		return -ENOMEM;
+	session->rdma_recv_req.recv_dma_addr = ib_dma_map_single(dev,
+		session->rdma_recv_req.recv_buf, sizeof(struct message), DMA_BIDIRECTIONAL);
+	if (ib_dma_mapping_error(dev, session->rdma_recv_req.recv_dma_addr))
+		return -ENOMEM;
+	session->recv_mapped = true;
+	session->rdma_send_req.send_dma_addr = ib_dma_map_single(dev,
+		session->rdma_send_req.send_buf, sizeof(struct message), DMA_BIDIRECTIONAL);
+	if (ib_dma_mapping_error(dev, session->rdma_send_req.send_dma_addr))
+		return -ENOMEM;
+	session->send_mapped = true;
+	rswap_setup_message_wr(session);
+	return 0;
 }
 
-/**
- * Init the rdma sessions for each memory server.
- */
-int init_rdma_sessions(struct rdma_session_context *rdma_session)
+int setup_rdma_session_comm_buffer(struct rdma_session_context *session)
 {
-	int ret = 0;
-
-	rdma_session->rdma_queues = kzalloc(
-		sizeof(struct rswap_rdma_queue) * num_queues, GFP_KERNEL);
-	rdma_session->send_queue_depth = RDMA_SEND_QUEUE_DEPTH + 1;
-	rdma_session->recv_queue_depth = RDMA_RECV_QUEUE_DEPTH + 1;
-
-	rdma_session->port = htons(server_port);
-	ret = in4_pton(server_ip, strlen(server_ip), rdma_session->addr, -1,
-		       NULL);
-	if (ret == 0) {
-		pr_err("Assign ip %s to  rdma_session->addr : %s failed.\n",
-		       server_ip, rdma_session->addr);
-		goto err;
-	}
-	rdma_session->addr_type = AF_INET;
-
-err:
-	return ret;
+	return rswap_setup_buffers(session);
 }
 
-/**
- * Reserve some rdma_wr, registerred buffer for fast communiction.
- */
-int setup_rdma_session_comm_buffer(struct rdma_session_context *rdma_session)
+int rswap_connect_remote_memory_server(struct rdma_session_context *session, int index)
 {
-	int ret = 0;
+	struct rswap_rdma_queue *queue = &session->rdma_queues[index];
+	struct rdma_conn_param param = {
+		.responder_resources = 1, .initiator_depth = 1, .retry_count = 7,
+	};
+	int ret = post_control_recv(session, queue, AVAILABLE_TO_QUERY);
 
-	if (rdma_session->rdma_dev == NULL) {
-		pr_err("%s, rdma_session->rdma_dev is NULL. too early to regiseter RDMA buffer.\n",
-		       __func__);
-		goto err;
-	}
-
-	ret = rswap_setup_buffers(rdma_session);
-	if (unlikely(ret)) {
-		pr_err("%s, Bind DMA buffer error\n", __func__);
-		goto err;
-	}
-
-err:
-	return ret;
-}
-
-/**
- * Build and Connect all the QP for each Session/memory server.
- */
-int rswap_init_rdma_queue(struct rdma_session_context *rdma_session, int idx)
-{
-	int ret = 0;
-	struct rswap_rdma_queue *rdma_queue = &(rdma_session->rdma_queues[idx]);
-
-	rdma_queue->rdma_session = rdma_session;
-	rdma_queue->q_index = idx;
-	rdma_queue->type = get_qp_type(idx);
-	rdma_queue->cm_id =
-		rdma_create_id(&init_net, rswap_rdma_cm_event_handler,
-			       rdma_queue, RDMA_PS_TCP, IB_QPT_RC);
-	if (IS_ERR(rdma_queue->cm_id)) {
-		pr_err("failed to create cm id: %ld\n",
-		       PTR_ERR(rdma_queue->cm_id));
-		ret = -ENODEV;
-		goto err;
-	}
-
-	rdma_queue->state = IDLE;
-	init_waitqueue_head(&rdma_queue->sem);
-	spin_lock_init(&(rdma_queue->cq_lock));
-	atomic_set(&(rdma_queue->rdma_post_counter), 0);
-	rdma_queue->fs_rdma_req_cache =
-		kmem_cache_create("fs_rdma_req_cache",
-				  sizeof(struct fs_rdma_req), 0,
-				  SLAB_TEMPORARY | SLAB_HWCACHE_ALIGN, NULL);
-	if (unlikely(rdma_queue->fs_rdma_req_cache == NULL)) {
-		pr_err("%s, allocate rdma_queue->fs_rdma_req_cache failed.\n",
-		       __func__);
-		ret = -1;
-		goto err;
-	}
-
-	ret = rdma_resolve_ip_to_ib_device(rdma_session, rdma_queue);
-	if (unlikely(ret)) {
-		pr_err("%s, bind socket error (addr or route resolve error)\n",
-		       __func__);
+	if (ret)
 		return ret;
-	}
-
-	return ret;
-
-err:
-	rdma_destroy_id(rdma_queue->cm_id);
-	return ret;
+	queue->connect_started = true;
+	ret = rdma_connect(queue->cm_id, &param);
+	return ret ? ret : wait_queue_state(queue, MEMORY_SERVER_AVAILABLE);
 }
 
-/**
- * Build the RDMA connection to remote memory server.
- */
-int rdma_session_connect(struct rdma_session_context *rdma_session)
+int init_remote_chunk_list(struct rdma_session_context *session)
 {
-	int ret;
+	session->remote_mem_pool.chunks = kcalloc(session->expected_chunks,
+					 sizeof(struct remote_chunk), GFP_KERNEL);
+	return session->remote_mem_pool.chunks ? 0 : -ENOMEM;
+}
+
+void bind_remote_memory_chunks(struct rdma_session_context *session)
+{
+	struct message *msg = session->rdma_recv_req.recv_buf;
+	unsigned int i;
+
+	for (i = 0; i < session->expected_chunks; i++) {
+		struct remote_chunk *chunk = &session->remote_mem_pool.chunks[i];
+
+		chunk->remote_rkey = msg->rkey[i];
+		chunk->remote_addr = msg->buf[i];
+		chunk->mapped_size = msg->mapped_size[i];
+		chunk->chunk_state = MAPPED;
+	}
+}
+
+int init_rdma_sessions(struct rdma_session_context *session)
+{
 	int i;
 
+	session->rdma_queues = kcalloc(num_queues, sizeof(struct rswap_rdma_queue), GFP_KERNEL);
+	if (!session->rdma_queues)
+		return -ENOMEM;
+	session->send_queue_depth = RDMA_SEND_QUEUE_DEPTH + 1;
+	session->recv_queue_depth = RDMA_RECV_QUEUE_DEPTH + 1;
 	for (i = 0; i < num_queues; i++) {
-		ret = rswap_init_rdma_queue(rdma_session, i);
-		if (unlikely(ret)) {
-			pr_err("%s,init rdma queue [%d] failed.\n", __func__,
-			       i);
-		}
+		struct rswap_rdma_queue *queue = &session->rdma_queues[i];
 
-		ret = rswap_create_rdma_queue(rdma_session, i);
-		if (unlikely(ret)) {
-			pr_err("%s, Create rdma queues failed. \n", __func__);
-		}
-
-		ret = rswap_connect_remote_memory_server(rdma_session, i);
-		if (unlikely(ret)) {
-			pr_err("%s: Connect to remote server error \n",
-			       __func__);
-			goto err;
-		}
-
-		pr_info("%s, RDMA queue[%d] Connect to remote server successfully \n",
-			__func__, i);
+		queue->rdma_session = session;
+		queue->q_index = i;
+		queue->type = get_qp_type(i);
+		queue->state = IDLE;
+		init_waitqueue_head(&queue->sem);
+		spin_lock_init(&queue->cq_lock);
+		atomic_set(&queue->rdma_post_counter, 0);
 	}
+	return 0;
+}
 
-	ret = rswap_query_available_memory(rdma_session);
-	if (unlikely(ret)) {
-		printk("%s, request for chunk failed.\n", __func__);
-		goto err;
+int rswap_init_rdma_queue(struct rdma_session_context *session, int index)
+{
+	struct rswap_rdma_queue *queue = &session->rdma_queues[index];
+	struct rdma_cm_id *id;
+	char name[48];
+
+	id = rdma_create_id(&init_net, rswap_rdma_cm_event_handler, queue,
+			    RDMA_PS_TCP, IB_QPT_RC);
+	if (IS_ERR(id))
+		return PTR_ERR(id);
+	queue->cm_id = id;
+	snprintf(name, sizeof(name), "rswap_s%u_q%d", session->server_id, index);
+	queue->fs_rdma_req_cache = kmem_cache_create(name, sizeof(struct fs_rdma_req),
+				0, SLAB_TEMPORARY | SLAB_HWCACHE_ALIGN, NULL);
+	if (!queue->fs_rdma_req_cache)
+		return -ENOMEM;
+	return rdma_resolve_ip_to_ib_device(session, queue);
+}
+
+int rdma_session_connect(struct rdma_session_context *session)
+{
+	int i, ret;
+
+	session->deadline = jiffies + msecs_to_jiffies(session->timeout_ms);
+	for (i = 0; i < num_queues; i++) {
+		ret = rswap_init_rdma_queue(session, i);
+		if (!ret)
+			ret = rswap_create_rdma_queue(session, i);
+		if (!ret)
+			ret = rswap_connect_remote_memory_server(session, i);
+		if (ret) {
+			pr_err("rswap: server=%u queue=%d initialization failed: %d\n",
+			       session->server_id, i, ret);
+			return ret;
+		}
 	}
-
-	ret = rswap_request_for_chunk(rdma_session);
-	if (unlikely(ret)) {
-		printk("%s, request for chunk failed.\n", __func__);
-		goto err;
-	}
-
-	printk("%s,Exit the main() function with built RDMA conenction rdma_session_context:0x%llx .\n",
-	       __func__, (uint64_t)rdma_session);
-
-	return ret;
-
-err:
-	pr_err("ERROR in %s \n", __func__);
+	ret = rswap_query_available_memory(session);
+	if (!ret)
+		ret = rswap_request_for_chunk(session);
+	if (!ret)
+		ret = READ_ONCE(session->error);
+	if (!ret)
+		pr_info("rswap: server=%u ready queues=%d capacity=%u GiB regions=%u\n",
+			session->server_id, num_queues,
+			session->remote_mem_pool.remote_mem_size, session->expected_chunks);
 	return ret;
 }
 
-/**
- * Free the RDMA buffers.
- */
-void rswap_free_buffers(struct rdma_session_context *rdma_session)
+void rswap_free_buffers(struct rdma_session_context *session)
 {
-	if (rdma_session == NULL)
-		return;
+	struct ib_device *dev = session->rdma_dev ? session->rdma_dev->dev : NULL;
 
-	if (rdma_session->rdma_recv_req.recv_buf != NULL)
-		kfree(rdma_session->rdma_recv_req.recv_buf);
-	if (rdma_session->rdma_send_req.send_buf != NULL)
-		kfree(rdma_session->rdma_send_req.send_buf);
-
-	if (rdma_session->remote_mem_pool.chunks != NULL)
-		kfree(rdma_session->remote_mem_pool.chunks);
-
-	print_debug("%s, Free RDMA buffers done. \n", __func__);
+	if (session->send_mapped) {
+		ib_dma_unmap_single(dev, session->rdma_send_req.send_dma_addr,
+				    sizeof(struct message), DMA_BIDIRECTIONAL);
+		session->send_mapped = false;
+	}
+	if (session->recv_mapped) {
+		ib_dma_unmap_single(dev, session->rdma_recv_req.recv_dma_addr,
+				    sizeof(struct message), DMA_BIDIRECTIONAL);
+		session->recv_mapped = false;
+	}
+	kfree(session->rdma_recv_req.recv_buf);
+	session->rdma_recv_req.recv_buf = NULL;
+	kfree(session->rdma_send_req.send_buf);
+	session->rdma_send_req.send_buf = NULL;
+	kfree(session->remote_mem_pool.chunks);
+	session->remote_mem_pool.chunks = NULL;
 }
 
-/**
- * Free RDMA related structures.
- */
-void rswap_free_rdma_structure(struct rdma_session_context *rdma_session)
+int rswap_disconnect_and_collect_resource(struct rdma_session_context *session)
 {
-	struct rswap_rdma_queue *rdma_queue;
 	int i;
 
-	if (rdma_session == NULL)
-		return;
-
+	WRITE_ONCE(session->stopping, true);
+	if (!session->rdma_queues)
+		return 0;
 	for (i = 0; i < num_queues; i++) {
-		rdma_queue = &(rdma_session->rdma_queues[i]);
-		if (rdma_queue->cm_id != NULL) {
-			rdma_destroy_id(rdma_queue->cm_id);
-			print_debug(
-				"%s, free rdma_queue[%d] rdma_cm_id done. \n",
-				__func__, i);
-		}
+		struct rswap_rdma_queue *queue = &session->rdma_queues[i];
 
-		if (rdma_queue->qp != NULL) {
-			ib_destroy_qp(rdma_queue->qp);
-			print_debug("%s, free rdma_queue[%d] ib_qp  done. \n",
-				    __func__, i);
+		if (queue->qp) {
+			if (queue->connect_started)
+				rdma_disconnect(queue->cm_id);
+			/* Flush both SQ and RQ, including an unanswered control receive. */
+			ib_drain_qp(queue->qp);
+			rdma_destroy_qp(queue->cm_id);
+			queue->qp = NULL;
 		}
-
-		if (rdma_queue->cq != NULL) {
-			ib_destroy_cq(rdma_queue->cq);
-			print_debug("%s, free rdma_queue[%d] ib_cq  done. \n",
-				    __func__, i);
+		if (queue->cq) {
+			ib_free_cq(queue->cq);
+			queue->cq = NULL;
 		}
+		WARN_ON(atomic_read(&queue->rdma_post_counter));
 	}
-
-	if (rdma_session->rdma_dev->pd != NULL) {
-		ib_dealloc_pd(rdma_session->rdma_dev->pd);
-		print_debug("%s, Free device PD  done. \n", __func__);
-	}
-	print_debug("%s, Free RDMA structures,cm_id,qp,cq,pd done. \n",
-		    __func__);
-}
-
-/**
- * The main entry for resource free.
- */
-int rswap_disconnect_and_collect_resource(
-	struct rdma_session_context *rdma_session)
-{
-	int ret = 0;
-	int i;
-	struct rswap_rdma_queue *rdma_queue;
-
-	for (i = 0; i < num_queues; i++) {
-		rdma_queue = &(rdma_session->rdma_queues[i]);
-
-		if (unlikely(rdma_queue->freed != 0)) {
-			pr_warn("%s, rdma_queue[%d] already freed. \n",
-				__func__, i);
-			continue;
-		}
-		rdma_queue->freed++;
-
-		if (rdma_queue->state != CM_DISCONNECT) {
-			ret = rdma_disconnect(rdma_queue->cm_id);
-			if (ret) {
-				pr_err("%s, RDMA disconnect failed. \n",
-				       __func__);
-				goto err;
-			}
-		}
-		print_debug(
-			"%s, RDMA queue[%d] disconnected, start to free resoutce. \n",
-			__func__, i);
+	/* CM IDs still hold their device references while DMA and PD are released. */
+	rswap_free_buffers(session);
+	if (session->rdma_dev) {
+		if (session->rdma_dev->pd)
+			ib_dealloc_pd(session->rdma_dev->pd);
+		kfree(session->rdma_dev);
+		session->rdma_dev = NULL;
 	}
 	for (i = 0; i < num_queues; i++) {
-		wait_event_interruptible(rdma_queue->sem,
-					 rdma_queue->state == CM_DISCONNECT);
+		struct rswap_rdma_queue *queue = &session->rdma_queues[i];
+
+		if (queue->cm_id) {
+			/* Waits for CM handlers and cancels unresolved address/route work. */
+			rdma_destroy_id(queue->cm_id);
+			queue->cm_id = NULL;
+		}
+		if (queue->fs_rdma_req_cache)
+			kmem_cache_destroy(queue->fs_rdma_req_cache);
 	}
-
-	rswap_free_buffers(rdma_session);
-	rswap_free_rdma_structure(rdma_session);
-
-	print_debug("%s, RDMA memory resouce freed. \n", __func__);
-err:
-	return ret;
+	kfree(session->rdma_queues);
+	session->rdma_queues = NULL;
+	pr_info("rswap: server=%u resources released\n", session->server_id);
+	return 0;
 }
 
 /**

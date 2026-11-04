@@ -31,8 +31,8 @@ export KBUILD_EXTRA_SYMBOLS=$(OFA_SYMVERS)
 KDIR ?= /lib/modules/`uname -r`/build
 
 default:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(RSWAP_ROOT_PATH) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$$PWD clean
+	$(MAKE) -C $(KDIR) M=$(RSWAP_ROOT_PATH) clean
 endif

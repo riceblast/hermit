@@ -138,54 +138,17 @@ static struct frontswap_ops rswap_frontswap_ops = {
 
 int rswap_register_frontswap(void)
 {
-	frontswap_register_ops(&rswap_frontswap_ops);
-	pr_info("frontswap module loaded\n");
-	return 0;
-}
-
-int rswap_replace_frontswap(void)
-{
-	frontswap_ops->init = rswap_frontswap_ops.init;
-	frontswap_ops->store = rswap_frontswap_ops.store;
-	frontswap_ops->load = rswap_frontswap_ops.load;
-	frontswap_ops->invalidate_page = rswap_frontswap_ops.invalidate_page,
-	frontswap_ops->invalidate_area = rswap_frontswap_ops.invalidate_area,
-#ifdef RSWAP_KERNEL_SUPPORT
-	frontswap_ops->load_async = rswap_frontswap_ops.load_async;
-	frontswap_ops->poll_load = rswap_frontswap_ops.poll_load;
-#if RSWAP_KERNEL_SUPPORT >= 2
-	frontswap_ops->store_on_core = rswap_frontswap_ops.store_on_core;
-	frontswap_ops->poll_store = rswap_frontswap_ops.poll_store;
-#endif // RSWAP_KERNEL_SUPPORT >= 2
-#if RSWAP_KERNEL_SUPPORT >= 3
-	frontswap_ops->peek_load = rswap_frontswap_ops.peek_load;
-	frontswap_ops->peek_store = rswap_frontswap_ops.peek_store;
-#endif // RSWAP_KERNEL_SUPPORT >= 3
-#endif
-	pr_info("frontswap ops replaced\n");
-	return 0;
+	return frontswap_register_managed_ops(&rswap_frontswap_ops, THIS_MODULE, 0);
 }
 
 void rswap_deregister_frontswap(void)
 {
-#ifdef RSWAP_KERNEL_SUPPORT
-	frontswap_ops->init = NULL;
-	frontswap_ops->store = NULL;
-	frontswap_ops->load = NULL;
-	frontswap_ops->load_async = NULL;
-	frontswap_ops->poll_load = NULL;
-#else
-	frontswap_ops->init = NULL;
-	frontswap_ops->store = NULL;
-	frontswap_ops->load = NULL;
-	frontswap_ops->poll_load = NULL;
-#endif
-	pr_info("frontswap ops deregistered\n");
+	frontswap_unregister_managed_ops(&rswap_frontswap_ops);
 }
 
-int rswap_client_init(char *server_ip, int server_port, int mem_size)
+int rswap_client_init(const struct rswap_client_config *config)
 {
-	return rswap_init_local_dram(mem_size);
+	return rswap_init_local_dram(config->size_gb);
 }
 
 void rswap_client_exit(void)

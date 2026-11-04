@@ -18,21 +18,28 @@
 #include <linux/debugfs.h>
 #include <linux/frontswap.h>
 #include <linux/swapfile.h>
+#include <linux/mutex.h>
+#include <linux/srcu.h>
 
 DEFINE_STATIC_KEY_FALSE(frontswap_enabled_key);
 EXPORT_SYMBOL(frontswap_enabled_key);
 
-/*
- * frontswap_ops are added by frontswap_register_ops, and provide the
- * frontswap "backend" implementation functions.  Multiple implementations
- * may be registered, but implementations can never deregister.  This
- * is a simple singly-linked list of all registered implementations.
- */
+/* Legacy backends remain permanent. A managed backend is exclusive. */
 struct frontswap_ops *frontswap_ops __read_mostly;
 EXPORT_SYMBOL(frontswap_ops);
 
-#define for_each_frontswap_ops(ops)		\
-	for ((ops) = frontswap_ops; (ops); (ops) = (ops)->next)
+static DEFINE_MUTEX(frontswap_mutex);
+DEFINE_STATIC_SRCU(frontswap_srcu);
+static struct module *managed_owner;
+static unsigned long managed_max_pages;
+static int managed_type = -1;
+static bool managed_unregistering;
+
+/* Callers hold either the control mutex or a SRCU read-side section. */
+#define for_each_frontswap_ops(ops)                                      \
+	for ((ops) = srcu_dereference_check(frontswap_ops, &frontswap_srcu, \
+			lockdep_is_held(&frontswap_mutex));                   \
+	     (ops); (ops) = READ_ONCE((ops)->next))
 
 /*
  * If enabled, frontswap_store will return failure even on success.  As
@@ -86,33 +93,11 @@ static inline void inc_frontswap_invalidates(void) { }
 #endif
 
 /*
- * Due to the asynchronous nature of the backends loading potentially
- * _after_ the swap system has been activated, we have chokepoints
- * on all frontswap functions to not call the backend until the backend
- * has registered.
- *
- * This would not guards us against the user deciding to call swapoff right as
- * we are calling the backend to initialize (so swapon is in action).
- * Fortunately for us, the swapon_mutex has been taken by the callee so we are
- * OK. The other scenario where calls to frontswap_store (called via
- * swap_writepage) is racing with frontswap_invalidate_area (called via
- * swapoff) is again guarded by the swap subsystem.
- *
- * While no backend is registered all calls to frontswap_[store|load|
- * invalidate_area|invalidate_page] are ignored or fail.
- *
- * The time between the backend being registered and the swap file system
- * calling the backend (via the frontswap_* functions) is indeterminate as
- * frontswap_ops is not atomic_t (or a value guarded by a spinlock).
- * That is OK as we are comfortable missing some of these calls to the newly
- * registered backend.
- *
- * Obviously the opposite (unloading the backend) must be done after all
- * the frontswap_[store|load|invalidate_area|invalidate_page] start
- * ignoring or failing the requests.  However, there is currently no way
- * to unload a backend once it is registered.
+ * A swap-area binding pins a managed module until invalidate_area has
+ * completed. SRCU independently protects calls which already fetched ops,
+ * including CPU-only poll/peek callbacks. RDMA completion lifetime remains
+ * the backend's responsibility: it must quiesce those before module_exit.
  */
-
 /*
  * Register operations for frontswap
  */
@@ -122,6 +107,13 @@ void frontswap_register_ops(struct frontswap_ops *ops)
 	DECLARE_BITMAP(b, MAX_SWAPFILES);
 	struct swap_info_struct *si;
 	unsigned int i;
+
+	mutex_lock(&frontswap_mutex);
+	if (managed_owner || managed_unregistering) {
+		pr_err("frontswap: an exclusive backend is registered\n");
+		mutex_unlock(&frontswap_mutex);
+		return;
+	}
 
 	bitmap_zero(a, MAX_SWAPFILES);
 	bitmap_zero(b, MAX_SWAPFILES);
@@ -169,8 +161,83 @@ void frontswap_register_ops(struct frontswap_ops *ops)
 				ops->invalidate_area(i);
 		}
 	}
+	mutex_unlock(&frontswap_mutex);
 }
 EXPORT_SYMBOL(frontswap_register_ops);
+
+/* Register only before swap is enabled, never over an existing backend. */
+int frontswap_register_managed_ops(struct frontswap_ops *ops,
+		struct module *owner, unsigned long max_pages)
+{
+	unsigned int type;
+	int ret = 0;
+
+	if (!ops || !owner || !ops->init || !ops->store || !ops->load ||
+	    !ops->invalidate_page || !ops->invalidate_area)
+		return -EINVAL;
+#ifdef RSWAP_KERNEL_SUPPORT
+	if (!ops->load_async || !ops->poll_load)
+		return -EINVAL;
+#if RSWAP_KERNEL_SUPPORT >= 2
+	if (!ops->store_on_core || !ops->poll_store)
+		return -EINVAL;
+#endif
+#if RSWAP_KERNEL_SUPPORT >= 3
+	if (!ops->peek_load || !ops->peek_store)
+		return -EINVAL;
+#endif
+#endif
+	mutex_lock(&frontswap_mutex);
+	if (frontswap_ops || managed_unregistering) {
+		ret = -EBUSY;
+		goto out;
+	}
+	/* SWP_USED also covers swap areas being prepared or torn down. */
+	spin_lock(&swap_lock);
+	for (type = 0; type < MAX_SWAPFILES; type++) {
+		if (swap_info[type] && (swap_info[type]->flags & SWP_USED)) {
+			ret = -EBUSY;
+			break;
+		}
+	}
+	spin_unlock(&swap_lock);
+	if (ret)
+		goto out;
+
+	managed_owner = owner;
+	managed_max_pages = max_pages;
+	managed_type = -1;
+	ops->next = NULL;
+	rcu_assign_pointer(frontswap_ops, ops);
+	static_branch_inc(&frontswap_enabled_key);
+out:
+	mutex_unlock(&frontswap_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(frontswap_register_managed_ops);
+
+/* Caller owns ops; an active binding prevents its module_exit from running. */
+void frontswap_unregister_managed_ops(struct frontswap_ops *ops)
+{
+	mutex_lock(&frontswap_mutex);
+	if (WARN_ON(frontswap_ops != ops || !managed_owner || managed_type != -1)) {
+		mutex_unlock(&frontswap_mutex);
+		return;
+	}
+	managed_unregistering = true;
+	rcu_assign_pointer(frontswap_ops, NULL);
+	static_branch_dec(&frontswap_enabled_key);
+	mutex_unlock(&frontswap_mutex);
+
+	/* Never wait while holding a lock which a reader might acquire. */
+	synchronize_srcu(&frontswap_srcu);
+	mutex_lock(&frontswap_mutex);
+	managed_owner = NULL;
+	managed_max_pages = 0;
+	managed_unregistering = false;
+	mutex_unlock(&frontswap_mutex);
+}
+EXPORT_SYMBOL_GPL(frontswap_unregister_managed_ops);
 
 /*
  * Enable/disable frontswap writethrough (see above).
@@ -193,28 +260,41 @@ EXPORT_SYMBOL(frontswap_tmem_exclusive_gets);
 /*
  * Called when a swap device is swapon'd.
  */
-void __frontswap_init(unsigned type, unsigned long *map)
+int __frontswap_init(unsigned type, unsigned long *map)
 {
 	struct swap_info_struct *sis = swap_info[type];
 	struct frontswap_ops *ops;
+	int ret = 0;
 
 	VM_BUG_ON(sis == NULL);
-
-	/*
-	 * p->frontswap is a bitmap that we MUST have to figure out which page
-	 * has gone in frontswap. Without it there is no point of continuing.
-	 */
-	if (WARN_ON(!map))
-		return;
-	/*
-	 * Irregardless of whether the frontswap backend has been loaded
-	 * before this function or it will be later, we _MUST_ have the
-	 * p->frontswap set to something valid to work properly.
-	 */
+	mutex_lock(&frontswap_mutex);
+	if (managed_owner) {
+		if (managed_unregistering || managed_type != -1) {
+			ret = -EBUSY;
+			goto out;
+		}
+		if (!map || !managed_max_pages) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		if (sis->max > managed_max_pages) {
+			ret = -ENOSPC;
+			goto out;
+		}
+		if (!try_module_get(managed_owner)) {
+			ret = -EBUSY;
+			goto out;
+		}
+		managed_type = type;
+	}
 	frontswap_map_set(sis, map);
-
-	for_each_frontswap_ops(ops)
-		ops->init(type);
+	/* No bitmap means this ordinary swap area cannot use a backend. */
+	if (map)
+		for_each_frontswap_ops(ops)
+			ops->init(type);
+out:
+	mutex_unlock(&frontswap_mutex);
+	return ret;
 }
 EXPORT_SYMBOL(__frontswap_init);
 
@@ -230,15 +310,15 @@ EXPORT_SYMBOL(__frontswap_test);
 static inline void __frontswap_set(struct swap_info_struct *sis,
 				   pgoff_t offset)
 {
-	set_bit(offset, sis->frontswap_map);
-	atomic_inc(&sis->frontswap_pages);
+	if (!test_and_set_bit(offset, sis->frontswap_map))
+		atomic_inc(&sis->frontswap_pages);
 }
 
 static inline void __frontswap_clear(struct swap_info_struct *sis,
 				     pgoff_t offset)
 {
-	clear_bit(offset, sis->frontswap_map);
-	atomic_dec(&sis->frontswap_pages);
+	if (test_and_clear_bit(offset, sis->frontswap_map))
+		atomic_dec(&sis->frontswap_pages);
 }
 
 /*
@@ -251,28 +331,23 @@ static inline void __frontswap_clear(struct swap_info_struct *sis,
 int __frontswap_store(struct page *page, int core)
 {
 	int ret = -1;
+	int idx;
 	swp_entry_t entry = { .val = page_private(page), };
 	int type = swp_type(entry);
 	struct swap_info_struct *sis = swap_info[type];
 	pgoff_t offset = swp_offset(entry);
 	struct frontswap_ops *ops;
 
-	VM_BUG_ON(!frontswap_ops);
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(sis == NULL);
 
-	// /*
-	//  * If a dup, we must remove the old page first; we can't leave the
-	//  * old page no matter if the store of the new page succeeds or fails,
-	//  * and we can't rely on the new page replacing the old page as we may
-	//  * not store to the same implementation that contains the old page.
-	//  */
-	// if (__frontswap_test(sis, offset)) {
-	// 	__frontswap_clear(sis, offset);
-	// 	for_each_frontswap_ops(ops)
-	// 		ops->invalidate_page(type, offset);
-	// }
-
+	idx = srcu_read_lock(&frontswap_srcu);
+	/* Retire an old copy even if the new store will fall back to disk. */
+	if (__frontswap_test(sis, offset)) {
+		__frontswap_clear(sis, offset);
+		for_each_frontswap_ops(ops)
+			ops->invalidate_page(type, offset);
+	}
 	/* Try to store in each implementation, until one succeeds. */
 	for_each_frontswap_ops(ops) {
 		if (core == -1)
@@ -282,6 +357,7 @@ int __frontswap_store(struct page *page, int core)
 		if (!ret) /* successful store */
 			break;
 	}
+	srcu_read_unlock(&frontswap_srcu, idx);
 	if (ret == 0) {
 		__frontswap_set(sis, offset);
 		inc_frontswap_succ_stores();
@@ -299,14 +375,15 @@ EXPORT_SYMBOL(__frontswap_store);
 int __frontswap_poll_store(int core)
 {
 	struct frontswap_ops *ops;
+	int idx = srcu_read_lock(&frontswap_srcu);
+	int ret = 0;
 
-	VM_BUG_ON(!frontswap_ops);
-
-	for_each_frontswap_ops(ops)
-		return ops->poll_store(core);
-
-	BUG();
-	return -1;
+	for_each_frontswap_ops(ops) {
+		ret = ops->poll_store(core);
+		break;
+	}
+	srcu_read_unlock(&frontswap_srcu, idx);
+	return ret;
 }
 #else // RSWAP_KERNEL_SUPPORT < 2
 int __frontswap_poll_store(int core)
@@ -325,19 +402,20 @@ EXPORT_SYMBOL(__frontswap_poll_store);
 int __frontswap_load(struct page *page, bool sync)
 {
 	int ret = -1;
+	int idx;
 	swp_entry_t entry = { .val = page_private(page), };
 	int type = swp_type(entry);
 	struct swap_info_struct *sis = swap_info[type];
 	pgoff_t offset = swp_offset(entry);
 	struct frontswap_ops *ops;
 
-	VM_BUG_ON(!frontswap_ops);
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(sis == NULL);
 
-	// if (!__frontswap_test(sis, offset))
-	// 	return -1;
+	if (!__frontswap_test(sis, offset))
+		return -1;
 
+	idx = srcu_read_lock(&frontswap_srcu);
 	/* Try loading from each implementation, until one succeeds. */
 	for_each_frontswap_ops(ops) {
 		if (sync)
@@ -347,6 +425,7 @@ int __frontswap_load(struct page *page, bool sync)
 		if (!ret) /* successful load */
 			break;
 	}
+	srcu_read_unlock(&frontswap_srcu, idx);
 	if (ret == 0) {
 		inc_frontswap_loads();
 		if (frontswap_tmem_exclusive_gets_enabled) {
@@ -362,14 +441,15 @@ EXPORT_SYMBOL(__frontswap_load);
 int __frontswap_poll_load(int core)
 {
 	struct frontswap_ops *ops;
+	int idx = srcu_read_lock(&frontswap_srcu);
+	int ret = 0;
 
-	VM_BUG_ON(!frontswap_ops);
-
-	for_each_frontswap_ops(ops)
-		return ops->poll_load(core);
-
-	BUG();
-	return -1;
+	for_each_frontswap_ops(ops) {
+		ret = ops->poll_load(core);
+		break;
+	}
+	srcu_read_unlock(&frontswap_srcu, idx);
+	return ret;
 }
 #else // !defined(RSWAP_KERNEL_SUPPORT)
 int __frontswap_poll_load(int core)
@@ -384,27 +464,29 @@ EXPORT_SYMBOL(__frontswap_poll_load);
 int __frontswap_peek_load(int core)
 {
 	struct frontswap_ops *ops;
+	int idx = srcu_read_lock(&frontswap_srcu);
+	int ret = 0;
 
-	VM_BUG_ON(!frontswap_ops);
-
-	for_each_frontswap_ops(ops)
-		return ops->peek_load(core);
-
-	BUG();
-	return -1;
+	for_each_frontswap_ops(ops) {
+		ret = ops->peek_load(core);
+		break;
+	}
+	srcu_read_unlock(&frontswap_srcu, idx);
+	return ret;
 }
 
 int __frontswap_peek_store(int core)
 {
 	struct frontswap_ops *ops;
+	int idx = srcu_read_lock(&frontswap_srcu);
+	int ret = 0;
 
-	VM_BUG_ON(!frontswap_ops);
-
-	for_each_frontswap_ops(ops)
-		return ops->peek_store(core);
-
-	BUG();
-	return -1;
+	for_each_frontswap_ops(ops) {
+		ret = ops->peek_store(core);
+		break;
+	}
+	srcu_read_unlock(&frontswap_srcu, idx);
+	return ret;
 }
 #else // RSWAP_KERNEL_SUPPORT < 3
 int __frontswap_poll_load(int core)
@@ -430,15 +512,17 @@ void __frontswap_invalidate_page(unsigned type, pgoff_t offset)
 {
 	struct swap_info_struct *sis = swap_info[type];
 	struct frontswap_ops *ops;
+	int idx;
 
-	VM_BUG_ON(!frontswap_ops);
 	VM_BUG_ON(sis == NULL);
 
 	if (!__frontswap_test(sis, offset))
 		return;
 
+	idx = srcu_read_lock(&frontswap_srcu);
 	for_each_frontswap_ops(ops)
 		ops->invalidate_page(type, offset);
+	srcu_read_unlock(&frontswap_srcu, idx);
 	__frontswap_clear(sis, offset);
 	inc_frontswap_invalidates();
 }
@@ -452,17 +536,24 @@ void __frontswap_invalidate_area(unsigned type)
 {
 	struct swap_info_struct *sis = swap_info[type];
 	struct frontswap_ops *ops;
+	struct module *owner = NULL;
 
-	VM_BUG_ON(!frontswap_ops);
 	VM_BUG_ON(sis == NULL);
-
-	if (sis->frontswap_map == NULL)
-		return;
-
-	for_each_frontswap_ops(ops)
-		ops->invalidate_area(type);
-	atomic_set(&sis->frontswap_pages, 0);
-	bitmap_zero(sis->frontswap_map, sis->max);
+	mutex_lock(&frontswap_mutex);
+	if (sis->frontswap_map) {
+		for_each_frontswap_ops(ops)
+			ops->invalidate_area(type);
+		atomic_set(&sis->frontswap_pages, 0);
+		bitmap_zero(sis->frontswap_map, sis->max);
+	}
+	if (managed_owner && managed_type == type) {
+		managed_type = -1;
+		owner = managed_owner;
+	}
+	mutex_unlock(&frontswap_mutex);
+	/* No backend pointer or module code may be accessed after this put. */
+	if (owner)
+		module_put(owner);
 }
 EXPORT_SYMBOL(__frontswap_invalidate_area);
 

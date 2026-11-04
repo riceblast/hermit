@@ -36,6 +36,11 @@ struct frontswap_ops {
 };
 
 extern void frontswap_register_ops(struct frontswap_ops *ops);
+struct module;
+/* Exclusive, unloadable backend; max_pages == 0 permits connection tests only. */
+extern int frontswap_register_managed_ops(struct frontswap_ops *ops,
+		struct module *owner, unsigned long max_pages);
+extern void frontswap_unregister_managed_ops(struct frontswap_ops *ops);
 extern void frontswap_shrink(unsigned long);
 extern unsigned long frontswap_curr_pages(void);
 extern void frontswap_writethrough(bool);
@@ -43,7 +48,7 @@ extern void frontswap_writethrough(bool);
 extern void frontswap_tmem_exclusive_gets(bool);
 
 extern bool __frontswap_test(struct swap_info_struct *, pgoff_t);
-extern void __frontswap_init(unsigned type, unsigned long *map);
+extern int __frontswap_init(unsigned type, unsigned long *map);
 extern int __frontswap_store(struct page *page, int core);
 extern int __frontswap_poll_store(int core);
 extern int __frontswap_load(struct page *page, bool sync);
@@ -200,10 +205,12 @@ static inline void frontswap_invalidate_area(unsigned type)
 		__frontswap_invalidate_area(type);
 }
 
-static inline void frontswap_init(unsigned type, unsigned long *map)
+static inline int frontswap_init(unsigned type, unsigned long *map)
 {
 #ifdef CONFIG_FRONTSWAP
-	__frontswap_init(type, map);
+	return __frontswap_init(type, map);
+#else
+	return 0;
 #endif
 }
 

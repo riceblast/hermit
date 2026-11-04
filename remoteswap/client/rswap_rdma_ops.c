@@ -68,7 +68,7 @@ static inline int peek_rdma_queue(struct rswap_rdma_queue *rdma_queue)
 void drain_all_rdma_queues(int target_mem_server)
 {
 	int i;
-	struct rdma_session_context *rdma_session = &rdma_session_global;
+	struct rdma_session_context *rdma_session = &rdma_sessions[0];
 
 	for (i = 0; i < num_queues; i++) {
 		drain_rdma_queue(&(rdma_session->rdma_queues[i]));
@@ -91,7 +91,6 @@ int _get_free_idx(struct end2end_rdma_lat* rdma_lat_list)
 // -1: failed
 int _init_lat_entry(struct end2end_rdma_lat* rdma_lat_list, struct mutex* mtx, u64 wr_id)
 {
-	int nr_try_times = 0;
 	int free_idx = -1;
 	int success = -1;
 	u64 cur_time_us;
@@ -257,7 +256,7 @@ void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 		pr_err("%s status is not success, it is=%d\n", __func__,
 		       wc->status);
 	}
-	get_rdma_queue_cpu_type(&rdma_session_global, rdma_queue, &cpu, &type);
+	get_rdma_queue_cpu_type(rdma_queue->rdma_session, rdma_queue, &cpu, &type);
 	if (type == QP_STORE) { // STORE requests
 		dump_lat(wc->wr_id, cpu, type);
 
@@ -413,7 +412,7 @@ int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
 	chunk_idx = page_addr >> CHUNK_SHIFT;
 	offset_within_chunk = page_addr & CHUNK_MASK;
 
-	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, type);
+	rdma_queue = get_rdma_queue(&rdma_sessions[0], cpu, type);
 	rdma_req = (struct fs_rdma_req *)kmem_cache_alloc(
 		rdma_queue->fs_rdma_req_cache, GFP_ATOMIC);
 	if (!rdma_req) {
@@ -422,9 +421,9 @@ int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
 	}
 
 	remote_chunk_ptr =
-		&(rdma_session_global.remote_mem_pool.chunks[chunk_idx]);
+		&(rdma_sessions[0].remote_mem_pool.chunks[chunk_idx]);
 
-	ret = fs_build_rdma_wr(&rdma_session_global, rdma_queue, rdma_req,
+	ret = fs_build_rdma_wr(&rdma_sessions[0], rdma_queue, rdma_req,
 			       remote_chunk_ptr, offset_within_chunk, page,
 			       type);
 	if (unlikely(ret)) {
@@ -432,7 +431,7 @@ int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
 		goto out;
 	}
 
-	ret = fs_enqueue_send_wr(&rdma_session_global, rdma_queue, rdma_req);
+	ret = fs_enqueue_send_wr(&rdma_sessions[0], rdma_queue, rdma_req);
 	if (unlikely(ret)) {
 		pr_err("%s, enqueue rdma_wr failed.\n", __func__);
 		goto out;
@@ -460,7 +459,7 @@ int rswap_frontswap_store(unsigned type, pgoff_t swap_entry_offset,
 		goto out;
 	}
 	put_cpu();
-	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, QP_STORE);
+	rdma_queue = get_rdma_queue(&rdma_sessions[0], cpu, QP_STORE);
 	write_drain_rdma_queue(rdma_queue);
 
 	ret = 0;
@@ -491,7 +490,7 @@ int rswap_frontswap_poll_store(int core)
 
 	core %= NR_WRITE_QUEUE;
 
-	rdma_queue = get_rdma_queue(&rdma_session_global, core, QP_STORE);
+	rdma_queue = get_rdma_queue(&rdma_sessions[0], core, QP_STORE);
 	write_drain_rdma_queue(rdma_queue);
 	return 0;
 }
@@ -545,7 +544,7 @@ int rswap_frontswap_poll_load(int cpu)
 {
 	struct rswap_rdma_queue *rdma_queue;
 
-	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, QP_LOAD_SYNC);
+	rdma_queue = get_rdma_queue(&rdma_sessions[0], cpu, QP_LOAD_SYNC);
 	drain_rdma_queue(rdma_queue);
 	return 0;
 }
@@ -553,7 +552,7 @@ int rswap_frontswap_poll_load(int cpu)
 int rswap_frontswap_peek_load(int cpu)
 {
 	struct rswap_rdma_queue *rdma_queue =
-		get_rdma_queue(&rdma_session_global, cpu, QP_LOAD_SYNC);
+		get_rdma_queue(&rdma_sessions[0], cpu, QP_LOAD_SYNC);
 	return peek_rdma_queue(rdma_queue);
 }
 
@@ -561,7 +560,7 @@ int rswap_frontswap_peek_store(int cpu)
 {
 	struct rswap_rdma_queue *rdma_queue;
 	cpu %= NR_WRITE_QUEUE;
-	rdma_queue = get_rdma_queue(&rdma_session_global, cpu, QP_STORE);
+	rdma_queue = get_rdma_queue(&rdma_sessions[0], cpu, QP_STORE);
 	return peek_rdma_queue(rdma_queue);
 }
 
@@ -599,116 +598,128 @@ static struct frontswap_ops rswap_frontswap_ops = {
 #endif
 };
 
+/* Patch 1 intentionally cannot activate swap before striping/polling exist. */
 int rswap_register_frontswap(void)
 {
-	int ret = 0;
-	// enable the frontswap path
-	frontswap_register_ops(&rswap_frontswap_ops);
-
-	pr_info("frontswap module loaded\n");
-	return ret;
-}
-
-int rswap_replace_frontswap(void)
-{
-	frontswap_ops->init = rswap_frontswap_ops.init;
-	frontswap_ops->store = rswap_frontswap_ops.store;
-	frontswap_ops->load = rswap_frontswap_ops.load;
-	frontswap_ops->invalidate_page = rswap_frontswap_ops.invalidate_page,
-	frontswap_ops->invalidate_area = rswap_frontswap_ops.invalidate_area,
-#ifdef RSWAP_KERNEL_SUPPORT
-	frontswap_ops->load_async = rswap_frontswap_ops.load_async;
-	frontswap_ops->poll_load = rswap_frontswap_ops.poll_load;
-#if RSWAP_KERNEL_SUPPORT >= 2
-	frontswap_ops->store_on_core = rswap_frontswap_ops.store_on_core;
-	frontswap_ops->poll_store = rswap_frontswap_ops.poll_store;
-#endif // RSWAP_KERNEL_SUPPORT >= 2
-#if RSWAP_KERNEL_SUPPORT >= 3
-	frontswap_ops->peek_load = rswap_frontswap_ops.peek_load;
-	frontswap_ops->peek_store = rswap_frontswap_ops.peek_store;
-#endif // RSWAP_KERNEL_SUPPORT >= 3
-#endif
-	pr_info("frontswap ops replaced\n");
-	return 0;
+	return frontswap_register_managed_ops(&rswap_frontswap_ops, THIS_MODULE, 0);
 }
 
 void rswap_deregister_frontswap(void)
 {
-#ifdef RSWAP_KERNEL_SUPPORT
-	frontswap_ops->init = NULL;
-	frontswap_ops->store = NULL;
-	frontswap_ops->load = NULL;
-	frontswap_ops->load_async = NULL;
-	frontswap_ops->poll_load = NULL;
-#else
-	frontswap_ops->init = NULL;
-	frontswap_ops->store = NULL;
-	frontswap_ops->load = NULL;
-	frontswap_ops->poll_load = NULL;
-#endif
-	pr_info("frontswap ops deregistered\n");
+	frontswap_unregister_managed_ops(&rswap_frontswap_ops);
 }
 
-
-int rswap_client_init(char *_server_ip, int _server_port, int _mem_size)
+static void free_latency_buffers(void)
 {
-	int ret = 0;
-	int idx = 0;
-	printk(KERN_INFO "%s, start \n", __func__);
+	unsigned int cpu;
 
-	// online cores decide the parallelism. e.g. number of QP, CP etc.
-	online_cores = num_online_cpus();
-	num_queues = online_cores * NUM_QP_TYPE;
-	server_ip = _server_ip;
-	server_port = _server_port;
-	rdma_session_global.remote_mem_pool.remote_mem_size = _mem_size;
-	rdma_session_global.remote_mem_pool.chunk_num =
-		_mem_size / REGION_SIZE_GB;
-
-	// init lat measure related struct
-	qp_store_lat = (struct end2end_rdma_lat**)kzalloc(online_cores * sizeof(struct end2end_rdma_lat*), GFP_KERNEL);
-	qp_sync_load_lat = (struct end2end_rdma_lat**)kzalloc(online_cores * sizeof(struct end2end_rdma_lat*), GFP_KERNEL);
-	qp_async_load_lat = (struct end2end_rdma_lat**)kzalloc(online_cores * sizeof(struct end2end_rdma_lat*), GFP_KERNEL);
-
-	qp_store_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
-	qp_sync_load_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
-	qp_async_load_mutex = (struct mutex*)kmalloc(online_cores * sizeof(struct mutex), GFP_KERNEL);
-
-	for (idx = 0; idx < online_cores; idx += 1) {
-		qp_store_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
-		qp_sync_load_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
-		qp_async_load_lat[idx] = (struct end2end_rdma_lat*)kzalloc((RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH) * sizeof(struct end2end_rdma_lat), GFP_KERNEL);
-
-		mutex_init(&qp_store_mutex[idx]);
-		mutex_init(&qp_sync_load_mutex[idx]);
-		mutex_init(&qp_async_load_mutex[idx]);
+	for (cpu = 0; cpu < list_size; cpu++) {
+		if (qp_store_lat)
+			kfree(qp_store_lat[cpu]);
+		if (qp_sync_load_lat)
+			kfree(qp_sync_load_lat[cpu]);
+		if (qp_async_load_lat)
+			kfree(qp_async_load_lat[cpu]);
 	}
+	kfree(qp_store_lat);
+	kfree(qp_sync_load_lat);
+	kfree(qp_async_load_lat);
+	kfree(qp_store_mutex);
+	kfree(qp_sync_load_mutex);
+	kfree(qp_async_load_mutex);
+	qp_store_lat = NULL;
+	qp_sync_load_lat = NULL;
+	qp_async_load_lat = NULL;
+	qp_store_mutex = NULL;
+	qp_sync_load_mutex = NULL;
+	qp_async_load_mutex = NULL;
+	list_size = 0;
+}
+
+static int init_latency_buffers(void)
+{
+	unsigned int cpu;
+	unsigned int entries = RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH;
 
 	list_size = online_cores;
-
-	pr_info("%s, num_queues : %d (Can't exceed the slots on Memory server) \n",
-		__func__, num_queues);
-
-	// init the rdma session to memory server
-	ret = init_rdma_sessions(&rdma_session_global);
-
-	// Build both the RDMA and Disk driver
-	ret = rdma_session_connect(&rdma_session_global);
-	if (unlikely(ret)) {
-		pr_err("%s, rdma_session_connect failed. \n", __func__);
-		goto out;
+	qp_store_lat = kcalloc(online_cores, sizeof(*qp_store_lat), GFP_KERNEL);
+	qp_sync_load_lat = kcalloc(online_cores, sizeof(*qp_sync_load_lat), GFP_KERNEL);
+	qp_async_load_lat = kcalloc(online_cores, sizeof(*qp_async_load_lat), GFP_KERNEL);
+	qp_store_mutex = kcalloc(online_cores, sizeof(*qp_store_mutex), GFP_KERNEL);
+	qp_sync_load_mutex = kcalloc(online_cores, sizeof(*qp_sync_load_mutex), GFP_KERNEL);
+	qp_async_load_mutex = kcalloc(online_cores, sizeof(*qp_async_load_mutex), GFP_KERNEL);
+	if (!qp_store_lat || !qp_sync_load_lat || !qp_async_load_lat ||
+	    !qp_store_mutex || !qp_sync_load_mutex || !qp_async_load_mutex)
+		return -ENOMEM;
+	for (cpu = 0; cpu < online_cores; cpu++) {
+		qp_store_lat[cpu] = kcalloc(entries, sizeof(**qp_store_lat), GFP_KERNEL);
+		qp_sync_load_lat[cpu] = kcalloc(entries, sizeof(**qp_sync_load_lat), GFP_KERNEL);
+		qp_async_load_lat[cpu] = kcalloc(entries, sizeof(**qp_async_load_lat), GFP_KERNEL);
+		if (!qp_store_lat[cpu] || !qp_sync_load_lat[cpu] || !qp_async_load_lat[cpu])
+			return -ENOMEM;
+		mutex_init(&qp_store_mutex[cpu]);
+		mutex_init(&qp_sync_load_mutex[cpu]);
+		mutex_init(&qp_async_load_mutex[cpu]);
 	}
+	return 0;
+}
 
-out:
+int rswap_client_init(const struct rswap_client_config *config)
+{
+	struct rdma_session_context *session;
+	unsigned int id;
+	int ret;
+
+	online_cores = num_online_cpus();
+	num_queues = online_cores * NUM_QP_TYPE;
+	/* Fill all ownership metadata first, including for unstarted sessions. */
+	for (id = 0; id < RSWAP_NUM_SERVERS; id++) {
+		session = &rdma_sessions[id];
+		session->server_id = id;
+		session->timeout_ms = config->timeout_ms;
+		session->remote_mem_pool.remote_mem_size = config->size_gb / RSWAP_NUM_SERVERS;
+		session->expected_chunks = session->remote_mem_pool.remote_mem_size / REGION_SIZE_GB;
+		session->remote_mem_pool.chunk_num = session->expected_chunks;
+		session->port = htons(config->servers[id].port);
+		if (!in4_pton(config->servers[id].ip, -1, session->addr, '\0', NULL))
+			return -EINVAL;
+	}
+	ret = init_latency_buffers();
+	if (ret)
+		goto fail;
+	for (id = 0; id < RSWAP_NUM_SERVERS; id++) {
+		session = &rdma_sessions[id];
+		pr_info("rswap: connecting server=%u endpoint=%s:%u expected=%u GiB\n",
+			id, config->servers[id].ip, config->servers[id].port,
+			session->remote_mem_pool.remote_mem_size);
+		ret = init_rdma_sessions(session);
+		if (!ret)
+			ret = rdma_session_connect(session);
+		if (ret)
+			goto fail;
+	}
+	for (id = 0; id < RSWAP_NUM_SERVERS; id++) {
+		ret = READ_ONCE(rdma_sessions[id].error);
+		if (ret)
+			goto fail;
+	}
+	pr_info("rswap: pool ready servers=%u total=%u GiB (connection-only)\n",
+		RSWAP_NUM_SERVERS, config->size_gb);
+	return 0;
+fail:
+	pr_err("rswap: initialization failed (%d); rolling back both sessions\n", ret);
+	rswap_client_exit();
 	return ret;
 }
 
 void rswap_client_exit(void)
 {
-	int ret;
-	ret = rswap_disconnect_and_collect_resource(&rdma_session_global);
-	if (unlikely(ret)) {
-		pr_err("%s,  failed.\n", __func__);
-	}
-	pr_info("%s done.\n", __func__);
+	int id;
+
+	/* Stop both sessions before beginning reverse-order destruction. */
+	for (id = 0; id < RSWAP_NUM_SERVERS; id++)
+		WRITE_ONCE(rdma_sessions[id].stopping, true);
+	for (id = RSWAP_NUM_SERVERS - 1; id >= 0; id--)
+		rswap_disconnect_and_collect_resource(&rdma_sessions[id]);
+	free_latency_buffers();
 }
