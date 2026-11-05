@@ -474,6 +474,12 @@ __read_swap_cache_speculative(swp_entry_t entry, gfp_t gfp_mask,
 	}
 
 	*cpu = hermit_issue_read(new_page, entry);
+	/*
+	 * Disk completion unlocks the page, unlike the RDMA callback.  Wait
+	 * for it and regain the lock before swap-cache insertion or cleanup.
+	 */
+	if (*cpu < 0)
+		lock_page(new_page);
 	// [RMGrid] profiling
 	set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
 	adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
@@ -549,9 +555,11 @@ __read_swap_cache_speculative(swp_entry_t entry, gfp_t gfp_mask,
 			hmt_update_rft_dist(page, rft_dist);
 	}
 
-	/* Caller will initiate read into locked page */
+	/* The speculative read was already submitted above. */
 	lru_cache_add(page);
 	*new_page_allocated = true;
+	if (*cpu < 0)
+		unlock_page(page);
 
 	return page;
 
@@ -565,7 +573,10 @@ fail_unlock:
 fail_free:
 	if (cpu) {
 		adc_profile_counter_inc(ADC_OPTIM_FAILED);
-		hermit_poll_read(*cpu, new_page, true, pf_breakdown);
+		if (*cpu < 0)
+			unlock_page(new_page);
+		else
+			hermit_poll_read(*cpu, new_page, true, pf_breakdown);
 	}
 	put_page(new_page);
 	return page;

@@ -13,7 +13,7 @@ def definition(source, name, struct=False):
     if struct:
         start = source.index(f"struct {name} {{")
     else:
-        match = re.search(r"^(?:(?:static|inline)\s+)*(?:void|int)\s+"
+        match = re.search(r"^(?:(?:static|inline)\s+)*(?:void\s+|int\s+|struct page\s*\*\s*)"
                           + re.escape(name) + r"\(", source, re.MULTILINE)
         if match is None:
             raise ValueError(f"Function definition not found: {name}")
@@ -502,6 +502,124 @@ int main(void) {
 """
 
 
+SPECULATIVE_STUBS = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <errno.h>
+typedef unsigned int gfp_t;
+typedef struct { unsigned long val; } swp_entry_t;
+struct page { int locked, pending, refs; };
+struct vm_area_struct { void *vm_mm; };
+#define ADC_PF_MAJOR_BIT 0
+#define ADC_ONDEMAND_SWAPIN 0
+#define ADC_OPTIM_FAILED 0
+#define GFP_RECLAIM_MASK 0
+#define set_adc_pf_bits(...) ((void)0)
+#define adc_profile_counter_inc(...) ((void)0)
+#define adc_pf_breakdown_stt(...) ((void)0)
+#define adc_pf_breakdown_end(...) ((void)0)
+#define BUG_ON(x) assert(!(x))
+#define cond_resched() ((void)0)
+#define swap_address_space(e) NULL
+#define swp_offset(e) ((e).val)
+#define inline
+static struct page fresh, cached;
+/* 0 = RDMA, 1 = already-completed disk, 2 = pending disk. */
+static int mode, scenario, polls, locks, unlocks, page_puts, insertions, releases;
+static int lookups, prepares, swap_slot_cache_enabled = 1;
+static struct page *alloc_page_vma(gfp_t g, struct vm_area_struct *v, unsigned long a) {
+    return scenario == 7 ? NULL : &fresh;
+}
+static struct page *find_get_page(void *mapping, unsigned long offset) {
+    lookups++;
+    return scenario == 3 || scenario == 7 ? &cached : NULL;
+}
+static int hermit_issue_read(struct page *p, swp_entry_t entry) {
+    assert(!p->locked); p->locked = 1;
+    if (mode == 1) p->locked = 0;
+    else p->pending = 1;
+    return mode == 0 ? 0 : -1;
+}
+static void lock_page(struct page *p) {
+    /* A filesystem readpage may return before its unlock completion. */
+    assert(mode != 0);
+    if (p->pending) { assert(p->locked); p->pending = 0; p->locked = 0; }
+    assert(!p->locked); p->locked = 1; locks++;
+}
+static void unlock_page(struct page *p) {
+    assert(p->locked && !p->pending); p->locked = 0; unlocks++;
+}
+static void frontswap_poll_load(int cpu) {
+    assert(mode == 0 && cpu == 0 && fresh.locked && fresh.pending);
+    fresh.pending = 0; polls++;
+}
+static void put_page(struct page *p) {
+    assert(p == &fresh && p->refs == 1 && !p->locked && !p->pending);
+    p->refs--; page_puts++;
+}
+static int __swp_swapcount(swp_entry_t entry) { return scenario != 4; }
+static int swapcache_prepare(swp_entry_t entry) {
+    prepares++;
+    if (scenario == 5) return -ENOMEM;
+    if (scenario == 6 && prepares == 1) return -EEXIST;
+    return 0;
+}
+static int hermit_mem_cgroup_swapin_charge_page(struct page *p, void *mm, gfp_t g,
+                                                int *bits, uint64_t *breakdown) {
+    assert(p->locked); return scenario == 1 ? -ENOMEM : 0;
+}
+static int add_to_swap_cache(struct page *p, swp_entry_t entry, gfp_t g, void **shadow) {
+    assert(p->locked); insertions++; return scenario == 2 ? -ENOMEM : 0;
+}
+static unsigned long hermit_workingset_refault(struct page *p, void *shadow) { return 0; }
+static void hmt_update_rft_dist(struct page *p, unsigned long dist) {}
+static void lru_cache_add(struct page *p) { assert(p->locked); }
+static void put_swap_page(struct page *p, swp_entry_t entry) {
+    assert(p->locked && !p->pending); releases++;
+}
+"""
+
+SPECULATIVE_CASES = r"""
+int main(void) {
+    struct vm_area_struct vma = {0};
+    swp_entry_t entry = {1};
+    for (mode = 0; mode < 3; mode++) {
+        for (scenario = 0; scenario < 8; scenario++) {
+            int cpu = -1;
+            bool allocated = true;
+            fresh = (struct page){.refs = 1};
+            polls = locks = unlocks = page_puts = insertions = releases = lookups = prepares = 0;
+            struct page *p = __read_swap_cache_speculative(entry, 0, &vma, 0,
+                                                          &allocated, &cpu, NULL, NULL);
+            if (scenario == 7) {
+                assert(p == &cached && !allocated && cpu == -1 && !page_puts && !locks);
+                continue;
+            }
+            assert(cpu == (mode == 0 ? 0 : -1));
+            if (scenario == 0 || scenario == 6) {
+                assert(p == &fresh && allocated && insertions == 1 && !page_puts && !releases);
+                assert(fresh.locked == (mode == 0));
+                hermit_poll_read(cpu, p, true, NULL);
+                assert(!fresh.locked && !fresh.pending);
+                if (scenario == 6) assert(prepares == 2);
+            } else {
+                assert(p == (scenario == 3 ? &cached : NULL));
+                assert(!allocated && page_puts == 1 && fresh.refs == 0);
+                assert(releases == (scenario == 1 || scenario == 2));
+            }
+            assert(polls == (mode == 0));
+            assert(locks == (mode != 0) && unlocks == 1);
+        }
+    }
+    puts("PASS: actual speculative helper, RDMA/disk locks and all cleanup paths (24 cases)");
+    return 0;
+}
+"""
+
+
 class CompletionTests(unittest.TestCase):
     def test_actual_client_functions(self):
         source = (ROOT / "client/rswap_rdma_ops.c").read_text()
@@ -536,6 +654,20 @@ class CompletionTests(unittest.TestCase):
             binary = Path(tmp) / "frontswap"
             c.write_text(code)
             subprocess.run(["gcc", "-std=gnu11", "-O1", "-Wall", "-Wextra", "-Werror",
+                            "-Wno-unused-parameter", str(c), "-o", str(binary)], check=True)
+            subprocess.run([str(binary)], check=True, timeout=10)
+
+    def test_actual_speculative_disk_fallback(self):
+        kernel = ROOT.parent / "linux-5.14-rc5/mm"
+        state = (kernel / "swap_state.c").read_text()
+        io = (kernel / "page_io.c").read_text()
+        code = (SPECULATIVE_STUBS + definition(io, "hermit_poll_read")
+                + definition(state, "__read_swap_cache_speculative") + SPECULATIVE_CASES)
+        with tempfile.TemporaryDirectory(prefix="hermit-patch3-speculative-") as tmp:
+            c = Path(tmp) / "speculative.c"
+            binary = Path(tmp) / "speculative"
+            c.write_text(code)
+            subprocess.run(["gcc", "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                             "-Wno-unused-parameter", str(c), "-o", str(binary)], check=True)
             subprocess.run([str(binary)], check=True, timeout=10)
 

@@ -44,6 +44,9 @@
   `get_cpu()` 的禁止抢占区间。全部内部调用点和无 SWAP stub 已同步修改。
 - `swap_state.c`：推测读取失败时，先等待 I/O，再释放 entry／页面；避免磁盘回退后
   因 cpu=-1 再次提交同一页读取。
+- 推测读取的磁盘回退：等待磁盘完成并重新取得页面锁，再进行 swap cache 插入或
+  失败清理；成功返回及提前退出时释放重新取得的锁。RDMA 路径继续由 polling 收尾。
+  修复磁盘完成已解锁后仍插入 swap cache，以及失败路径重复解锁的问题。
 - `memory.c`：在 KSM、rmap 和 swap 记账之前完成必要读取并检查 Uptodate，失败
   返回 SIGBUS，避免晚检查导致错误退出时记账失衡。lazy polling 仍存在，但等待点
   收紧到上述操作之前，不保证原先全部延迟重叠收益。
@@ -62,7 +65,7 @@
 | 内核 bzImage + modules 编译 | PASS |
 | RDMA Client 编译 | PASS，无编译警告 |
 | DRAM backend 兼容性编译 | PASS，无编译警告；最终产物已恢复 RDMA |
-| Patch 3 实际函数逻辑检查 | PASS，2 项，含 200 轮并发发布／完成及 area 收尾 |
+| Patch 3 实际函数逻辑检查 | PASS，3 项，含 200 轮并发发布／完成、area 收尾及推测读取锁回归 |
 | Patch 2 映射回归 | PASS |
 | 管理脚本回归 | PASS，7 项 |
 | Client 逻辑检查 ASan / UBSan | PASS |
@@ -80,6 +83,12 @@ ASan 检查中关闭了 LeakSanitizer，因为当前 ptrace 环境不支持它�
 `/tmp/hermit-patch3-client-final-build.log` 和 `/tmp/hermit-patch3-dram-build.log`。
 最终模块版本为 1.3，引用新 v2 注册符号。
 
+锁修复后的 `bzImage + modules` 重新编译与 RDMA Client 增量构建检查均通过；
+日志分别为 `/tmp/hermit-patch3-lockfix-kernel-build.log` 和
+`/tmp/hermit-patch3-lockfix-client-build.log`。未修改内核 release／名称，仍为
+`5.14.0-rc5-hermit-syscall-v2`。修改的源文件无新增编译告警，链接仍有原有
+GNU-stack／RWX 告警。
+
 本轮没有安装内核、加载模块、连接 RDMA、启停 swap 或运行 workload。
 
 `test_patch3_completion.py` 在用户态提供 RDMA／页面 stub，编译并调用当前生产文件中
@@ -93,6 +102,11 @@ ASan 检查中关闭了 LeakSanitizer，因为当前 ptrace 环境不支持它�
 - 实际 Frontswap 发布／commit 顺序、未命中与远端已有副本失败的区别；
 - 整 THP 写拒绝／全范围失效、远端仅有 THP 尾页时禁止磁盘回退；
 - Hermit 对磁盘和 RDMA 页面锁的职责区分。
+- 实际推测读取函数的 24 个组合：RDMA、磁盘立即完成、磁盘延后完成，分别覆盖成功、
+  内存计费失败、缓存插入失败、缓存命中、无引用 slot、准备失败、EEXIST 重试、分配失败。
+  检查插入时持锁、释放前 I/O 完成，以及每条退出路径的解锁职责。
+
+新增推测读取回归先在修复前的实际函数上触发未持锁断言，再在修复后通过。
 
 这些是无特权逻辑检查，不能替代真实 HCA、软中断调度、DMA 一致性及内核并发验证。
 没有新增产品运行时故障注入或自检入口。
