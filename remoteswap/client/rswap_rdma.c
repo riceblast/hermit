@@ -30,7 +30,7 @@ void get_rdma_queue_cpu_type(struct rdma_session_context *session,
 	*type = queue->type;
 }
 
-static void queue_error(struct rswap_rdma_queue *queue, int error)
+void rswap_rdma_error(struct rswap_rdma_queue *queue, int error)
 {
 	cmpxchg(&queue->error, 0, error < 0 ? error : -EIO);
 	cmpxchg(&queue->rdma_session->error, 0, error < 0 ? error : -EIO);
@@ -136,7 +136,7 @@ void two_sided_message_done(struct ib_cq *cq, struct ib_wc *wc)
 			pr_err("rswap: server=%u queue=%d control completion status=%d error=%d\n",
 			       queue->rdma_session->server_id, queue->q_index,
 			       wc->status, ret);
-			queue_error(queue, ret);
+			rswap_rdma_error(queue, ret);
 		}
 	}
 	/* Errors and WR_FLUSH_ERR consume a posted WR just like success. */
@@ -217,7 +217,7 @@ int rswap_rdma_cm_event_handler(struct rdma_cm_id *id,
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
 		ret = rdma_resolve_route(id, 2000);
 		if (ret)
-			queue_error(queue, ret);
+			rswap_rdma_error(queue, ret);
 		break;
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
 		WRITE_ONCE(queue->state, ROUTE_RESOLVED);
@@ -234,12 +234,12 @@ int rswap_rdma_cm_event_handler(struct rdma_cm_id *id,
 	case RDMA_CM_EVENT_DISCONNECTED:
 	case RDMA_CM_EVENT_DEVICE_REMOVAL:
 	case RDMA_CM_EVENT_ADDR_CHANGE:
-		queue_error(queue, event->status < 0 ? event->status : -ECONNRESET);
+		rswap_rdma_error(queue, event->status < 0 ? event->status : -ECONNRESET);
 		break;
 	case RDMA_CM_EVENT_TIMEWAIT_EXIT:
 		break;
 	default:
-		queue_error(queue, -EPROTO);
+		rswap_rdma_error(queue, -EPROTO);
 	}
 	/* Destruction belongs to process-context cleanup, never CM auto-destroy. */
 	return 0;
@@ -416,6 +416,7 @@ int init_rdma_sessions(struct rdma_session_context *session)
 		init_waitqueue_head(&queue->sem);
 		spin_lock_init(&queue->cq_lock);
 		atomic_set(&queue->rdma_post_counter, 0);
+		atomic_set(&queue->store_pending, 0);
 	}
 	return 0;
 }
@@ -514,6 +515,7 @@ int rswap_disconnect_and_collect_resource(struct rdma_session_context *session)
 			queue->cq = NULL;
 		}
 		WARN_ON(atomic_read(&queue->rdma_post_counter));
+		WARN_ON(atomic_read(&queue->store_pending));
 	}
 	/* CM IDs still hold their device references while DMA and PD are released. */
 	rswap_free_buffers(session);

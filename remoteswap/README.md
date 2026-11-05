@@ -1,19 +1,21 @@
 # Remoteswap
 
-**Development stage: Patch 2 (single/dual-server static mapping; swap still disabled).**
-The Client selects one or two Servers, discovers their capacities independently,
-checks their sum against the configuration, registers an unloadable exclusive
-Frontswap backend, and deliberately rejects
-`swapon` until Patch 3 provides correct multi-session I/O completion.
-All data submissions now share static page routing: interleave the common
-capacity of two Servers and append any larger Server's remaining capacity.
-Single-server pools map directly. See the [Patch 2 summary](tests/patch2_summary.md)
-for implementation scope and verification results. The Patch 1 documents remain
-historical connection-test records; their stage-specific log text has changed.
-The historical single-server swap/deployment instructions below do not apply
-to this intermediate stage. The management script connects/disconnects only;
-it does not create or activate a swapfile. Edit `client/rswap_client.conf`
-before install; environment overrides are not used.
+**Development stage: Patch 3 (4-KiB single/dual-server remote swap; hardware validation pending).**
+The Client discovers each selected Server's capacity and checks the configured sum.
+Static routing interleaves the common capacity and appends the larger Server's tail;
+single-server pools map directly. Multi-session polling, request retirement and
+managed Frontswap publication now permit one swap area no larger than the pool.
+Use 4-KiB pages; disable THP for validation workloads. Whole-THP remote I/O is rejected.
+
+Deploy the rebuilt kernel and Client together: the module now requires
+`frontswap_register_managed_ops_v2`, preventing accidental use with the older kernel.
+The kernel release string is unchanged, so `uname -r` alone does not identify this build.
+See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.
+Patch 1/2 smoke guides are historical and must not be used as Patch 3 swap instructions.
+The management script still only connects/disconnects; it does not create, format,
+activate or deactivate a swap area. Edit `client/rswap_client.conf` before install;
+environment overrides are not used. The historical deployment instructions below
+predate this prototype and its managed Frontswap lifecycle.
 
 A RDMA-based remote swap system for remote memory and disaggregated clusters. The codebase is larged adopted from Fastswap (https://github.com/clusterfarmem/fastswap) and Canvas (https://github.com/uclasystem/canvas), but is enhanced with our optimizations.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Connection tests only: never create, reformat, enable or disable swap here.
+# Connect/disconnect only: swap activation is an explicit operator action.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 config_file="${script_dir}/rswap_client.conf"
 
@@ -56,7 +56,7 @@ case "${1:-}" in
         if (( NR_SERVERS == 2 )); then
             printf 'Server 1: %s:%s\n' "${SERVER1_IP}" "${SERVER1_PORT}"
         fi
-        echo 'Mode: connection-only; swap activation remains disabled.'
+        echo 'Mode: 4-KiB remote swap ready; activate the intended swap area explicitly.'
 
         require_no_swap
         [[ ! -d /sys/module/rswap_client ]] || die 'rswap_client is already loaded.'
@@ -67,7 +67,7 @@ case "${1:-}" in
             module_args+=("sip2=${SERVER1_IP}" "sport2=${SERVER1_PORT}")
         fi
         run_as_root insmod "${script_dir}/rswap-client.ko" "${module_args[@]}"
-        echo 'Client initialized. Swap activation is disabled until Patch 2/3.'
+        echo 'Client initialized. No swap area was activated by this script.'
         ;;
     uninstall|disconnect)
         # A missing or broken configuration must never prevent normal unloading.

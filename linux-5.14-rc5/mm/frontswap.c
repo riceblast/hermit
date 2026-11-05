@@ -166,20 +166,23 @@ void frontswap_register_ops(struct frontswap_ops *ops)
 EXPORT_SYMBOL(frontswap_register_ops);
 
 /* Register only before swap is enabled, never over an existing backend. */
-int frontswap_register_managed_ops(struct frontswap_ops *ops,
+int frontswap_register_managed_ops_v2(struct frontswap_ops *ops,
 		struct module *owner, unsigned long max_pages)
 {
 	unsigned int type;
 	int ret = 0;
 
-	if (!ops || !owner || !ops->init || !ops->store || !ops->load ||
+	if (!ops || !owner || !ops->init ||
+	    (!ops->store && !ops->store_prepare) || !ops->load ||
 	    !ops->invalidate_page || !ops->invalidate_area)
+		return -EINVAL;
+	if (!!ops->store_prepare != !!ops->store_commit)
 		return -EINVAL;
 #ifdef RSWAP_KERNEL_SUPPORT
 	if (!ops->load_async || !ops->poll_load)
 		return -EINVAL;
 #if RSWAP_KERNEL_SUPPORT >= 2
-	if (!ops->store_on_core || !ops->poll_store)
+	if ((!ops->store_on_core && !ops->store_prepare) || !ops->poll_store)
 		return -EINVAL;
 #endif
 #if RSWAP_KERNEL_SUPPORT >= 3
@@ -190,6 +193,10 @@ int frontswap_register_managed_ops(struct frontswap_ops *ops,
 	mutex_lock(&frontswap_mutex);
 	if (frontswap_ops || managed_unregistering) {
 		ret = -EBUSY;
+		goto out;
+	}
+	if (frontswap_writethrough_enabled || frontswap_tmem_exclusive_gets_enabled) {
+		ret = -EOPNOTSUPP;
 		goto out;
 	}
 	/* SWP_USED also covers swap areas being prepared or torn down. */
@@ -214,7 +221,7 @@ out:
 	mutex_unlock(&frontswap_mutex);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(frontswap_register_managed_ops);
+EXPORT_SYMBOL_GPL(frontswap_register_managed_ops_v2);
 
 /* Caller owns ops; an active binding prevents its module_exit from running. */
 void frontswap_unregister_managed_ops(struct frontswap_ops *ops)
@@ -244,7 +251,12 @@ EXPORT_SYMBOL_GPL(frontswap_unregister_managed_ops);
  */
 void frontswap_writethrough(bool enable)
 {
-	frontswap_writethrough_enabled = enable;
+	mutex_lock(&frontswap_mutex);
+	if (enable && managed_owner)
+		pr_warn("frontswap: managed backend requires writeback mode\n");
+	else
+		frontswap_writethrough_enabled = enable;
+	mutex_unlock(&frontswap_mutex);
 }
 EXPORT_SYMBOL(frontswap_writethrough);
 
@@ -253,7 +265,12 @@ EXPORT_SYMBOL(frontswap_writethrough);
  */
 void frontswap_tmem_exclusive_gets(bool enable)
 {
-	frontswap_tmem_exclusive_gets_enabled = enable;
+	mutex_lock(&frontswap_mutex);
+	if (enable && managed_owner)
+		pr_warn("frontswap: managed backend retains pages until invalidation\n");
+	else
+		frontswap_tmem_exclusive_gets_enabled = enable;
+	mutex_unlock(&frontswap_mutex);
 }
 EXPORT_SYMBOL(frontswap_tmem_exclusive_gets);
 
@@ -337,11 +354,22 @@ int __frontswap_store(struct page *page, int core)
 	struct swap_info_struct *sis = swap_info[type];
 	pgoff_t offset = swp_offset(entry);
 	struct frontswap_ops *ops;
+	void *cookie = NULL;
 
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(sis == NULL);
 
 	idx = srcu_read_lock(&frontswap_srcu);
+	if (managed_owner && PageCompound(page)) {
+		unsigned long i;
+
+		/* A disk fallback writes the whole THP. Retire every old base-page copy. */
+		for (i = 0; i < thp_nr_pages(page); i++)
+			__frontswap_invalidate_page(type, offset + i);
+		srcu_read_unlock(&frontswap_srcu, idx);
+		inc_frontswap_failed_stores();
+		return -EOPNOTSUPP;
+	}
 	/* Retire an old copy even if the new store will fall back to disk. */
 	if (__frontswap_test(sis, offset)) {
 		__frontswap_clear(sis, offset);
@@ -350,20 +378,25 @@ int __frontswap_store(struct page *page, int core)
 	}
 	/* Try to store in each implementation, until one succeeds. */
 	for_each_frontswap_ops(ops) {
-		if (core == -1)
+		if (managed_owner && ops->store_prepare)
+			ret = ops->store_prepare(type, offset, page, core, &cookie);
+		else if (core == -1)
 			ret = ops->store(type, offset, page);
 		else
 			ret = ops->store_on_core(type, offset, page, core);
 		if (!ret) /* successful store */
 			break;
 	}
-	srcu_read_unlock(&frontswap_srcu, idx);
 	if (ret == 0) {
 		__frontswap_set(sis, offset);
 		inc_frontswap_succ_stores();
+		/* Keep the backend and commit callback under SRCU protection. */
+		if (managed_owner && ops->store_prepare)
+			ops->store_commit(cookie);
 	} else {
 		inc_frontswap_failed_stores();
 	}
+	srcu_read_unlock(&frontswap_srcu, idx);
 	if (frontswap_writethrough_enabled)
 		/* report failure so swap also writes to swap device */
 		ret = -1;
@@ -412,6 +445,15 @@ int __frontswap_load(struct page *page, bool sync)
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(sis == NULL);
 
+	if (managed_owner && PageCompound(page)) {
+		unsigned long i;
+
+		/* Never read a whole THP from disk if any constituent page is remote. */
+		for (i = 0; i < thp_nr_pages(page); i++)
+			if (__frontswap_test(sis, offset + i))
+				return FRONTSWAP_LOAD_ERROR;
+		return -1;
+	}
 	if (!__frontswap_test(sis, offset))
 		return -1;
 
@@ -425,6 +467,8 @@ int __frontswap_load(struct page *page, bool sync)
 		if (!ret) /* successful load */
 			break;
 	}
+	if (ret && managed_owner)
+		ret = FRONTSWAP_LOAD_ERROR;
 	srcu_read_unlock(&frontswap_srcu, idx);
 	if (ret == 0) {
 		inc_frontswap_loads();

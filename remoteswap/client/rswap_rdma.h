@@ -33,6 +33,7 @@
 #include <linux/delay.h>
 #include <linux/page-flags.h>
 #include <linux/smp.h>
+#include <linux/refcount.h>
 
 #include "constants.h"
 #include "rswap_ops.h"
@@ -106,6 +107,14 @@ struct fs_rdma_req {
 	struct ib_rdma_wr rdma_wr;
 
 	struct rswap_rdma_queue *rdma_queue;
+	/* Store has two owners: the CQ callback and Frontswap publication. */
+	refcount_t store_refs;
+	bool store_published;
+	bool io_done;
+	int status;
+	unsigned int swap_type;
+	pgoff_t offset;
+	u64 start_ns;
 };
 
 struct two_sided_rdma_send {
@@ -144,6 +153,7 @@ struct rswap_rdma_queue {
 	int error;
 	int expected_message;
 	atomic_t rdma_post_counter;
+	atomic_t store_pending; /* Stores awaiting both publication and WC retirement. */
 
 	int q_index;
 	enum rdma_queue_type type;
@@ -173,7 +183,7 @@ struct rdma_session_context {
 	bool stopping;
 	bool send_mapped;
 	bool recv_mapped;
-	int error; /* First setup error on any queue in this session. */
+	int error; /* First setup or runtime error; reject subsequent submissions. */
 	struct rswap_rdma_dev *rdma_dev; // The RDMA device of cpu server.
 	struct rswap_rdma_queue *rdma_queues; // point to multiple QP
 
@@ -202,6 +212,7 @@ get_rdma_queue(struct rdma_session_context *rdma_session, unsigned int cpu,
 void get_rdma_queue_cpu_type(struct rdma_session_context *rdma_session,
 			     struct rswap_rdma_queue *rdma_queue,
 			     unsigned int *cpu, enum rdma_queue_type *type);
+void rswap_rdma_error(struct rswap_rdma_queue *queue, int error);
 
 // functions for RDMA connection
 int init_rdma_sessions(struct rdma_session_context *rdma_session);
@@ -261,12 +272,6 @@ static inline void print_debug(const char *format, ...)
 	va_end(args);
 #endif
 }
-
-struct end2end_rdma_lat {
-	u64 wr_id_;
-	u64 start_time_us_;
-	u64 end_time_us_;
-};
 
 extern u64 rmda_ops_count;
 extern u64 cq_notify_count;

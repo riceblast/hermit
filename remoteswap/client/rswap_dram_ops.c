@@ -138,7 +138,7 @@ static struct frontswap_ops rswap_frontswap_ops = {
 
 int rswap_register_frontswap(void)
 {
-	return frontswap_register_managed_ops(&rswap_frontswap_ops, THIS_MODULE, 0);
+	return frontswap_register_managed_ops_v2(&rswap_frontswap_ops, THIS_MODULE, 0);
 }
 
 void rswap_deregister_frontswap(void)

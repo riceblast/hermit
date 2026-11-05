@@ -412,7 +412,7 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
 	return 0;
 }
 
-int swap_readpage(struct page *page, bool synchronous)
+int swap_readpage(struct page *page, bool synchronous, int *rdma_cpu)
 {
 	struct bio *bio;
 	int ret = 0;
@@ -433,8 +433,12 @@ int swap_readpage(struct page *page, bool synchronous)
 	 * significant part of overall IO time.
 	 */
 
+	/* Pin only the RDMA submission, never the potentially sleeping disk I/O. */
+	*rdma_cpu = get_cpu();
 	pf_ts = get_cycles_start();
-	if (frontswap_load(page) == 0) {
+	ret = frontswap_load(page);
+	put_cpu();
+	if (ret == 0) {
 		// [rswap] done in the callback function when page is loaded
 		// SetPageUptodate(page);
 		// unlock_page(page);
@@ -446,6 +450,13 @@ int swap_readpage(struct page *page, bool synchronous)
 				    get_cycles_end() - pf_ts);
 	}
 
+	if (ret == FRONTSWAP_LOAD_ERROR) {
+		ClearPageUptodate(page);
+		SetPageError(page);
+		/* Hermit owns the demand-page lock, even on software completion. */
+		return -EIO;
+	}
+	*rdma_cpu = -1;
 	psi_memstall_enter(&pflags);
 	if (data_race(sis->flags & SWP_FS_OPS)) {
 		struct file *swap_file = sis->swap_file;
@@ -527,13 +538,20 @@ int swap_readpage_async(struct page *page)
 	 * significant part of overall IO time.
 	 */
 
-	if (frontswap_load_async(page) == 0) {
+	ret = frontswap_load_async(page);
+	if (ret == 0) {
 		// [rswap] done in the callback function when page is loaded
 		// SetPageUptodate(page);
 		// unlock_page(page);
 		return 0;
 	}
 
+	if (ret == FRONTSWAP_LOAD_ERROR) {
+		ClearPageUptodate(page);
+		SetPageError(page);
+		unlock_page(page);
+		return -EIO;
+	}
 	psi_memstall_enter(&pflags);
 	if (data_race(sis->flags & SWP_FS_OPS)) {
 		struct file *swap_file = sis->swap_file;
@@ -616,12 +634,10 @@ inline int hermit_issue_read(struct page *page, swp_entry_t entry)
 	__SetPageLocked(page);
 	__SetPageSwapBacked(page);
 
-	cpu = get_cpu();
 	/* Provide entry to swap_readpage() */
 	set_page_private(page, entry.val);
-	swap_readpage(page, true);
+	swap_readpage(page, true, &cpu);
 	set_page_private(page, 0);
-	put_cpu();
 
 	return cpu;
 }
@@ -630,14 +646,14 @@ inline int hermit_poll_read(int cpu, struct page *page, bool unlock,
 			    uint64_t pf_breakdown[])
 {
 	BUG_ON(!page);
+	/* Disk I/O owns its own completion and lock; never unlock it here. */
+	if (cpu < 0)
+		return 0;
 	adc_pf_breakdown_stt(pf_breakdown, ADC_POLL_LOAD, pf_cycles_start());
-	if (!PageLocked(page))
-		goto done;
 	frontswap_poll_load(cpu);
 	// SetPageUptodate(page);
 	if (unlock)
 		unlock_page(page);
-done:
 	adc_pf_breakdown_end(pf_breakdown, ADC_POLL_LOAD, pf_cycles_end());
 	return 0;
 }

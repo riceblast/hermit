@@ -1983,6 +1983,11 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 
 		lock_page(page);
 		wait_on_page_writeback(page);
+		if (unlikely(!PageUptodate(page))) {
+			unlock_page(page);
+			put_page(page);
+			return -EIO;
+		}
 		ret = unuse_pte(vma, pmd, addr, entry, page);
 		if (ret < 0) {
 			unlock_page(page);

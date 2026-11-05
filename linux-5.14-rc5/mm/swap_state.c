@@ -556,12 +556,10 @@ __read_swap_cache_speculative(swp_entry_t entry, gfp_t gfp_mask,
 	return page;
 
 fail_unlock:
+	adc_profile_counter_inc(ADC_OPTIM_FAILED);
+	hermit_poll_read(*cpu, page, false, pf_breakdown);
 	put_swap_page(page, entry);
 	unlock_page(page);
-	if (cpu) {
-		adc_profile_counter_inc(ADC_OPTIM_FAILED);
-		hermit_poll_read(*cpu, page, true, pf_breakdown);
-	}
 	put_page(page);
 	return NULL;
 fail_free:
@@ -707,13 +705,12 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 			vma, addr, &page_was_allocated);
 
 	if (page_was_allocated) {
-		int cpu = get_cpu();
-		swap_readpage(retpage, do_poll);
-		put_cpu();
+		int cpu;
+		swap_readpage(retpage, do_poll, &cpu);
 		hermit_poll_read(cpu, retpage, true, NULL);
 		// [RMGrid] profiling
 		adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
-		if (vma->vm_mm)
+		if (vma && vma->vm_mm)
 			count_memcg_event_mm(vma->vm_mm, ONDEMAND_SWAPIN);
 	}
 
@@ -838,14 +835,12 @@ struct page *hermit_swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 				     entry, gfp_mask, vma, addr,
 				     &demand_page_allocated, adc_pf_bits,
 				     pf_breakdown);
-	if (cpu == -1 && demand_page_allocated) {
-		cpu = get_cpu();
-		swap_readpage(fault_page, do_poll);
-		put_cpu();
+	if (!hmt_spec_io && demand_page_allocated) {
+		swap_readpage(fault_page, do_poll, &cpu);
 		// [RMGrid] profiling
 		set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
 		adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);
-		if (vma->vm_mm)
+		if (vma && vma->vm_mm)
 			count_memcg_event_mm(vma->vm_mm, ONDEMAND_SWAPIN);
 	}
 
@@ -1063,10 +1058,8 @@ hermit_swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
 	adc_pf_breakdown_end(pf_breakdown, ADC_DEDUP_SWAPIN, pf_ts);
 	adc_pf_breakdown_stt(pf_breakdown, ADC_PAGE_IO, pf_ts);
 
-	if (cpu == -1 && demand_page_allocated) {
-		cpu = get_cpu();
-		swap_readpage(fault_page, pref_req.ra_info.win == 1);
-		put_cpu();
+	if (!hmt_spec_io && demand_page_allocated) {
+		swap_readpage(fault_page, pref_req.ra_info.win == 1, &cpu);
 		// [RMGrid] profiling
 		set_adc_pf_bits(adc_pf_bits, ADC_PF_MAJOR_BIT);
 		adc_profile_counter_inc(ADC_ONDEMAND_SWAPIN);

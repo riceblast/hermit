@@ -2614,7 +2614,7 @@ struct page *hermit_ksm_might_need_to_copy(struct page *page,
 	}
 
 	/* [Hermit] */
-	hermit_poll_read(cpu, page, true, NULL);
+	hermit_poll_read(cpu, page, false, NULL);
 	// lru_cache_add(page);
 
 	if (!PageUptodate(page))

@@ -450,7 +450,7 @@ extern void kswapd_stop(int nid);
 #include <linux/blk_types.h> /* for bio_end_io_t */
 
 /* linux/mm/page_io.c */
-extern int swap_readpage(struct page *page, bool do_poll);
+extern int swap_readpage(struct page *page, bool do_poll, int *rdma_cpu);
 extern int swap_readpage_async(struct page *page);
 extern int swap_writepage(struct page *page, struct writeback_control *wbc);
 extern int swap_writepage_on_core(struct page *page,
@@ -598,8 +598,9 @@ static inline void put_swap_device(struct swap_info_struct *si)
 
 #else /* CONFIG_SWAP */
 
-static inline int swap_readpage(struct page *page, bool do_poll)
+static inline int swap_readpage(struct page *page, bool do_poll, int *rdma_cpu)
 {
+	*rdma_cpu = -1;
 	return 0;
 }
 

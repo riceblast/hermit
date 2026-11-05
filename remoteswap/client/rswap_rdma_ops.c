@@ -1,8 +1,7 @@
 #include <linux/ktime.h>
-#include <linux/mutex.h>
 #include <linux/overflow.h>
-#include <linux/types.h>
 #include <linux/tracepoint.h>
+#include <linux/cpu.h>
 
 #include <linux/swap_stats.h>
 #include <linux/hermit.h>
@@ -12,6 +11,10 @@
 
 static unsigned int active_servers;
 static struct rswap_pool_layout pool_layout;
+static bool area_active;
+static unsigned int area_type;
+static DEFINE_SPINLOCK(area_lock);
+static atomic_t area_submissions = ATOMIC_INIT(0);
 
 struct rswap_remote_page {
 	struct rdma_session_context *session;
@@ -19,390 +22,183 @@ struct rswap_remote_page {
 	u64 chunk_offset;
 };
 
-struct end2end_rdma_lat** qp_store_lat;
-struct end2end_rdma_lat** qp_sync_load_lat;
-struct end2end_rdma_lat** qp_async_load_lat;
-
-struct mutex* qp_store_mutex;
-struct mutex* qp_sync_load_mutex;
-struct mutex* qp_async_load_mutex;
-
-u64 list_size;
-
-/**
- * Wait for the finish of ALL the outstanding rdma_request
- */
-void drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
+/* All DIRECT processing, including callbacks, is serialized per CQ. */
+static void rswap_poll_queue(struct rswap_rdma_queue *queue, int budget)
 {
-	int nr_pending = atomic_read(&rdma_queue->rdma_post_counter);
-	int nr_done = 0;
+	unsigned long flags;
 
-	preempt_disable();
-	while (atomic_read(&rdma_queue->rdma_post_counter) > 0) {
-		int nr_completed;
-		// IB_POLL_BATCH is 16 by default
-		nr_completed = ib_process_cq_direct(rdma_queue->cq, 4);
-		nr_done += nr_completed;
-		if (nr_done >= nr_pending)
-			break;
-		cpu_relax();
+	if (queue->cq->poll_ctx != IB_POLL_DIRECT)
+		return;
+	spin_lock_irqsave(&queue->cq_lock, flags);
+	ib_process_cq_direct(queue->cq, budget);
+	spin_unlock_irqrestore(&queue->cq_lock, flags);
+}
+
+static void rswap_wait_progress(struct rswap_rdma_queue *queue)
+{
+	if (queue->cq->poll_ctx == IB_POLL_DIRECT) {
+		rswap_poll_queue(queue, 64);
+	} else if (!in_atomic() && !irqs_disabled()) {
+		/* SOFTIRQ owns this CQ. Do not also process it directly. */
+		wait_event_timeout(queue->sem,
+			!atomic_read(&queue->rdma_post_counter), 1);
 	}
-	preempt_enable();
+	if (!in_atomic() && !irqs_disabled())
+		cond_resched();
+	cpu_relax();
 }
 
-void write_drain_rdma_queue(struct rswap_rdma_queue *rdma_queue)
+void drain_rdma_queue(struct rswap_rdma_queue *queue)
 {
-	int nr_pending = atomic_read(&rdma_queue->rdma_post_counter);
-	int nr_done = 0;
-
-	while (atomic_read(&rdma_queue->rdma_post_counter) > 0) {
-		int nr_completed;
-		// IB_POLL_BATCH is 16 by default
-		nr_completed = ib_process_cq_direct(rdma_queue->cq, 64);
-		nr_done += nr_completed;
-		if (nr_done >= nr_pending)
-			break;
-		cpu_relax();
-	}
+	while (atomic_read(&queue->rdma_post_counter) || atomic_read(&queue->store_pending))
+		rswap_wait_progress(queue);
+	/* Also synchronize with a DIRECT callback's return, not just pending. */
+	if (queue->cq->poll_ctx == IB_POLL_DIRECT)
+		rswap_poll_queue(queue, 4);
 }
 
-static inline int peek_rdma_queue(struct rswap_rdma_queue *rdma_queue)
-{
-	if (atomic_read(&rdma_queue->rdma_post_counter) > 0)
-		ib_process_cq_direct(rdma_queue->cq, 4);
-	return atomic_read(&rdma_queue->rdma_post_counter);
-}
-
-/**
- * Drain all the outstanding messages for a specific memory server.
- */
 void drain_all_rdma_queues(int target_mem_server)
 {
+	struct rdma_session_context *session;
 	int i;
-	struct rdma_session_context *rdma_session = &rdma_sessions[0];
 
-	for (i = 0; i < num_queues; i++) {
-		drain_rdma_queue(&(rdma_session->rdma_queues[i]));
-	}
-}
-
-int _get_free_idx(struct end2end_rdma_lat* rdma_lat_list)
-{
-	int idx = 0;
-
-	for (idx = 0; idx < (RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH); idx += 1) {
-		if (rdma_lat_list[idx].wr_id_ == 0) {
-			return idx;
-		}
-	}
-	return -1;
-}
-
-// 0: success
-// -1: failed
-int _init_lat_entry(struct end2end_rdma_lat* rdma_lat_list, struct mutex* mtx, u64 wr_id)
-{
-	int free_idx = -1;
-	int success = -1;
-	u64 cur_time_us;
-	ktime_t kt;
-
-	//while(1) {
-		// if (nr_try_times == 10) {
-		// 	printk("WARN, nr_try_times == 10\n");
-		// }
-
-		free_idx = _get_free_idx(rdma_lat_list);
-		if (free_idx == -1 || free_idx >= (RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH)) {
-			printk("(FREE_IDX BUG!! free_idx == -1\n");
-			return -1;
-		}
-
-		
-		//mutex_lock(mtx);
-		if (rdma_lat_list[free_idx].wr_id_ == 0) {
-			rdma_lat_list[free_idx].wr_id_ = wr_id;
-			
-			kt = ktime_get();
-			cur_time_us = ktime_to_us(kt);
-			rdma_lat_list[free_idx].start_time_us_ = cur_time_us;
-			success = 0;
-		} else {
-			printk("init_lat_entry conflict\n");
-		}
-		//mutex_unlock(mtx);
-
-		// if (success == 0) {
-		// 	kt = ktime_get();
-		// 	cur_time_us = ktime_to_us(kt);
-		// 	rdma_lat_list[free_idx].start_time_us_ = cur_time_us;
-
-		// 	//break;
-		// } else {
-		// 	printk("init_lat_entry conflict\n");
-		// }
-		//nr_try_times += 1;
-	//}
-	return success;
-}
-
-void record_start_time(u64 wr_id, int cpu, enum rdma_queue_type type) 
-{
-	if (cpu >= list_size) {
-		printk("BUG!! cpu > list_size, %d - %lld\n", cpu, list_size);
+	if (WARN_ON(target_mem_server < 0 || (unsigned int)target_mem_server >= active_servers))
 		return;
-	}
-
-	switch (type) {
-		case QP_STORE:
-			_init_lat_entry(qp_store_lat[cpu], &qp_store_mutex[cpu], wr_id);
-			break;
-
-		case QP_LOAD_SYNC:
-			_init_lat_entry(qp_sync_load_lat[cpu], &qp_sync_load_mutex[cpu], wr_id);
-			break;
-
-		case QP_LOAD_ASYNC:
-			_init_lat_entry(qp_async_load_lat[cpu], &qp_async_load_mutex[cpu], wr_id);
-			break;
-
-		case NUM_QP_TYPE:
-			printk("(NUM_QP_TYPE)BUG!!\n");
-			break;
-	}
+	session = &rdma_sessions[target_mem_server];
+	for (i = 0; i < num_queues; i++)
+		drain_rdma_queue(&session->rdma_queues[i]);
 }
 
-int _get_target_idx(struct end2end_rdma_lat* rdma_lat_list, u64 wr_id)
+static void rswap_request_done(struct rswap_rdma_queue *queue)
 {
-	int idx = 0;
-
-	for (idx = 0; idx < (RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH); idx += 1) {
-		if (rdma_lat_list[idx].wr_id_ == wr_id) {
-			return idx;
-		}
-	}
-	return -1;
+	atomic_dec(&queue->rdma_post_counter);
+	wake_up_all(&queue->sem);
 }
 
-int _caculate_lat(struct end2end_rdma_lat* rdma_lat_list, struct mutex* mtx, u64 wr_id, enum rdma_queue_type type)
-{
-	int success = -1;
-	int target_idx = -1;
-	u64 cur_time_us;
-	ktime_t kt;
-
-	target_idx = _get_target_idx(rdma_lat_list, wr_id);
-	if (target_idx == -1) {
-		printk("TARGET_IDX BUG!! target_idx == -1\n");
-		return -1;
-	}
-	if (rdma_lat_list[target_idx].wr_id_ != wr_id) {
-		printk("TARGET WR_ID BUG!! wr_id not match\n");
-		return -1;
-	}
-	if (rdma_lat_list[target_idx].start_time_us_ == 0) {
-		printk("START_TIME_US BUG!! start_time_us == 0\n");
-		return -1;
-	}
-
-	kt = ktime_get();
-	cur_time_us = ktime_to_us(kt);
-	trace_printk("type: %d lat: %llu\n", type, cur_time_us - rdma_lat_list[target_idx].start_time_us_);
-
-	//mutex_lock(mtx);
-	rdma_lat_list[target_idx].wr_id_ = 0;
-	// rdma_lat_list[target_idx].start_time_us_ = 0;
-	// rdma_lat_list[target_idx].end_time_us_ = 0;
-	//mutex_unlock(mtx);
-
-	return success;
-}
-
-void dump_lat(u64 wr_id, int cpu, enum rdma_queue_type type)
-{
-	if (cpu >= list_size) {
-		printk("BUG!! cpu > list_size, %d - %lld\n", cpu, list_size);
-		return;
-	}
-
-	switch (type) {
-		case QP_STORE:
-			_caculate_lat(qp_store_lat[cpu], &qp_store_mutex[cpu], wr_id, type);
-			break;
-
-		case QP_LOAD_SYNC:
-			_caculate_lat(qp_sync_load_lat[cpu], &qp_sync_load_mutex[cpu], wr_id, type);
-			break;
-
-		case QP_LOAD_ASYNC:
-			_caculate_lat(qp_async_load_lat[cpu], &qp_async_load_mutex[cpu], wr_id, type);
-			break;
-
-		case NUM_QP_TYPE:
-			printk("(NUM_QP_TYPE)BUG!!\n");
-			break;
-	}
-}
-
-/**
- * The callback function for rdma requests.
+/* Last owner retires the store. A failed synchronous prepare never publishes
+ * and leaves the lock with swap_writepage() for its disk fallback.
  */
+static void rswap_store_put(struct fs_rdma_req *req)
+{
+	struct rswap_rdma_queue *queue = req->rdma_queue;
+	struct page *page = req->page;
+
+	if (!refcount_dec_and_test(&req->store_refs))
+		return;
+	if (req->store_published) {
+		if (req->status) {
+			set_page_dirty(page);
+			ClearPageReclaim(page);
+			/* commit already published the bit, so it cannot reappear
+			 * after this invalidate. The dirty local copy stays resident.
+			 */
+			frontswap_invalidate_page(req->swap_type, req->offset);
+		}
+		unlock_page(page);
+	}
+	put_page(page);
+	kmem_cache_free(queue->fs_rdma_req_cache, req);
+	atomic_dec(&queue->store_pending);
+	wake_up_all(&queue->sem);
+}
+
 void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 {
-	struct fs_rdma_req *rdma_req =
-		container_of(wc->wr_cqe, struct fs_rdma_req, cqe);
-	struct rswap_rdma_queue *rdma_queue = cq->cq_context;
-	struct ib_device *ibdev = rdma_queue->rdma_session->rdma_dev->dev;
-	bool unlock = true;
-	int cpu;
-	enum rdma_queue_type type;
+	struct fs_rdma_req *req = container_of(wc->wr_cqe, struct fs_rdma_req, cqe);
+	struct rswap_rdma_queue *queue = req->rdma_queue;
+	struct ib_device *dev = queue->rdma_session->rdma_dev->dev;
+	enum rdma_queue_type type = queue->type;
+	struct page *page = req->page;
+	int status = wc->status == IB_WC_SUCCESS ? 0 : -EIO;
 
-#if defined(RSWAP_KERNEL_SUPPORT) && RSWAP_KERNEL_SUPPORT >= 3
-	unlock = !hmt_ctl_flag(HMT_LAZY_POLL);
-#else
-	unlock = true;
-#endif
-
-	if (unlikely(wc->status != IB_WC_SUCCESS)) {
-		pr_err("%s status is not success, it is=%d\n", __func__,
-		       wc->status);
+	ib_dma_unmap_page(dev, req->dma_addr, PAGE_SIZE,
+			type == QP_STORE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+	if (status) {
+		rswap_rdma_error(queue, status);
+		pr_err_ratelimited("rswap: server=%u queue=%d WC status=%d\n",
+			queue->rdma_session->server_id, queue->q_index, wc->status);
 	}
-	get_rdma_queue_cpu_type(rdma_queue->rdma_session, rdma_queue, &cpu, &type);
-	if (type == QP_STORE) { // STORE requests
-		dump_lat(wc->wr_id, cpu, type);
+	trace_printk("server: %u type: %d lat: %llu\n",
+		queue->rdma_session->server_id, type,
+		(unsigned long long)((ktime_get_ns() - req->start_ns) / 1000));
 
-		// set_page_writeback(rdma_req->page);
-		unlock_page(rdma_req->page);
-		// end_page_writeback(rdma_req->page);
-	} else if (type == QP_LOAD_SYNC) { // LOAD SYNC requests
-		dump_lat(wc->wr_id, cpu, type);
-
-		// originally called in swap_readpage(). Moved here for asynchrony.
-		SetPageUptodate(rdma_req->page);
-		if (unlock)
-			unlock_page(rdma_req->page);
-	} else if (type == QP_LOAD_ASYNC) { // LOAD ASYNC requests
-		dump_lat(wc->wr_id, cpu, type);
-
-		// originally called in swap_readpage(). Moved here for asynchrony.
-		SetPageUptodate(rdma_req->page);
-		unlock_page(rdma_req->page);
+	if (type == QP_STORE) {
+		req->status = status;
+		smp_store_release(&req->io_done, true);
+		rswap_store_put(req);
+		rswap_request_done(queue);
+		return;
+	}
+	if (status) {
+		ClearPageUptodate(page);
+		SetPageError(page);
 	} else {
-		printk("Err cq handle cpu: %d type: %d\n", cpu, type);
+		ClearPageError(page);
+		SetPageUptodate(page);
 	}
-
-	atomic_dec(&rdma_queue->rdma_post_counter);
-	ib_dma_unmap_page(ibdev, rdma_req->dma_addr, PAGE_SIZE,
-			  type == QP_STORE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
-	kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
+	/* Demand reads remain locked for Hermit, independent of lazy_poll. */
+	if (type == QP_LOAD_ASYNC)
+		unlock_page(page);
+	put_page(page);
+	kmem_cache_free(queue->fs_rdma_req_cache, req);
+	rswap_request_done(queue);
 }
 
-int fs_enqueue_send_wr(struct rdma_session_context *rdma_session,
-		       struct rswap_rdma_queue *rdma_queue,
-		       struct fs_rdma_req *rdma_req)
+static int fs_enqueue_send_wr(struct rswap_rdma_queue *queue,
+		struct fs_rdma_req *req)
 {
-	int ret = 0;
 	const struct ib_send_wr *bad_wr;
-	int test;
+	int pending, ret;
 
-	int cpu;
-	enum rdma_queue_type type;
-
-	rdma_req->rdma_queue = rdma_queue;
-
-	get_rdma_queue_cpu_type(rdma_session, rdma_queue, &cpu, &type);
-	if (type != rdma_queue->type) {
-		printk("RDMA_QUEUE_TYPE BUG!! %d - %d\n", type, rdma_queue->type);
-	}
-
-	while (1) {
-		test = atomic_inc_return(&rdma_queue->rdma_post_counter);
-		if (test < RDMA_SEND_QUEUE_DEPTH - 16) {
-
-			record_start_time((u64)rdma_req, cpu, type);
-
-			ret = ib_post_send(
-				rdma_queue->qp,
-				(struct ib_send_wr *)&rdma_req->rdma_wr,
-				&bad_wr);
-			if (unlikely(ret)) {
-				pr_err("%s, post 1-sided RDMA send wr failed, "
-				       "return value :%d. counter %d \n",
-				       __func__, ret, test);
-				ret = -1;
-				goto err;
-			}
-
+	for (;;) {
+		if (READ_ONCE(queue->rdma_session->stopping))
+			return -ESHUTDOWN;
+		ret = READ_ONCE(queue->rdma_session->error);
+		if (ret)
 			return ret;
-		} else { // RDMA send queue is full, wait for next turn.
-			test = atomic_dec_return(
-				&rdma_queue->rdma_post_counter);
-			cpu_relax();
-
-			drain_rdma_queue(rdma_queue);
-			pr_err("%s, back pressure...\n", __func__);
+		pending = atomic_read(&queue->rdma_post_counter);
+		if (pending >= RDMA_SEND_QUEUE_DEPTH - 16) {
+			/* A local disabled BH cannot service a SOFTIRQ CQ. */
+			if (queue->cq->poll_ctx != IB_POLL_DIRECT &&
+			    (in_softirq() || irqs_disabled()))
+				return -EAGAIN;
+			rswap_wait_progress(queue);
+			continue;
 		}
+		if (atomic_cmpxchg(&queue->rdma_post_counter, pending, pending + 1) == pending)
+			break;
 	}
-err:
-	pr_err(" Error in %s \n", __func__);
-	return -1;
+	req->start_ns = ktime_get_ns();
+	ret = ib_post_send(queue->qp, &req->rdma_wr.wr, &bad_wr);
+	if (ret)
+		rswap_request_done(queue);
+	/* On success a load callback may already have freed req. */
+	return ret;
 }
 
-/**
- * Build a rdma_wr for frontswap data path.
- */
-int fs_build_rdma_wr(struct rdma_session_context *rdma_session,
-		     struct rswap_rdma_queue *rdma_queue,
-		     struct fs_rdma_req *rdma_req,
-		     struct remote_chunk *remote_chunk_ptr,
-		     size_t offset_within_chunk, struct page *page,
-		     enum rdma_queue_type type)
+static int fs_build_rdma_wr(struct rswap_rdma_queue *queue,
+		struct fs_rdma_req *req, const struct rswap_remote_page *remote,
+		struct page *page)
 {
-	int ret = 0;
-	enum dma_data_direction dir;
-	struct ib_device *dev = rdma_session->rdma_dev->dev;
+	struct ib_device *dev = queue->rdma_session->rdma_dev->dev;
+	enum dma_data_direction dir = queue->type == QP_STORE ?
+		DMA_TO_DEVICE : DMA_FROM_DEVICE;
 
-	rdma_req->page = page;
-
-	dir = type == QP_STORE ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
-	rdma_req->dma_addr = ib_dma_map_page(dev, page, 0, PAGE_SIZE, dir);
-	if (unlikely(ib_dma_mapping_error(dev, rdma_req->dma_addr))) {
-		pr_err("%s, ib_dma_mapping_error\n", __func__);
-		ret = -ENOMEM;
-		kmem_cache_free(rdma_queue->fs_rdma_req_cache, rdma_req);
-		goto out;
-	}
-
-	ib_dma_sync_single_for_device(dev, rdma_req->dma_addr, PAGE_SIZE, dir);
-
-	rdma_req->cqe.done = fs_rdma_callback;
-
-	rdma_req->sge.addr = rdma_req->dma_addr;
-	rdma_req->sge.length = PAGE_SIZE;
-	rdma_req->sge.lkey = rdma_session->rdma_dev->pd->local_dma_lkey;
-
-	rdma_req->rdma_wr.wr.next = NULL;
-	rdma_req->rdma_wr.wr.wr_cqe = &rdma_req->cqe;
-	rdma_req->rdma_wr.wr.sg_list = &(rdma_req->sge);
-	rdma_req->rdma_wr.wr.num_sge = 1;
-	rdma_req->rdma_wr.wr.opcode =
-		(dir == DMA_TO_DEVICE ? IB_WR_RDMA_WRITE : IB_WR_RDMA_READ);
-	rdma_req->rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
-	rdma_req->rdma_wr.remote_addr =
-		remote_chunk_ptr->remote_addr + offset_within_chunk;
-	rdma_req->rdma_wr.rkey = remote_chunk_ptr->remote_rkey;
-
-// debug
-#ifdef DEBUG_MODE_BRIEF
-	if (dir == DMA_FROM_DEVICE) {
-		pr_info("%s, read data from remote 0x%lx, size 0x%lx \n",
-			__func__, (size_t)rdma_req->rdma_wr.remote_addr,
-			(size_t)PAGE_SIZE);
-	}
-#endif
-
-out:
-	return ret;
+	req->dma_addr = ib_dma_map_page(dev, page, 0, PAGE_SIZE, dir);
+	if (ib_dma_mapping_error(dev, req->dma_addr))
+		return -ENOMEM;
+	req->cqe.done = fs_rdma_callback;
+	req->sge.addr = req->dma_addr;
+	req->sge.length = PAGE_SIZE;
+	req->sge.lkey = queue->rdma_session->rdma_dev->pd->local_dma_lkey;
+	req->rdma_wr.wr.wr_cqe = &req->cqe;
+	req->rdma_wr.wr.sg_list = &req->sge;
+	req->rdma_wr.wr.num_sge = 1;
+	req->rdma_wr.wr.opcode = queue->type == QP_STORE ? IB_WR_RDMA_WRITE : IB_WR_RDMA_READ;
+	req->rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
+	req->rdma_wr.remote_addr = remote->chunk->remote_addr + remote->chunk_offset;
+	req->rdma_wr.rkey = remote->chunk->remote_rkey;
+	return 0;
 }
 
 /* All store/load paths resolve the same immutable pool layout. */
@@ -444,285 +240,237 @@ static int rswap_resolve_remote_page(pgoff_t offset,
 	return 0;
 }
 
-/* Optionally return the actual queue so a synchronous store can wait on it. */
-static int rswap_rdma_send_on_queue(int cpu, pgoff_t offset, struct page *page,
-		enum rdma_queue_type type, struct rswap_rdma_queue **target_queue)
+/* Stores retain a publication reference until Frontswap commits their bit. */
+static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
+		enum rdma_queue_type type, struct fs_rdma_req **store_req)
 {
 	struct rswap_remote_page remote;
-	struct rswap_rdma_queue *rdma_queue;
-	struct fs_rdma_req *rdma_req;
+	struct rswap_rdma_queue *queue;
+	struct fs_rdma_req *req;
 	int ret;
 
+	if (PageCompound(page))
+		return -EOPNOTSUPP;
 	if (cpu < 0 || cpu >= online_cores || (unsigned int)type >= NUM_QP_TYPE)
 		return -EINVAL;
 	ret = rswap_resolve_remote_page(offset, &remote);
 	if (ret)
 		return ret;
-	if (READ_ONCE(remote.session->stopping))
-		return -ESHUTDOWN;
-	ret = READ_ONCE(remote.session->error);
+	queue = get_rdma_queue(remote.session, cpu, type);
+	req = kmem_cache_zalloc(queue->fs_rdma_req_cache, GFP_ATOMIC);
+	if (!req)
+		return -ENOMEM;
+	req->rdma_queue = queue;
+	req->page = page;
+	req->offset = offset;
+	if (type == QP_STORE) {
+		req->swap_type = area_type;
+		refcount_set(&req->store_refs, 2);
+	}
+	get_page(page);
+	ret = fs_build_rdma_wr(queue, req, &remote, page);
 	if (ret)
-		return ret;
-	if (!remote.session->rdma_queues || !remote.session->rdma_dev ||
-	    !remote.session->rdma_dev->pd)
-		return -ENODEV;
-
-	rdma_queue = get_rdma_queue(remote.session, cpu, type);
-	rdma_req = (struct fs_rdma_req *)kmem_cache_alloc(
-		rdma_queue->fs_rdma_req_cache, GFP_ATOMIC);
-	if (!rdma_req) {
-		pr_err("%s, get reserved fs_rdma_req failed. \n", __func__);
-		ret = -ENOMEM;
-		goto out;
+		goto free_req;
+	if (type == QP_STORE)
+		atomic_inc(&queue->store_pending);
+	ret = fs_enqueue_send_wr(queue, req);
+	if (ret) {
+		ib_dma_unmap_page(remote.session->rdma_dev->dev, req->dma_addr,
+			PAGE_SIZE, type == QP_STORE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+		if (type == QP_STORE)
+			atomic_dec(&queue->store_pending);
+		goto free_req;
 	}
+	if (type == QP_STORE)
+		*store_req = req;
+	return 0;
+free_req:
+	put_page(page);
+	kmem_cache_free(queue->fs_rdma_req_cache, req);
+	return ret;
+}
 
-	ret = fs_build_rdma_wr(remote.session, rdma_queue, rdma_req,
-			       remote.chunk, remote.chunk_offset, page,
-			       type);
-	if (unlikely(ret)) {
-		pr_err("%s, Build rdma_wr failed.\n", __func__);
-		goto out;
+static int rswap_rdma_submit(int cpu, pgoff_t offset, struct page *page,
+		enum rdma_queue_type type, struct fs_rdma_req **store_req)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&area_lock, flags);
+	if (!area_active) {
+		spin_unlock_irqrestore(&area_lock, flags);
+		return -ESHUTDOWN;
 	}
-
-	ret = fs_enqueue_send_wr(remote.session, rdma_queue, rdma_req);
-	if (unlikely(ret)) {
-		pr_err("%s, enqueue rdma_wr failed.\n", __func__);
-		goto out;
-	}
-	if (target_queue)
-		*target_queue = rdma_queue;
-
-out:
+	atomic_inc(&area_submissions);
+	spin_unlock_irqrestore(&area_lock, flags);
+	ret = rswap_rdma_submit_active(cpu, offset, page, type, store_req);
+	atomic_dec(&area_submissions);
 	return ret;
 }
 
 int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
-		    enum rdma_queue_type type)
+		enum rdma_queue_type type)
 {
-	return rswap_rdma_send_on_queue(cpu, offset, page, type, NULL);
+	/* Stores must enter through prepare/commit, never bypass publication. */
+	if (type == QP_STORE)
+		return -EINVAL;
+	return rswap_rdma_submit(cpu, offset, page, type, NULL);
 }
 
-/**
- * Synchronously write data to memory server.
- */
-int rswap_frontswap_store(unsigned type, pgoff_t swap_entry_offset,
-			  struct page *page)
+static int rswap_store_prepare(unsigned int type, pgoff_t offset,
+		struct page *page, int core, void **cookie)
 {
-	int ret = 0;
-	int cpu;
-	struct rswap_rdma_queue *rdma_queue;
+	struct fs_rdma_req *req;
+	int cpu, ret;
 
-	cpu = get_cpu();
-	ret = rswap_rdma_send_on_queue(cpu, swap_entry_offset, page, QP_STORE,
-				      &rdma_queue);
+	*cookie = NULL;
+	if (type != READ_ONCE(area_type))
+		return -EINVAL;
+	cpu = core == -1 ? get_cpu() : core;
+	ret = rswap_rdma_submit(cpu, offset, page, QP_STORE, &req);
+	if (core == -1)
+		put_cpu();
+	if (ret)
+		return ret;
+	if (core == -1) {
+		while (!smp_load_acquire(&req->io_done))
+			rswap_wait_progress(req->rdma_queue);
+		ret = req->status;
+		if (ret) {
+			rswap_store_put(req);
+			return ret;
+		}
+	}
+	*cookie = req;
+	return 0;
+}
+
+static void rswap_store_commit(void *cookie)
+{
+	struct fs_rdma_req *req = cookie;
+
+	req->store_published = true;
+	rswap_store_put(req);
+}
+
+static int rswap_poll_cpu(int cpu, enum rdma_queue_type type, bool peek)
+{
+	unsigned int id;
+	int ret = 0, pending = 0;
+
+	if (cpu < 0 || cpu >= online_cores)
+		return -EINVAL;
+	for (id = 0; id < active_servers; id++) {
+		struct rswap_rdma_queue *queue = get_rdma_queue(&rdma_sessions[id], cpu, type);
+
+		if (peek) {
+			int count, stores;
+
+			rswap_poll_queue(queue, 4);
+			count = atomic_read(&queue->rdma_post_counter);
+			stores = atomic_read(&queue->store_pending);
+			pending += count > stores ? count : stores;
+		} else {
+			drain_rdma_queue(queue);
+			if (!ret)
+				ret = READ_ONCE(rdma_sessions[id].error);
+		}
+	}
+	/* peek reports terminal completion; page flags carry read success. */
+	return peek ? pending : ret;
+}
+
+static int rswap_frontswap_poll_store(int cpu)
+{
+	return rswap_poll_cpu(cpu, QP_STORE, false);
+}
+
+static int rswap_frontswap_poll_load(int cpu)
+{
+	return rswap_poll_cpu(cpu, QP_LOAD_SYNC, false);
+}
+
+static int rswap_frontswap_peek_store(int cpu)
+{
+	return rswap_poll_cpu(cpu, QP_STORE, true);
+}
+
+static int rswap_frontswap_peek_load(int cpu)
+{
+	return rswap_poll_cpu(cpu, QP_LOAD_SYNC, true);
+}
+
+static int rswap_frontswap_load(unsigned int type, pgoff_t offset, struct page *page)
+{
+	if (type != READ_ONCE(area_type))
+		return -EINVAL;
+	return rswap_rdma_send(smp_processor_id(), offset, page, QP_LOAD_SYNC);
+}
+
+static int rswap_frontswap_load_async(unsigned int type, pgoff_t offset, struct page *page)
+{
+	int cpu = get_cpu();
+
 	put_cpu();
-	if (unlikely(ret)) {
-		pr_err("%s, enqueuing rdma frontswap write failed.\n",
-		       __func__);
-		goto out;
-	}
-	write_drain_rdma_queue(rdma_queue);
-
-	ret = 0;
-out:
-	return ret;
+	if (type != READ_ONCE(area_type))
+		return -EINVAL;
+	/* This queue completes by SOFTIRQ, so migration after selection is safe. */
+	return rswap_rdma_send(cpu, offset, page, QP_LOAD_ASYNC);
 }
 
-int rswap_frontswap_store_on_core(unsigned type, pgoff_t swap_entry_offset,
-				  struct page *page, int core)
+static void rswap_invalidate_page(unsigned int type, pgoff_t offset)
 {
-	int ret = 0;
-
-	ret = rswap_rdma_send(core, swap_entry_offset, page, QP_STORE);
-	if (unlikely(ret)) {
-		pr_err("%s, enqueuing rdma frontswap write failed.\n",
-		       __func__);
-		goto out;
-	}
-
-	ret = 0;
-out:
-	return ret;
+	/* Static slots follow Linux's entry lifetime; do not sleep here. */
 }
 
-int rswap_frontswap_poll_store(int core)
+static void rswap_invalidate_area(unsigned int type)
 {
-	struct rswap_rdma_queue *rdma_queue;
+	unsigned int id;
+	unsigned long flags;
 
-	core %= NR_WRITE_QUEUE;
-
-	rdma_queue = get_rdma_queue(&rdma_sessions[0], core, QP_STORE);
-	write_drain_rdma_queue(rdma_queue);
-	return 0;
+	spin_lock_irqsave(&area_lock, flags);
+	area_active = false;
+	spin_unlock_irqrestore(&area_lock, flags);
+	/* No submitter can reserve a WR after the drain has passed its queue. */
+	while (atomic_read(&area_submissions))
+		cond_resched();
+	for (id = 0; id < active_servers; id++)
+		drain_all_rdma_queues(id);
 }
 
-/**
- * Synchronously read data from memory server.
- *
- * return:
- *  0 : success
- *  non-zero : failed.
- */
-int rswap_frontswap_load(unsigned type, pgoff_t swap_entry_offset,
-			 struct page *page)
+static void rswap_frontswap_init(unsigned int type)
 {
-	int ret = 0;
-	int cpu;
-	cpu = smp_processor_id();
-	ret = rswap_rdma_send(cpu, swap_entry_offset, page, QP_LOAD_SYNC);
-	if (unlikely(ret)) {
-		pr_err("%s, enqueuing rdma frontswap write failed.\n",
-		       __func__);
-		goto out;
-	}
+	unsigned long flags;
 
-	ret = 0;
-out:
-	return ret;
-}
-
-int rswap_frontswap_load_async(unsigned type, pgoff_t swap_entry_offset,
-			       struct page *page)
-{
-	int ret = 0;
-	int cpu;
-
-	cpu = smp_processor_id();
-	ret = rswap_rdma_send(cpu, swap_entry_offset, page, QP_LOAD_ASYNC);
-	if (unlikely(ret)) {
-		pr_err("%s, enqueuing rdma frontswap write failed.\n",
-		       __func__);
-		goto out;
-	}
-
-	ret = 0;
-
-out:
-	return ret;
-}
-
-int rswap_frontswap_poll_load(int cpu)
-{
-	struct rswap_rdma_queue *rdma_queue;
-
-	rdma_queue = get_rdma_queue(&rdma_sessions[0], cpu, QP_LOAD_SYNC);
-	drain_rdma_queue(rdma_queue);
-	return 0;
-}
-
-int rswap_frontswap_peek_load(int cpu)
-{
-	struct rswap_rdma_queue *rdma_queue =
-		get_rdma_queue(&rdma_sessions[0], cpu, QP_LOAD_SYNC);
-	return peek_rdma_queue(rdma_queue);
-}
-
-int rswap_frontswap_peek_store(int cpu)
-{
-	struct rswap_rdma_queue *rdma_queue;
-	cpu %= NR_WRITE_QUEUE;
-	rdma_queue = get_rdma_queue(&rdma_sessions[0], cpu, QP_STORE);
-	return peek_rdma_queue(rdma_queue);
-}
-
-static void rswap_invalidate_page(unsigned type, pgoff_t offset)
-{
-	return;
-}
-
-static void rswap_invalidate_area(unsigned type)
-{
-	return;
-}
-
-static void rswap_frontswap_init(unsigned type)
-{
+	spin_lock_irqsave(&area_lock, flags);
+	WRITE_ONCE(area_type, type);
+	area_active = true;
+	spin_unlock_irqrestore(&area_lock, flags);
 }
 
 static struct frontswap_ops rswap_frontswap_ops = {
 	.init = rswap_frontswap_init,
-	.store = rswap_frontswap_store,
+	.store_prepare = rswap_store_prepare,
+	.store_commit = rswap_store_commit,
 	.load = rswap_frontswap_load,
-	.invalidate_page = rswap_invalidate_page,
-	.invalidate_area = rswap_invalidate_area,
-#ifdef RSWAP_KERNEL_SUPPORT
 	.load_async = rswap_frontswap_load_async,
 	.poll_load = rswap_frontswap_poll_load,
-#if RSWAP_KERNEL_SUPPORT >= 2
-	.store_on_core = rswap_frontswap_store_on_core,
 	.poll_store = rswap_frontswap_poll_store,
-#endif // RSWAP_KERNEL_SUPPORT >= 2
-#if RSWAP_KERNEL_SUPPORT >= 3
 	.peek_load = rswap_frontswap_peek_load,
 	.peek_store = rswap_frontswap_peek_store,
-#endif // RSWAP_KERNEL_SUPPORT >= 3
-#endif
+	.invalidate_page = rswap_invalidate_page,
+	.invalidate_area = rswap_invalidate_area,
 };
 
-/* Patch 2 keeps swap disabled until Patch 3 fixes multi-session completion. */
 int rswap_register_frontswap(void)
 {
-	return frontswap_register_managed_ops(&rswap_frontswap_ops, THIS_MODULE, 0);
+	return frontswap_register_managed_ops_v2(&rswap_frontswap_ops, THIS_MODULE,
+					    pool_layout.total_pages);
 }
 
 void rswap_deregister_frontswap(void)
 {
 	frontswap_unregister_managed_ops(&rswap_frontswap_ops);
-}
-
-static void free_latency_buffers(void)
-{
-	unsigned int cpu;
-
-	for (cpu = 0; cpu < list_size; cpu++) {
-		if (qp_store_lat)
-			kfree(qp_store_lat[cpu]);
-		if (qp_sync_load_lat)
-			kfree(qp_sync_load_lat[cpu]);
-		if (qp_async_load_lat)
-			kfree(qp_async_load_lat[cpu]);
-	}
-	kfree(qp_store_lat);
-	kfree(qp_sync_load_lat);
-	kfree(qp_async_load_lat);
-	kfree(qp_store_mutex);
-	kfree(qp_sync_load_mutex);
-	kfree(qp_async_load_mutex);
-	qp_store_lat = NULL;
-	qp_sync_load_lat = NULL;
-	qp_async_load_lat = NULL;
-	qp_store_mutex = NULL;
-	qp_sync_load_mutex = NULL;
-	qp_async_load_mutex = NULL;
-	list_size = 0;
-}
-
-static int init_latency_buffers(void)
-{
-	unsigned int cpu;
-	unsigned int entries = RDMA_SEND_QUEUE_DEPTH + RDMA_RECV_QUEUE_DEPTH;
-
-	list_size = online_cores;
-	qp_store_lat = kcalloc(online_cores, sizeof(*qp_store_lat), GFP_KERNEL);
-	qp_sync_load_lat = kcalloc(online_cores, sizeof(*qp_sync_load_lat), GFP_KERNEL);
-	qp_async_load_lat = kcalloc(online_cores, sizeof(*qp_async_load_lat), GFP_KERNEL);
-	qp_store_mutex = kcalloc(online_cores, sizeof(*qp_store_mutex), GFP_KERNEL);
-	qp_sync_load_mutex = kcalloc(online_cores, sizeof(*qp_sync_load_mutex), GFP_KERNEL);
-	qp_async_load_mutex = kcalloc(online_cores, sizeof(*qp_async_load_mutex), GFP_KERNEL);
-	if (!qp_store_lat || !qp_sync_load_lat || !qp_async_load_lat ||
-	    !qp_store_mutex || !qp_sync_load_mutex || !qp_async_load_mutex)
-		return -ENOMEM;
-	for (cpu = 0; cpu < online_cores; cpu++) {
-		qp_store_lat[cpu] = kcalloc(entries, sizeof(**qp_store_lat), GFP_KERNEL);
-		qp_sync_load_lat[cpu] = kcalloc(entries, sizeof(**qp_sync_load_lat), GFP_KERNEL);
-		qp_async_load_lat[cpu] = kcalloc(entries, sizeof(**qp_async_load_lat), GFP_KERNEL);
-		if (!qp_store_lat[cpu] || !qp_sync_load_lat[cpu] || !qp_async_load_lat[cpu])
-			return -ENOMEM;
-		mutex_init(&qp_store_mutex[cpu]);
-		mutex_init(&qp_sync_load_mutex[cpu]);
-		mutex_init(&qp_async_load_mutex[cpu]);
-	}
-	return 0;
 }
 
 int rswap_client_init(const struct rswap_client_config *config)
@@ -732,7 +480,16 @@ int rswap_client_init(const struct rswap_client_config *config)
 	unsigned int id, total_gib = 0;
 	int ret;
 
+	/* The wire protocol numbers queues by a dense, fixed online CPU set. */
+	if (PAGE_SIZE != 4096)
+		return -EOPNOTSUPP;
 	online_cores = num_online_cpus();
+	for_each_online_cpu(id) {
+		if (id >= online_cores) {
+			pr_err("rswap: online CPU IDs must be contiguous from zero\n");
+			return -EINVAL;
+		}
+	}
 	num_queues = online_cores * NUM_QP_TYPE;
 	/* Includes selected but unstarted sessions, so partial failure can unwind. */
 	active_servers = config->nr_servers;
@@ -746,9 +503,6 @@ int rswap_client_init(const struct rswap_client_config *config)
 			goto fail;
 		}
 	}
-	ret = init_latency_buffers();
-	if (ret)
-		goto fail;
 	for (id = 0; id < active_servers; id++) {
 		session = &rdma_sessions[id];
 		pr_info("rswap: connecting server=%u endpoint=%s:%u\n",
@@ -778,7 +532,7 @@ int rswap_client_init(const struct rswap_client_config *config)
 	/* Publish only after every selected session and total capacity are valid. */
 	layout.nr_servers = active_servers;
 	pool_layout = layout;
-	pr_info("rswap: pool ready servers=%u total=%u GiB (static mapping ready; swapon disabled)\n",
+	pr_info("rswap: pool ready servers=%u total=%u GiB (4-KiB swap ready)\n",
 		active_servers, total_gib);
 	return 0;
 fail:
@@ -799,5 +553,4 @@ void rswap_client_exit(void)
 		rswap_disconnect_and_collect_resource(&rdma_sessions[id - 1]);
 	active_servers = 0;
 	memset(&pool_layout, 0, sizeof(pool_layout));
-	free_latency_buffers();
 }

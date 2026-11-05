@@ -3831,6 +3831,15 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 		goto out_page;
 	}
 
+	if (cpu != -1) {
+		hermit_poll_read(cpu, page, false, pf_breakdown);
+		cpu = -1;
+		adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO, pf_cycles_end());
+	}
+	if (unlikely(!PageUptodate(page))) {
+		ret = VM_FAULT_SIGBUS;
+		goto out_page;
+	}
 	page = hermit_ksm_might_need_to_copy(page, vma, vmf->address, cpu);
 	if (unlikely(!page)) {
 		ret = VM_FAULT_OOM;
@@ -3854,11 +3863,6 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 				     pf_cycles_end());
 		goto out_nomap;
 	}
-
-	// if (unlikely(!PageUptodate(page))) {
-	// 	ret = VM_FAULT_SIGBUS;
-	// 	goto out_nomap;
-	// }
 
 	/*
 	 * The page isn't present yet, go ahead with the fault.
@@ -3895,18 +3899,6 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 	}
 
 	adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA, pf_cycles_end());
-
-	if (cpu != -1 && !(page != swapcache && swapcache)) {
-		hermit_poll_read(cpu, page, false, pf_breakdown);
-		// lru_cache_add(page);
-		cpu = -1;
-		adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO,
-				     pf_cycles_end());
-	}
-	if (unlikely(!PageUptodate(page))) {
-		ret = VM_FAULT_SIGBUS;
-		goto out_nomap;
-	}
 
 	adc_pf_breakdown_stt(pf_breakdown, ADC_SETPTE, pf_cycles_start());
 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);

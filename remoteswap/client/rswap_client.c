@@ -6,9 +6,9 @@
 #include "constants.h"
 
 MODULE_AUTHOR("Chenxi Wang, Yifan Qiao");
-MODULE_DESCRIPTION("Hermit single/dual-server remote pool (Patch 2 static mapping)");
+MODULE_DESCRIPTION("Hermit single/dual-server remote pool (Patch 3 4-KiB remote swap)");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_VERSION("1.2");
+MODULE_VERSION("1.3");
 
 static char server_ip[INET_ADDRSTRLEN];
 static char server_ip2[INET_ADDRSTRLEN];
@@ -72,7 +72,7 @@ static int __init rswap_cpu_init(void)
 		rswap_client_exit();
 		return ret;
 	}
-	pr_info("rswap: client ready; swapon remains disabled pending Patch 3\n");
+	pr_info("rswap: client ready; 4-KiB swap enabled for one swap area\n");
 	return 0;
 }
 

@@ -6,6 +6,7 @@
 #include <linux/mm.h>
 #include <linux/bitops.h>
 #include <linux/jump_label.h>
+#include <linux/errno.h>
 
 /*
  * Return code to denote that requested number of
@@ -13,6 +14,9 @@
  * Used in shmem_unuse and try_to_unuse.
  */
 #define FRONTSWAP_PAGES_UNUSED	2
+
+/* A managed backend owns this page, but could not read its remote copy. */
+#define FRONTSWAP_LOAD_ERROR (-EREMOTEIO)
 
 struct frontswap_ops {
 	void (*init)(unsigned); /* this swap type was just swapon'ed */
@@ -33,12 +37,19 @@ struct frontswap_ops {
 #endif // RSWAP_KERNEL_SUPPORT >= 3
 #endif // RSWAP_KERNEL_SUPPORT
 	struct frontswap_ops *next; /* private pointer to next ops */
+	/* Optional managed-store pair. Success returns a cookie while keeping
+	 * the page locked. commit runs after the validity bit is published;
+	 * the backend unlocks only after both commit and I/O completion.
+	 * Failed prepare leaves the page locked and returns no cookie.
+	 */
+	int (*store_prepare)(unsigned, pgoff_t, struct page *, int, void **);
+	void (*store_commit)(void *);
 };
 
 extern void frontswap_register_ops(struct frontswap_ops *ops);
 struct module;
 /* Exclusive, unloadable backend; max_pages == 0 permits connection tests only. */
-extern int frontswap_register_managed_ops(struct frontswap_ops *ops,
+extern int frontswap_register_managed_ops_v2(struct frontswap_ops *ops,
 		struct module *owner, unsigned long max_pages);
 extern void frontswap_unregister_managed_ops(struct frontswap_ops *ops);
 extern void frontswap_shrink(unsigned long);
