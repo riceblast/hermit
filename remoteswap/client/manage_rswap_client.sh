@@ -3,12 +3,12 @@ set -euo pipefail
 
 # Patch 1 connects only. It never creates, reformats, enables or disables swap.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-server0_ip="${SERVER0_IP:-10.0.0.20}"
-server1_ip="${SERVER1_IP:-10.0.0.13}"
+server0_ip="${SERVER0_IP:-10.0.0.13}"
+server1_ip="${SERVER1_IP:-10.0.0.20}"
 server0_port="${SERVER0_PORT:-9400}"
 server1_port="${SERVER1_PORT:-9400}"
 pool_gib="${POOL_GIB:-16}"
-connect_timeout_ms="${CONNECT_TIMEOUT_MS:-30000}"
+connect_timeout_ms="${CONNECT_TIMEOUT_MS:-15000}"
 
 run_as_root() {
     if [[ ${EUID} -eq 0 ]]; then
