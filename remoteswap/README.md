@@ -1,11 +1,15 @@
 # Remoteswap
 
-**Development stage: Patch 1 (configurable single/dual-server connection tests only).**
-Use [the Patch 1 smoke-test guide](tests/patch1-smoke.md) for the current
-build and operator-run tests. The Client selects one or two Servers, discovers their capacities independently,
+**Development stage: Patch 2 (single/dual-server static mapping; swap still disabled).**
+The Client selects one or two Servers, discovers their capacities independently,
 checks their sum against the configuration, registers an unloadable exclusive
 Frontswap backend, and deliberately rejects
-`swapon` until Patch 2/3 provide striping and multi-session I/O completion.
+`swapon` until Patch 3 provides correct multi-session I/O completion.
+All data submissions now share static page routing: interleave the common
+capacity of two Servers and append any larger Server's remaining capacity.
+Single-server pools map directly. See the [Patch 2 summary](tests/patch2_summary.md)
+for implementation scope and verification results. The Patch 1 documents remain
+historical connection-test records; their stage-specific log text has changed.
 The historical single-server swap/deployment instructions below do not apply
 to this intermediate stage. The management script connects/disconnects only;
 it does not create or activate a swapfile. Edit `client/rswap_client.conf`

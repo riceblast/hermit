@@ -6,7 +6,7 @@
 #include "constants.h"
 
 MODULE_AUTHOR("Chenxi Wang, Yifan Qiao");
-MODULE_DESCRIPTION("Hermit single/dual-server remote pool (Patch 1 connection tests)");
+MODULE_DESCRIPTION("Hermit single/dual-server remote pool (Patch 2 static mapping)");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_VERSION("1.2");
 
@@ -72,7 +72,7 @@ static int __init rswap_cpu_init(void)
 		rswap_client_exit();
 		return ret;
 	}
-	pr_info("rswap: Patch 1 ready; swapon is disabled until Patch 2/3\n");
+	pr_info("rswap: client ready; swapon remains disabled pending Patch 3\n");
 	return 0;
 }
 

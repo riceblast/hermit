@@ -1,5 +1,6 @@
 #include <linux/ktime.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/types.h>
 #include <linux/tracepoint.h>
 
@@ -7,6 +8,16 @@
 #include <linux/hermit.h>
 
 #include "rswap_rdma.h"
+#include "rswap_mapping.h"
+
+static unsigned int active_servers;
+static struct rswap_pool_layout pool_layout;
+
+struct rswap_remote_page {
+	struct rdma_session_context *session;
+	struct remote_chunk *chunk;
+	u64 chunk_offset;
+};
 
 struct end2end_rdma_lat** qp_store_lat;
 struct end2end_rdma_lat** qp_sync_load_lat;
@@ -394,51 +405,101 @@ out:
 	return ret;
 }
 
-/**
- * Enqueue a page into RDMA queue.
- */
-int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
-		    enum rdma_queue_type type)
+/* All store/load paths resolve the same immutable pool layout. */
+static int rswap_resolve_remote_page(pgoff_t offset,
+		struct rswap_remote_page *remote)
 {
-	int ret = 0;
-	size_t page_addr;
-	size_t chunk_idx;
-	size_t offset_within_chunk;
+	struct rdma_session_context *session;
+	struct remote_chunk *chunk;
+	u64 slot, byte_offset, chunk_idx, chunk_offset, end;
+	unsigned int server;
+	int ret;
+
+	ret = rswap_map_page(&pool_layout, offset, &server, &slot);
+	if (ret)
+		return ret;
+	session = &rdma_sessions[server];
+	if (!session->remote_mem_pool.chunks)
+		return -ENODEV;
+	if (slot > (U64_MAX >> PAGE_SHIFT))
+		return -EOVERFLOW;
+	byte_offset = slot << PAGE_SHIFT;
+	chunk_idx = byte_offset >> CHUNK_SHIFT;
+	chunk_offset = byte_offset & CHUNK_MASK;
+	if (chunk_idx >= session->remote_mem_pool.chunk_num)
+		return -ERANGE;
+	chunk = &session->remote_mem_pool.chunks[chunk_idx];
+	if (chunk->chunk_state != MAPPED)
+		return -ENXIO;
+	if (chunk->mapped_size < PAGE_SIZE ||
+	    chunk_offset > chunk->mapped_size - PAGE_SIZE)
+		return -ERANGE;
+	if (check_add_overflow(chunk->remote_addr, chunk_offset, &end) ||
+	    check_add_overflow(end, (u64)PAGE_SIZE, &end))
+		return -EOVERFLOW;
+
+	remote->session = session;
+	remote->chunk = chunk;
+	remote->chunk_offset = chunk_offset;
+	return 0;
+}
+
+/* Optionally return the actual queue so a synchronous store can wait on it. */
+static int rswap_rdma_send_on_queue(int cpu, pgoff_t offset, struct page *page,
+		enum rdma_queue_type type, struct rswap_rdma_queue **target_queue)
+{
+	struct rswap_remote_page remote;
 	struct rswap_rdma_queue *rdma_queue;
 	struct fs_rdma_req *rdma_req;
-	struct remote_chunk *remote_chunk_ptr;
+	int ret;
 
-	page_addr = pgoff2addr(offset);
-	chunk_idx = page_addr >> CHUNK_SHIFT;
-	offset_within_chunk = page_addr & CHUNK_MASK;
+	if (cpu < 0 || cpu >= online_cores || (unsigned int)type >= NUM_QP_TYPE)
+		return -EINVAL;
+	ret = rswap_resolve_remote_page(offset, &remote);
+	if (ret)
+		return ret;
+	if (READ_ONCE(remote.session->stopping))
+		return -ESHUTDOWN;
+	ret = READ_ONCE(remote.session->error);
+	if (ret)
+		return ret;
+	if (!remote.session->rdma_queues || !remote.session->rdma_dev ||
+	    !remote.session->rdma_dev->pd)
+		return -ENODEV;
 
-	rdma_queue = get_rdma_queue(&rdma_sessions[0], cpu, type);
+	rdma_queue = get_rdma_queue(remote.session, cpu, type);
 	rdma_req = (struct fs_rdma_req *)kmem_cache_alloc(
 		rdma_queue->fs_rdma_req_cache, GFP_ATOMIC);
 	if (!rdma_req) {
 		pr_err("%s, get reserved fs_rdma_req failed. \n", __func__);
+		ret = -ENOMEM;
 		goto out;
 	}
 
-	remote_chunk_ptr =
-		&(rdma_sessions[0].remote_mem_pool.chunks[chunk_idx]);
-
-	ret = fs_build_rdma_wr(&rdma_sessions[0], rdma_queue, rdma_req,
-			       remote_chunk_ptr, offset_within_chunk, page,
+	ret = fs_build_rdma_wr(remote.session, rdma_queue, rdma_req,
+			       remote.chunk, remote.chunk_offset, page,
 			       type);
 	if (unlikely(ret)) {
 		pr_err("%s, Build rdma_wr failed.\n", __func__);
 		goto out;
 	}
 
-	ret = fs_enqueue_send_wr(&rdma_sessions[0], rdma_queue, rdma_req);
+	ret = fs_enqueue_send_wr(remote.session, rdma_queue, rdma_req);
 	if (unlikely(ret)) {
 		pr_err("%s, enqueue rdma_wr failed.\n", __func__);
 		goto out;
 	}
+	if (target_queue)
+		*target_queue = rdma_queue;
 
 out:
 	return ret;
+}
+
+int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
+		    enum rdma_queue_type type)
+{
+	return rswap_rdma_send_on_queue(cpu, offset, page, type, NULL);
 }
 
 /**
@@ -452,14 +513,14 @@ int rswap_frontswap_store(unsigned type, pgoff_t swap_entry_offset,
 	struct rswap_rdma_queue *rdma_queue;
 
 	cpu = get_cpu();
-	ret = rswap_rdma_send(cpu, swap_entry_offset, page, QP_STORE);
+	ret = rswap_rdma_send_on_queue(cpu, swap_entry_offset, page, QP_STORE,
+				      &rdma_queue);
+	put_cpu();
 	if (unlikely(ret)) {
 		pr_err("%s, enqueuing rdma frontswap write failed.\n",
 		       __func__);
 		goto out;
 	}
-	put_cpu();
-	rdma_queue = get_rdma_queue(&rdma_sessions[0], cpu, QP_STORE);
 	write_drain_rdma_queue(rdma_queue);
 
 	ret = 0;
@@ -598,7 +659,7 @@ static struct frontswap_ops rswap_frontswap_ops = {
 #endif
 };
 
-/* Patch 1 intentionally cannot activate swap before striping/polling exist. */
+/* Patch 2 keeps swap disabled until Patch 3 fixes multi-session completion. */
 int rswap_register_frontswap(void)
 {
 	return frontswap_register_managed_ops(&rswap_frontswap_ops, THIS_MODULE, 0);
@@ -664,10 +725,9 @@ static int init_latency_buffers(void)
 	return 0;
 }
 
-static unsigned int active_servers;
-
 int rswap_client_init(const struct rswap_client_config *config)
 {
+	struct rswap_pool_layout layout = {};
 	struct rdma_session_context *session;
 	unsigned int id, total_gib = 0;
 	int ret;
@@ -700,6 +760,9 @@ int rswap_client_init(const struct rswap_client_config *config)
 			goto fail;
 		/* Each peer advertises at most MAX_REGION_NUM 8-GiB regions. */
 		total_gib += session->remote_mem_pool.remote_mem_size;
+		layout.server_pages[id] =
+			((u64)session->remote_mem_pool.remote_mem_size << GB_SHIFT) >> PAGE_SHIFT;
+		layout.total_pages += layout.server_pages[id];
 	}
 	for (id = 0; id < active_servers; id++) {
 		ret = READ_ONCE(rdma_sessions[id].error);
@@ -712,7 +775,10 @@ int rswap_client_init(const struct rswap_client_config *config)
 		ret = -ENOSPC;
 		goto fail;
 	}
-	pr_info("rswap: pool ready servers=%u total=%u GiB (connection-only)\n",
+	/* Publish only after every selected session and total capacity are valid. */
+	layout.nr_servers = active_servers;
+	pool_layout = layout;
+	pr_info("rswap: pool ready servers=%u total=%u GiB (static mapping ready; swapon disabled)\n",
 		active_servers, total_gib);
 	return 0;
 fail:
@@ -732,5 +798,6 @@ void rswap_client_exit(void)
 	for (id = active_servers; id > 0; id--)
 		rswap_disconnect_and_collect_resource(&rdma_sessions[id - 1]);
 	active_servers = 0;
+	memset(&pool_layout, 0, sizeof(pool_layout));
 	free_latency_buffers();
 }
