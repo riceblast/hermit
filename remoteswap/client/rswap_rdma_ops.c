@@ -664,62 +664,73 @@ static int init_latency_buffers(void)
 	return 0;
 }
 
+static unsigned int active_servers;
+
 int rswap_client_init(const struct rswap_client_config *config)
 {
 	struct rdma_session_context *session;
-	unsigned int id;
+	unsigned int id, total_gib = 0;
 	int ret;
 
 	online_cores = num_online_cpus();
 	num_queues = online_cores * NUM_QP_TYPE;
-	/* Fill all ownership metadata first, including for unstarted sessions. */
-	for (id = 0; id < RSWAP_NUM_SERVERS; id++) {
+	/* Includes selected but unstarted sessions, so partial failure can unwind. */
+	active_servers = config->nr_servers;
+	for (id = 0; id < active_servers; id++) {
 		session = &rdma_sessions[id];
 		session->server_id = id;
 		session->timeout_ms = config->timeout_ms;
-		session->remote_mem_pool.remote_mem_size = config->size_gb / RSWAP_NUM_SERVERS;
-		session->expected_chunks = session->remote_mem_pool.remote_mem_size / REGION_SIZE_GB;
-		session->remote_mem_pool.chunk_num = session->expected_chunks;
 		session->port = htons(config->servers[id].port);
-		if (!in4_pton(config->servers[id].ip, -1, session->addr, '\0', NULL))
-			return -EINVAL;
+		if (!in4_pton(config->servers[id].ip, -1, session->addr, '\0', NULL)) {
+			ret = -EINVAL;
+			goto fail;
+		}
 	}
 	ret = init_latency_buffers();
 	if (ret)
 		goto fail;
-	for (id = 0; id < RSWAP_NUM_SERVERS; id++) {
+	for (id = 0; id < active_servers; id++) {
 		session = &rdma_sessions[id];
-		pr_info("rswap: connecting server=%u endpoint=%s:%u expected=%u GiB\n",
-			id, config->servers[id].ip, config->servers[id].port,
-			session->remote_mem_pool.remote_mem_size);
+		pr_info("rswap: connecting server=%u endpoint=%s:%u\n",
+			id, config->servers[id].ip, config->servers[id].port);
 		ret = init_rdma_sessions(session);
 		if (!ret)
 			ret = rdma_session_connect(session);
 		if (ret)
 			goto fail;
+		/* Each peer advertises at most MAX_REGION_NUM 8-GiB regions. */
+		total_gib += session->remote_mem_pool.remote_mem_size;
 	}
-	for (id = 0; id < RSWAP_NUM_SERVERS; id++) {
+	for (id = 0; id < active_servers; id++) {
 		ret = READ_ONCE(rdma_sessions[id].error);
 		if (ret)
 			goto fail;
 	}
+	if (total_gib != config->size_gb) {
+		pr_err("rswap: capacity mismatch: configured=%u GiB discovered=%u GiB servers=%u\n",
+			config->size_gb, total_gib, active_servers);
+		ret = -ENOSPC;
+		goto fail;
+	}
 	pr_info("rswap: pool ready servers=%u total=%u GiB (connection-only)\n",
-		RSWAP_NUM_SERVERS, config->size_gb);
+		active_servers, total_gib);
 	return 0;
 fail:
-	pr_err("rswap: initialization failed (%d); rolling back both sessions\n", ret);
+	pr_err("rswap: initialization failed (%d); rolling back %u selected session(s)\n",
+		ret, active_servers);
 	rswap_client_exit();
 	return ret;
 }
 
 void rswap_client_exit(void)
 {
-	int id;
+	unsigned int id;
 
-	/* Stop both sessions before beginning reverse-order destruction. */
-	for (id = 0; id < RSWAP_NUM_SERVERS; id++)
+	/* Stop every selected session before reverse-order destruction. */
+	for (id = 0; id < active_servers; id++)
 		WRITE_ONCE(rdma_sessions[id].stopping, true);
-	for (id = RSWAP_NUM_SERVERS - 1; id >= 0; id--)
-		rswap_disconnect_and_collect_resource(&rdma_sessions[id]);
+	for (id = active_servers; id > 0; id--)
+		rswap_disconnect_and_collect_resource(&rdma_sessions[id - 1]);
+	active_servers = 0;
 	free_latency_buffers();
 }

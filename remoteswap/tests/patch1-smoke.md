@@ -1,157 +1,184 @@
-# Patch 1: dual-session connection and lifecycle smoke tests
+# 单/双节点连接测试（Patch 1）
 
-Scope: Client 10.0.0.11, Server 0 (server02) 10.0.0.20, Server 1
-(node04) 10.0.0.13. Each Server provides 8 GiB; the Client expects 16 GiB.
-No workload or swap activation is needed for these tests.
+本轮只测试模块装载、连接、容量发现和回滚，不启用远端 swap，不运行 Workload。
+支持 1 或 2 个 Server；每端实际暴露容量为正的 8GiB 整数倍，总和必须等于配置。
 
-Patch 1 deliberately registers a managed backend with `max_pages=0`.
-`swapon` is rejected with EOPNOTSUPP until Patch 2/3 implement striping and
-multi-session completion/polling. Do not use the old single-session I/O paths
-for a 16 GiB swap area. No runtime enable switch bypasses this restriction.
-
-## Build and kernel prerequisites
-
-From the repository root:
-
-```bash
-make -C linux-5.14-rc5 -j12 bzImage modules
-make -C remoteswap/client -j12
-make -C remoteswap/server
-```
-
-The new kernel must be installed and booted by the operator before loading
-the Client. Building it does not update the running kernel. The release name
-is unchanged to retain the existing OFED build configuration; `uname -r`
-alone therefore does not establish that the new kernel is running. Check:
+这次只更新 Client 模块、配置和脚本，内核与 Server 无改动。如果之前已经启动了
+包含 managed Frontswap 接口的新内核，无需再次安装内核。若不确定，可检查：
 
 ```bash
 sudo grep -w -E 'frontswap_(register|unregister)_managed_ops' /proc/kallsyms
 ```
 
-Both function symbols must exist. Keep a working kernel boot entry.
-The Client build uses the repository's matching kernel build/Module.symvers
-and the existing OFED headers/symbols; do not override vermagic or force load.
-
-Review `/proc/swaps`. The operator must explicitly stop the existing swap
-areas before managed registration. Do not use `swapoff -a` in automation.
-The management script reports active swap and exits without changing it.
-
-## T0: SSH and RDMA connectivity (operator)
-
-Use account `yxr` on all nodes. If SSH fails, stop and report the failure.
-Before cross-node tests, run these pairs, one pair at a time:
-
-On server02:
+应存在两个函数。Client 构建如下：
 
 ```bash
-bash /home/yxr/scripts/r_server.sh 20
+make -C remoteswap/client -j12
 ```
 
-On the Client:
+## 配置和通用流程
+
+编辑 `remoteswap/client/rswap_client.conf`，这是管理脚本的唯一配置来源。
+环境变量不再覆盖配置，因此 `POOL_GIB=32 ./manage_rswap_client.sh install`
+不再是容量异常测试的方法；请编辑文件或直接使用 insmod。
 
 ```bash
-bash /home/yxr/scripts/r_client.sh 20 11
+NR_SERVERS=2
+POOL_GIB=16
+CONNECT_TIMEOUT_MS=15000
+SERVER0_IP="10.0.0.13"
+SERVER0_PORT=9400
+SERVER1_IP="10.0.0.20"
+SERVER1_PORT=9400
 ```
 
-Then on node04:
+- 单节点只读取 SERVER0_*；SERVER1_* 可以保留、留空或省略。
+- 两节点都必须连接成功，没有自动降级。
+- POOL_GIB 是实际容量总和，不能填每端容量或大于实际容量的值。
+- timeout 是每个 Session 完整初始化的期限，不是两个 Session 共享的总期限。
+- install 会打印生效配置；status 显示已加载模块的实际参数。
+- uninstall/status 不要求配置文件存在或有效。
+
+测试前确认 SSH 和 RDMA 链路正常。若失败，停止并反馈。已有 rping 脚本参数是
+IP 末段数字：
+
+| Server 终端先执行 | Client 终端随后执行 |
+| --- | --- |
+| `bash /home/yxr/scripts/r_server.sh 13` | `bash /home/yxr/scripts/r_client.sh 13 11` |
+| `bash /home/yxr/scripts/r_server.sh 20` | `bash /home/yxr/scripts/r_client.sh 20 11` |
+
+仅需对参与本轮测试的节点执行，正常完成 10 次交换即可。rping 不替代模块测试。
+
+在 Client 查看在线 CPU 数：
 
 ```bash
-bash /home/yxr/scripts/r_server.sh 13
+getconf _NPROCESSORS_ONLN
 ```
 
-On the Client:
+每个 Server 启动参数的核数都必须使用这个数，而不是各 Server 自己的核数。
+保持 Client 的在线 CPU 集合不变。Server 的命令格式（把 `<N>` 换成上一步的数）为：
+
+```text
+cd /home/yxr/projects/hermit/remoteswap/server
+./rswap-server <该Server的IP> 9400 <该Server的容量GiB> <N>
+```
+
+服务端容量参数严格填写 8 的整数倍。原 Server 会把非整数倍向下截断，Client
+只能核对实际暴露的容量。等 Server 预分配完成再连接。
+
+模块加载前 Client 必须没有活动 swap。由操作者明确停用指定的 SSD swap：
 
 ```bash
-bash /home/yxr/scripts/r_client.sh 13 11
+swapon --show
+sudo swapoff /swap.img
+swapon --show
 ```
 
-The scripts take IP suffixes, not full IP addresses. Expect 10 successful
-rping exchanges and a successful Client exit. If RDMA fails, stop and report;
-do not continue with module loading. rping and remote-swap use separate
-services; the remote-swap port is 9400 on each Server.
+若 swap 已停用，不重复执行 swapoff。若 swapoff 失败，停止本轮测试。
+脚本不会创建/删除/格式化 swapfile，也不会自动 swapoff。
 
-## T1: successful connection, unload and reconnect (operator)
+每个成功用例都执行：
 
-1. On the Client, obtain the online CPU count with
-   `getconf _NPROCESSORS_ONLN`. Use this count on **both** Servers. Keep the
-   online CPU set unchanged during testing.
-2. On each Server, from `/home/yxr/projects/hermit/remoteswap/server`, build
-   the existing Server and start it in its own terminal:
+```bash
+cd /mnt/sdb3/data/yxr/projects/hermit/remoteswap/client
+./manage_rswap_client.sh install
+./manage_rswap_client.sh status
+sudo dmesg | tail -100
+```
 
-   ```text
-   server02: ./rswap-server 10.0.0.20 9400 8 <Client-online-CPU-count>
-   node04:   ./rswap-server 10.0.0.13 9400 8 <Client-online-CPU-count>
-   ```
+预期 install 返回 0，显示参与节点各自的实际容量和总池容量；没有 Oops/BUG/WARN。
+然后卸载：
 
-   Use the normal RDMA/memlock privileges for that machine. No Server source
-   changes are required. Wait for the Server memory allocation to complete.
-3. With no active swap on the Client:
+```bash
+./manage_rswap_client.sh uninstall
+./manage_rswap_client.sh status
+sudo dmesg | tail -100
+```
 
-   ```bash
-   cd /mnt/sdb3/data/yxr/projects/hermit/remoteswap/client
-   ./manage_rswap_client.sh install
-   ./manage_rswap_client.sh status
-   sudo dmesg | tail -100
-   ```
+预期参与节点的资源已释放，模块未加载。每次重新连接前，重启参与的 Server 进程。
+不要在模块加载期间执行 swapon；Patch 1 仍会拒绝它。
 
-   Expect `server=0 ready ... capacity=8 GiB regions=1`, the equivalent
-   Server 1 message, and `pool ready servers=2 total=16 GiB`.
-   The module is loaded; swap remains inactive.
-4. Unload:
+## T1：单节点 8GiB
 
-   ```bash
-   ./manage_rswap_client.sh uninstall
-   ./manage_rswap_client.sh status
-   sudo dmesg | tail -100
-   ```
+只在 node04（10.0.0.13）启动 8GiB 的 Server。配置：
 
-   Expect both `resources released` messages, `client unloaded`, and no
-   loaded Client module. There should be no Oops/BUG/unexpected WARN.
-5. Restart both Server processes and repeat this successful cycle once.
+```bash
+NR_SERVERS=1
+POOL_GIB=8
+CONNECT_TIMEOUT_MS=15000
+SERVER0_IP="10.0.0.13"
+SERVER0_PORT=9400
+```
 
-## T2: Server 1 unavailable, rollback and retry (operator)
+执行通用 install/status/uninstall 流程。预期只有 server=0 连接日志：
 
-1. Ensure the Client module is unloaded and swap remains inactive.
-2. Restart Server 0 with 8 GiB. Leave the Server 1 remote-swap process stopped.
-3. Run `./manage_rswap_client.sh install` on the Client and record its exit
-   code immediately. Do not run `rmmod` to repair a failed insertion.
-4. Expect a nonzero exit, an initialization-error/rollback log, and release
-   of Server 0 and any created Server 1 resources. `status` must show the
-   module is not loaded. A protocol timeout is bounded by the configured
-   per-session deadline (default 30000 ms); driver teardown is not a hard
-   real-time operation.
-5. Restart both Server processes. Repeat T1's install/uninstall once. A
-   successful retry is part of this test, not an inference from log output.
+```text
+server=0 ready ... capacity=8 GiB regions=1
+pool ready servers=1 total=8 GiB (connection-only)
+```
 
-Save the command exit codes and the relevant new Client/Server log excerpts.
-Do not clear the global kernel log. Do not run BFS or another workload yet.
+不应尝试连接另一个节点。可选：把 SERVER0_IP 改成 10.0.0.20，并在 server02
+启动新的 8GiB Server，再做一轮；任何物理节点都可作为单节点的逻辑 Server 0。
 
-## Remaining validation
+## T2：双节点 8+8GiB
 
-Compilation is not runtime validation. QP flush/CM synchronization and
-resource reclamation must be confirmed with the actual NIC/OFED stack.
-Driver hangs/hot-unplug are outside the basic connection-failure guarantee;
-a timeout never authorizes freeing DMA-visible memory early.
+node04、server02 各启动新的 8GiB Server。使用本文开头的双节点配置。
+执行通用流程。预期两条 `capacity=8 GiB regions=1`，以及：
 
-After T0/T1/T2 pass, retain only the necessary deeper checks: one silent
-handshake timeout/flush case, active-swap unload protection and concurrent
-activation/unload, then real page-content verification after Patch 2/3.
-The BFS script is recorded at
-`/mnt/sdb2/yxr/K_R_benchmarks/ligra/scripts/cgroup_run_bfs.sh`; it is not run
-in Patch 1. The swapfile path will be supplied by the operator later.
+```text
+pool ready servers=2 total=16 GiB (connection-only)
+```
 
-## Review boundaries
+## T3：双节点不等容量 8+16GiB
 
-Kernel changes are limited to `include/linux/frontswap.h`, `mm/frontswap.c`
-and `mm/swapfile.c`. Managed registration is exclusive and occurs with no
-SWP_USED swap area; a binding holds the owning module reference until area
-invalidation completes. SRCU separately protects synchronous backend calls,
-including poll/peek, from ops removal. Asynchronous RDMA lifetime is handled
-by the Client's stop/drain/destroy path, not by SRCU.
+node04 启动 8GiB，server02 启动 16GiB，仍使用 Client 的同一个在线 CPU 数。
+先确认 Server 机器有足够可用内存。配置为 NR_SERVERS=2、POOL_GIB=24，endpoint
+保持 node04 在 SERVER0、server02 在 SERVER1。执行通用流程。预期：
 
-Review the bitmap correctness changes separately from lifecycle changes:
-`__frontswap_set/clear` count bit transitions; duplicate store invalidates
-old backend data before attempting replacement; load tests the existing
-Frontswap bitmap before consulting a backend. This uses the existing bitmap,
-not a new page-location table. None of these changes implements recovery of
-remote-only data after a running Server fails.
+```text
+server=0 ready ... capacity=8 GiB regions=1
+server=1 ready ... capacity=16 GiB regions=2
+pool ready servers=2 total=24 GiB (connection-only)
+```
+
+## T4：总容量不匹配、回滚与重试
+
+两台 Server 仍分别提供 8 和 16GiB，均重新启动。把配置的 POOL_GIB 改成 32，执行：
+
+```bash
+./manage_rswap_client.sh install
+echo "exit_code=$?"
+./manage_rswap_client.sh status
+sudo dmesg | tail -100
+```
+
+预期返回非零，模块未加载；两端连接成功后才检查总和，因此可能看到两端 ready：
+
+```text
+capacity mismatch: configured=32 GiB discovered=24 GiB servers=2
+initialization failed (-28); rolling back 2 selected session(s)
+```
+
+之后应有资源释放日志。insmod 显示 `No space left on device` 是 ENOSPC 的通用提示，
+具体含义看上述容量日志。不要用 rmmod 修复失败插入。
+
+把 POOL_GIB 恢复 24，重启两台 Server，成功 install/uninstall 一次才算回滚验证通过。
+
+若要复测断连回滚：NR_SERVERS=2 时只启动 SERVER0，预期第二端失败后整体回滚；
+NR_SERVERS=1 时只需要所选节点，另一个节点停止不会影响连接。
+
+## 测试结束和记录
+
+确认模块已卸载后，恢复原来的 SSD swap：
+
+```bash
+sudo swapon /swap.img
+swapon --show
+```
+
+保存每轮配置、退出码和本轮 Client/Server 日志，不清空全局 dmesg。初始化等待的
+期限不等于驱动清理的硬性时间保证；若明显卡住，停止其他测试并反馈日志。
+本轮不做网卡热拔插、页面读写或掉线数据恢复测试。
+
+后续数据路径将按已确认的规则实现不等容量映射：共同容量交错，较大节点剩余容量
+接逻辑池尾段。该映射尚未在本轮实现。

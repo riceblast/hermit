@@ -168,7 +168,6 @@ struct rswap_rdma_dev {
  */
 struct rdma_session_context {
 	unsigned int server_id;
-	unsigned int expected_chunks;
 	unsigned int timeout_ms;
 	unsigned long deadline;
 	bool stopping;
@@ -238,7 +237,7 @@ void drain_all_rdma_queues(int target_mem_server);
 /*
  * Global var definition
  */
-extern struct rdma_session_context rdma_sessions[RSWAP_NUM_SERVERS];
+extern struct rdma_session_context rdma_sessions[RSWAP_MAX_SERVERS];
 
 extern int online_cores;
 extern int num_queues;

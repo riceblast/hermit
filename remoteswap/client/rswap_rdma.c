@@ -2,7 +2,7 @@
 #include <linux/jiffies.h>
 #include <linux/overflow.h>
 
-struct rdma_session_context rdma_sessions[RSWAP_NUM_SERVERS];
+struct rdma_session_context rdma_sessions[RSWAP_MAX_SERVERS];
 int online_cores;
 int num_queues; /* Per session. */
 u64 rmda_ops_count;
@@ -93,14 +93,19 @@ int handle_recv_wr(struct rswap_rdma_queue *queue, struct ib_wc *wc)
 		WRITE_ONCE(queue->state, MEMORY_SERVER_AVAILABLE);
 		break;
 	case FREE_SIZE:
-		if (msg->mapped_chunk != session->expected_chunks)
-			return -ENOSPC;
+		/* Learn the actual per-server capacity; never divide the total. */
+		if (msg->mapped_chunk <= 0 || msg->mapped_chunk > MAX_REGION_NUM)
+			return -EPROTO;
+		session->remote_mem_pool.chunk_num = msg->mapped_chunk;
+		session->remote_mem_pool.remote_mem_size =
+			msg->mapped_chunk * REGION_SIZE_GB;
 		WRITE_ONCE(queue->state, FREE_MEM_RECV);
 		break;
 	case GOT_CHUNKS:
-		if (msg->mapped_chunk != session->expected_chunks)
+		if (!session->remote_mem_pool.chunks ||
+		    msg->mapped_chunk != session->remote_mem_pool.chunk_num)
 			return -EPROTO;
-		for (i = 0; i < session->expected_chunks; i++) {
+		for (i = 0; i < session->remote_mem_pool.chunk_num; i++) {
 			if (!msg->buf[i] || (msg->buf[i] & (PAGE_SIZE - 1)) ||
 			    msg->mapped_size[i] != (u64)REGION_SIZE_GB * ONE_GB ||
 			    check_add_overflow(msg->buf[i], msg->mapped_size[i], &end))
@@ -195,7 +200,7 @@ int rswap_query_available_memory(struct rdma_session_context *session)
 int rswap_request_for_chunk(struct rdma_session_context *session)
 {
 	int ret = send_message_to_remote(session, 0, REQUEST_CHUNKS,
-					 session->expected_chunks);
+					 session->remote_mem_pool.chunk_num);
 
 	return ret ? ret : wait_queue_state(&session->rdma_queues[0], RECEIVED_CHUNKS);
 }
@@ -372,7 +377,7 @@ int rswap_connect_remote_memory_server(struct rdma_session_context *session, int
 
 int init_remote_chunk_list(struct rdma_session_context *session)
 {
-	session->remote_mem_pool.chunks = kcalloc(session->expected_chunks,
+	session->remote_mem_pool.chunks = kcalloc(session->remote_mem_pool.chunk_num,
 					 sizeof(struct remote_chunk), GFP_KERNEL);
 	return session->remote_mem_pool.chunks ? 0 : -ENOMEM;
 }
@@ -382,7 +387,7 @@ void bind_remote_memory_chunks(struct rdma_session_context *session)
 	struct message *msg = session->rdma_recv_req.recv_buf;
 	unsigned int i;
 
-	for (i = 0; i < session->expected_chunks; i++) {
+	for (i = 0; i < session->remote_mem_pool.chunk_num; i++) {
 		struct remote_chunk *chunk = &session->remote_mem_pool.chunks[i];
 
 		chunk->remote_rkey = msg->rkey[i];
@@ -459,7 +464,8 @@ int rdma_session_connect(struct rdma_session_context *session)
 	if (!ret)
 		pr_info("rswap: server=%u ready queues=%d capacity=%u GiB regions=%u\n",
 			session->server_id, num_queues,
-			session->remote_mem_pool.remote_mem_size, session->expected_chunks);
+			session->remote_mem_pool.remote_mem_size,
+			session->remote_mem_pool.chunk_num);
 	return ret;
 }
 
