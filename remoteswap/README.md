@@ -11,6 +11,7 @@ Deploy the rebuilt kernel and Client together: the module now requires
 `frontswap_register_managed_ops_v2`, preventing accidental use with the older kernel.
 The kernel release string is unchanged, so `uname -r` alone does not identify this build.
 See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.
+Use the [Patch 3 hardware test guide](tests/patch3-smoke.md) for commands and expected results.
 Patch 1/2 smoke guides are historical and must not be used as Patch 3 swap instructions.
 The management script still only connects/disconnects; it does not create, format,
 activate or deactivate a swap area. Edit `client/rswap_client.conf` before install;
