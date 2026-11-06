@@ -13,6 +13,7 @@ The kernel release string is unchanged, so `uname -r` alone does not identify th
 See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.
 Use the [Patch 3 hardware test guide](tests/patch3-smoke.md) for commands and expected results.
 See [Patch 4 statistics](tests/patch4_summary.md) for counter definitions and `stats` / `monitor` commands.
+Use the [Patch 4 BFS test guide](tests/patch4-bfs-smoke.md) for the single-server 48-GiB and dual-server 80-GiB runs.
 Patch 1/2 smoke guides are historical and must not be used as Patch 3 swap instructions.
 The management script still only connects/disconnects; it does not create, format,
 activate or deactivate a swap area. Edit `client/rswap_client.conf` before install;
