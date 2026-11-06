@@ -187,6 +187,7 @@ void init_memory_pool(struct context *rdma_ctx) {
   uint64_t num_alloc_thread = 16;
   printf("%lu threads init mmap space\n", num_alloc_thread);
 	touch_pages_parallel(heap_start, heap_size, num_alloc_thread);
+  printf("\ninit done\n");
 
   print_debug(stderr, "%s, Register Semeru Space: 0x%llx, size : 0x%llx. \n",
               __func__, (unsigned long long)heap_start,
