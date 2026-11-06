@@ -113,6 +113,7 @@ void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 
 	ib_dma_unmap_page(dev, req->dma_addr, PAGE_SIZE,
 			type == QP_STORE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+	rswap_stats_wc(queue->rdma_session, type, status);
 	if (status) {
 		rswap_rdma_error(queue, status);
 		pr_err_ratelimited("rswap: server=%u queue=%d WC status=%d\n",
@@ -245,21 +246,29 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 		enum rdma_queue_type type, struct fs_rdma_req **store_req)
 {
 	struct rswap_remote_page remote;
+	struct rdma_session_context *session = NULL;
 	struct rswap_rdma_queue *queue;
 	struct fs_rdma_req *req;
 	int ret;
 
-	if (PageCompound(page))
-		return -EOPNOTSUPP;
-	if (cpu < 0 || cpu >= online_cores || (unsigned int)type >= NUM_QP_TYPE)
-		return -EINVAL;
+	if (PageCompound(page)) {
+		ret = -EOPNOTSUPP;
+		goto submit_error;
+	}
+	if (cpu < 0 || cpu >= online_cores || (unsigned int)type >= NUM_QP_TYPE) {
+		ret = -EINVAL;
+		goto submit_error;
+	}
 	ret = rswap_resolve_remote_page(offset, &remote);
 	if (ret)
-		return ret;
+		goto submit_error;
+	session = remote.session;
 	queue = get_rdma_queue(remote.session, cpu, type);
 	req = kmem_cache_zalloc(queue->fs_rdma_req_cache, GFP_ATOMIC);
-	if (!req)
-		return -ENOMEM;
+	if (!req) {
+		ret = -ENOMEM;
+		goto submit_error;
+	}
 	req->rdma_queue = queue;
 	req->page = page;
 	req->offset = offset;
@@ -287,6 +296,8 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 free_req:
 	put_page(page);
 	kmem_cache_free(queue->fs_rdma_req_cache, req);
+submit_error:
+	rswap_stats_submit_error(session, type);
 	return ret;
 }
 
@@ -299,6 +310,7 @@ static int rswap_rdma_submit(int cpu, pgoff_t offset, struct page *page,
 	spin_lock_irqsave(&area_lock, flags);
 	if (!area_active) {
 		spin_unlock_irqrestore(&area_lock, flags);
+		rswap_stats_submit_error(NULL, type);
 		return -ESHUTDOWN;
 	}
 	atomic_inc(&area_submissions);
@@ -312,8 +324,10 @@ int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
 		enum rdma_queue_type type)
 {
 	/* Stores must enter through prepare/commit, never bypass publication. */
-	if (type == QP_STORE)
+	if (type == QP_STORE) {
+		rswap_stats_submit_error(NULL, type);
 		return -EINVAL;
+	}
 	return rswap_rdma_submit(cpu, offset, page, type, NULL);
 }
 
@@ -324,8 +338,10 @@ static int rswap_store_prepare(unsigned int type, pgoff_t offset,
 	int cpu, ret;
 
 	*cookie = NULL;
-	if (type != READ_ONCE(area_type))
+	if (type != READ_ONCE(area_type)) {
+		rswap_stats_submit_error(NULL, QP_STORE);
 		return -EINVAL;
+	}
 	cpu = core == -1 ? get_cpu() : core;
 	ret = rswap_rdma_submit(cpu, offset, page, QP_STORE, &req);
 	if (core == -1)
@@ -402,8 +418,10 @@ static int rswap_frontswap_peek_load(int cpu)
 
 static int rswap_frontswap_load(unsigned int type, pgoff_t offset, struct page *page)
 {
-	if (type != READ_ONCE(area_type))
+	if (type != READ_ONCE(area_type)) {
+		rswap_stats_submit_error(NULL, QP_LOAD_SYNC);
 		return -EINVAL;
+	}
 	return rswap_rdma_send(smp_processor_id(), offset, page, QP_LOAD_SYNC);
 }
 
@@ -412,8 +430,10 @@ static int rswap_frontswap_load_async(unsigned int type, pgoff_t offset, struct 
 	int cpu = get_cpu();
 
 	put_cpu();
-	if (type != READ_ONCE(area_type))
+	if (type != READ_ONCE(area_type)) {
+		rswap_stats_submit_error(NULL, QP_LOAD_ASYNC);
 		return -EINVAL;
+	}
 	/* This queue completes by SOFTIRQ, so migration after selection is safe. */
 	return rswap_rdma_send(cpu, offset, page, QP_LOAD_ASYNC);
 }
@@ -532,6 +552,11 @@ int rswap_client_init(const struct rswap_client_config *config)
 	/* Publish only after every selected session and total capacity are valid. */
 	layout.nr_servers = active_servers;
 	pool_layout = layout;
+	ret = rswap_stats_init(active_servers);
+	if (ret) {
+		pr_err("rswap: statistics interface initialization failed: %d\n", ret);
+		goto fail;
+	}
 	pr_info("rswap: pool ready servers=%u total=%u GiB (4-KiB swap ready)\n",
 		active_servers, total_gib);
 	return 0;
@@ -546,6 +571,8 @@ void rswap_client_exit(void)
 {
 	unsigned int id;
 
+	/* Remove the interface before any Session storage is released. */
+	rswap_stats_exit();
 	/* Stop every selected session before reverse-order destruction. */
 	for (id = 0; id < active_servers; id++)
 		WRITE_ONCE(rdma_sessions[id].stopping, true);

@@ -1,6 +1,6 @@
 # Remoteswap
 
-**Development stage: Patch 3 (4-KiB single/dual-server remote swap; hardware validation pending).**
+**Development stage: Patch 4 (per-server RDMA counters and successful-payload bandwidth monitoring).**
 The Client discovers each selected Server's capacity and checks the configured sum.
 Static routing interleaves the common capacity and appends the larger Server's tail;
 single-server pools map directly. Multi-session polling, request retirement and
@@ -12,6 +12,7 @@ Deploy the rebuilt kernel and Client together: the module now requires
 The kernel release string is unchanged, so `uname -r` alone does not identify this build.
 See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.
 Use the [Patch 3 hardware test guide](tests/patch3-smoke.md) for commands and expected results.
+See [Patch 4 statistics](tests/patch4_summary.md) for counter definitions and `stats` / `monitor` commands.
 Patch 1/2 smoke guides are historical and must not be used as Patch 3 swap instructions.
 The management script still only connects/disconnects; it does not create, format,
 activate or deactivate a swap area. Edit `client/rswap_client.conf` before install;

@@ -75,6 +75,12 @@ case "${1:-}" in
         run_as_root rmmod rswap_client
         echo 'Restart the participating Server processes before reconnecting.'
         ;;
+    stats)
+        run_as_root cat /sys/kernel/debug/rswap/stats
+        ;;
+    monitor)
+        run_as_root python3 "${script_dir}/../tools/rswap_stats.py" --interval "${2:-1}"
+        ;;
     status)
         if [[ -d /sys/module/rswap_client ]]; then
             echo 'rswap_client: loaded (actual module parameters below)'
@@ -90,7 +96,7 @@ case "${1:-}" in
         cat /proc/swaps
         ;;
     *)
-        echo "Usage: $0 {install|uninstall|status}" >&2
+        echo "Usage: $0 {install|uninstall|status|stats|monitor [seconds]}" >&2
         echo "Edit ${config_file} before install; environment overrides are not used." >&2
         exit 2
         ;;

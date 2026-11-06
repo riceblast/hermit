@@ -7,6 +7,7 @@ ifeq ($(BACKEND),DRAM)
 else
 	rswap-client-y += rswap_rdma_ops.o
 	rswap-client-y += rswap_rdma.o
+	rswap-client-y += rswap_stats.o
 endif
 
 OFA_DIR ?= /usr/src/ofa_kernel/default

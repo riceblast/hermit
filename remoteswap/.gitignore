@@ -58,4 +58,4 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
-
+tools/__pycache__

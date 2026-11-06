@@ -43,11 +43,14 @@ class ManageConfigTest(unittest.TestCase):
         # Fixture path contains spaces; quote the replacement in -d tests.
         script = script.replace(f"-d {self.module}", f'-d "{self.module}"')
         self.script = self.root / "manage_rswap_client.sh"
+        self.stats = self.root / "stats"
+        self.stats.write_text("fixture counters\n")
+        script = script.replace("/sys/kernel/debug/rswap/stats", shlex.quote(str(self.stats)))
         self.script.write_text(script)
         self.config = self.root / "rswap_client.conf"
         self.config.write_text(DUAL)
         (self.root / "rswap-client.ko").touch()
-        for name in ("insmod", "rmmod"):
+        for name in ("insmod", "rmmod", "python3"):
             mock = self.bin / name
             mock.write_text(
                 "#!/usr/bin/env bash\n"
@@ -62,8 +65,8 @@ class ManageConfigTest(unittest.TestCase):
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                         MOCK_TRACE=str(self.trace), MOCK_EXIT="0")
 
-    def run_script(self, action="install", **env):
-        return subprocess.run(["bash", str(self.script), action],
+    def run_script(self, action="install", *args, **env):
+        return subprocess.run(["bash", str(self.script), action, *args],
                               env=dict(self.env, **env), text=True,
                               capture_output=True, timeout=5)
 
@@ -137,6 +140,26 @@ class ManageConfigTest(unittest.TestCase):
         result = self.run_script(MOCK_EXIT="17")
         self.assertEqual(result.returncode, 17)
         self.assertNotIn("Client initialized.", result.stdout)
+
+    def test_stats_ignores_config_and_does_not_change_swap(self):
+        self.config.write_text("broken shell syntax (\n")
+        self.swap.write_text("Filename Type Size Used Priority\n/ssd file 10 1 -2\n")
+        result = self.run_script("stats")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "fixture counters\n")
+        self.assertEqual(self.calls(), [])
+
+    def test_monitor_forwards_interval_and_quoted_tool_path(self):
+        self.config.unlink()
+        result = self.run_script("monitor", "0.5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [["python3", str(self.root / "../tools/rswap_stats.py"),
+                                        "--interval", "0.5"]])
+
+    def test_monitor_default_interval(self):
+        result = self.run_script("monitor")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls()[0][-2:], ["--interval", "1"])
 
 
 if __name__ == "__main__":

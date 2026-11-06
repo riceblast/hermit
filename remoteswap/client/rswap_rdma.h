@@ -172,12 +172,20 @@ struct rswap_rdma_dev {
 	struct ib_pd *pd;
 };
 
+/* Data requests only; independent of WR reservation and Store retirement. */
+struct rswap_io_stats {
+	atomic64_t ok;
+	atomic64_t wc_error;
+	atomic64_t submit_error;
+};
+
 /**
  * Manage the RDMA connection to a remote server.
  * Each Remote Memory Server has a dedicated rdma_session_context as controller.
  */
 struct rdma_session_context {
 	unsigned int server_id;
+	struct rswap_io_stats io_stats[NUM_QP_TYPE];
 	unsigned int timeout_ms;
 	unsigned long deadline;
 	bool stopping;
@@ -199,6 +207,13 @@ struct rdma_session_context {
 
 	struct chunk_list remote_mem_pool;
 };
+
+int rswap_stats_init(unsigned int nr_servers);
+void rswap_stats_exit(void);
+void rswap_stats_wc(struct rdma_session_context *session,
+		enum rdma_queue_type type, int status);
+void rswap_stats_submit_error(struct rdma_session_context *session,
+		enum rdma_queue_type type);
 
 static inline size_t pgoff2addr(pgoff_t offset)
 {

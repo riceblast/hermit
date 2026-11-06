@@ -44,6 +44,10 @@ typedef uint16_t u16;
 typedef unsigned long pgoff_t;
 typedef atomic_int atomic_t;
 typedef atomic_int refcount_t;
+typedef atomic_llong atomic64_t;
+#define atomic64_inc(p) ((void)atomic_fetch_add(p, 1))
+#define atomic64_set(p, value) atomic_store(p, value)
+#define atomic64_read(p) atomic_load(p)
 #include "rswap_mapping.h"
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 4096ULL
@@ -124,8 +128,10 @@ struct ib_cq { int poll_ctx; bool hold; struct fs_rdma_req *queued; };
 struct ib_qp { struct rswap_rdma_queue *queue; };
 struct remote_chunk { uint32_t remote_rkey; uint64_t remote_addr, mapped_size; enum chunk_mapping_state chunk_state; };
 struct chunk_list { struct remote_chunk *chunks; unsigned int chunk_num; };
+/* STATS_STRUCT */
 struct rdma_session_context {
     unsigned int server_id;
+    struct rswap_io_stats io_stats[NUM_QP_TYPE];
     bool stopping;
     int error;
     struct rswap_rdma_dev *rdma_dev;
@@ -149,6 +155,7 @@ static unsigned int active_servers = 2, area_type;
 static bool area_active = true;
 static pthread_mutex_t area_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_t area_submissions;
+static atomic64_t unrouted_error;
 static int online_cores = 1, num_queues = 3;
 static atomic_int frees, maps, unmaps;
 static int alloc_error, map_error, post_error, wc_error, immediate, pins;
@@ -250,9 +257,13 @@ static void reset(struct page *p) {
     atomic_store(&p->reclaim, 1); current_page = p;
     alloc_error = map_error = post_error = wc_error = immediate = pins = 0;
     atomic_store(&frees, 0); atomic_store(&maps, 0); atomic_store(&unmaps, 0);
+    atomic64_set(&unrouted_error, 0);
     for (int s = 0; s < 2; s++) {
         rdma_sessions[s].error = 0; rdma_sessions[s].stopping = false;
         for (int t = 0; t < 3; t++) {
+            atomic64_set(&rdma_sessions[s].io_stats[t].ok, 0);
+            atomic64_set(&rdma_sessions[s].io_stats[t].wc_error, 0);
+            atomic64_set(&rdma_sessions[s].io_stats[t].submit_error, 0);
             assert(!atomic_load(&queues[s][t].rdma_post_counter));
             assert(!atomic_load(&queues[s][t].store_pending));
             assert(!cqs[s][t].queued); cqs[s][t].hold = false;
@@ -266,6 +277,12 @@ static void retired(struct page *p, bool unlocked) {
     assert(atomic_load(&maps) == atomic_load(&unmaps));
     assert(!atomic_load(&queues[1][0].rdma_post_counter));
     assert(!pins);
+}
+static void check_stats(int server, int type, int ok, int wc_error_count, int submit_error) {
+    struct rswap_io_stats *s = &rdma_sessions[server].io_stats[type];
+    assert(atomic64_read(&s->ok) == ok);
+    assert(atomic64_read(&s->wc_error) == wc_error_count);
+    assert(atomic64_read(&s->submit_error) == submit_error);
 }
 static void *callback_thread(void *arg) { complete_one(&cqs[1][0]); return NULL; }
 static void *commit_thread(void *arg) {
@@ -304,6 +321,8 @@ int main(void) {
             atomic_store(&p.valid, 1); rswap_store_commit(cookie);
             if (!before) complete_one(&cqs[1][0]);
             retired(&p, true);
+            check_stats(1, QP_STORE, !error, error, 0);
+            check_stats(0, QP_STORE, 0, 0, 0);
             assert(atomic_load(&p.valid) == !error);
             assert(atomic_load(&p.dirty) == error);
         }
@@ -317,6 +336,7 @@ int main(void) {
         assert(!pthread_create(&commit, NULL, commit_thread, cookie));
         pthread_join(cb, NULL); pthread_join(commit, NULL);
         retired(&p, true);
+        check_stats(1, QP_STORE, !(i & 1), i & 1, 0);
     }
     {
         pthread_t drain;
@@ -329,7 +349,10 @@ int main(void) {
         pthread_join(drain, NULL);
         assert(!atomic_load(&area_submissions));
         retired(&p, true);
+        assert(atomic64_read(&unrouted_error) == 1);
+        check_stats(1, QP_STORE, 1, 0, 0);
         rswap_frontswap_init(0);
+        check_stats(1, QP_STORE, 1, 0, 0); /* swapon must not reset counters */
     }
     for (int error = 0; error < 2; error++) {
         reset(&p); wc_error = error;
@@ -337,6 +360,7 @@ int main(void) {
         assert(atomic_load(&p.locked));
         if (!error) { atomic_store(&p.valid, 1); rswap_store_commit(cookie); }
         retired(&p, !error);
+        check_stats(1, QP_STORE, !error, error, 0); /* WC failure is not submit failure */
     }
     for (int failure = 0; failure < 4; failure++) {
         reset(&p);
@@ -349,6 +373,8 @@ int main(void) {
         assert(!atomic_load(&queues[1][0].rdma_post_counter));
         assert(atomic_load(&maps) == atomic_load(&unmaps));
         assert(atomic_load(&frees) == (failure == 1 || failure == 2));
+        check_stats(1, QP_STORE, 0, 0, failure != 3);
+        assert(atomic64_read(&unrouted_error) == (failure == 3));
     }
     /* Node 0 empty, node 1 pending: CPU-only polling must still complete it. */
     reset(&p);
@@ -375,6 +401,8 @@ int main(void) {
         assert(!rswap_poll_cpu(0, QP_STORE, true));
         assert(!atomic_load(&other.locked) && atomic_load(&frees) == 2);
         assert(atomic_load(&p.refs) == 1 && atomic_load(&other.refs) == 1);
+        check_stats(0, QP_STORE, 1, 0, 0);
+        check_stats(1, QP_STORE, 1, 0, 0);
     }
     /* Fast demand completion keeps the lock; asynchronous CQ owns its unlock. */
     for (int type = QP_LOAD_SYNC; type <= QP_LOAD_ASYNC; type++) {
@@ -386,9 +414,32 @@ int main(void) {
             assert(atomic_load(&p.uptodate) == !error);
             assert(atomic_load(&p.error) == error);
             retired(&p, type == QP_LOAD_ASYNC);
+            check_stats(1, type, !error, error, 0);
         }
     }
-    puts("PASS: actual resolver, store publication races, failures, polling and read completion");
+    /* All three operations: rejected sends count once, without a WC. */
+    for (int type = QP_STORE; type <= QP_LOAD_ASYNC; type++) {
+        for (int failure = 0; failure < 4; failure++) {
+            reset(&p);
+            if (failure == 0) alloc_error = 1;
+            if (failure == 1) map_error = 1;
+            if (failure == 2) post_error = -EIO;
+            if (failure == 3) rdma_sessions[1].error = -ECONNRESET;
+            int ret = type == QP_STORE ? rswap_store_prepare(0, 1, &p, 0, &cookie) :
+                                        rswap_rdma_submit(0, 1, &p, type, NULL);
+            assert(ret < 0 && atomic_load(&p.locked) && atomic_load(&p.refs) == 1);
+            assert(atomic_load(&maps) == atomic_load(&unmaps));
+            check_stats(1, type, 0, 0, 1);
+            check_stats(0, type, 0, 0, 0);
+            assert(!atomic64_read(&unrouted_error));
+        }
+    }
+    reset(&p);
+    assert(rswap_rdma_submit(0, pool_layout.total_pages, &p, QP_LOAD_SYNC, NULL) == -ERANGE);
+    assert(atomic64_read(&unrouted_error) == 1);
+    check_stats(0, QP_LOAD_SYNC, 0, 0, 0);
+    check_stats(1, QP_LOAD_SYNC, 0, 0, 0);
+    puts("PASS: actual resolver, publication races, failures, polling, read completion and per-server stats");
     return 0;
 }
 """
@@ -624,14 +675,17 @@ class CompletionTests(unittest.TestCase):
     def test_actual_client_functions(self):
         source = (ROOT / "client/rswap_rdma_ops.c").read_text()
         header = (ROOT / "client/rswap_rdma.h").read_text()
+        stats = (ROOT / "client/rswap_stats.c").read_text()
         names = ["rswap_poll_queue", "rswap_wait_progress", "drain_rdma_queue",
                  "drain_all_rdma_queues", "rswap_request_done", "rswap_store_put",
                  "fs_rdma_callback", "fs_enqueue_send_wr", "fs_build_rdma_wr",
                  "rswap_resolve_remote_page", "rswap_rdma_submit_active", "rswap_rdma_submit",
                  "rswap_store_prepare", "rswap_store_commit", "rswap_poll_cpu",
                  "rswap_invalidate_area", "rswap_frontswap_init"]
-        code = (STUBS + definition(header, "fs_rdma_req", struct=True)
+        stubs = STUBS.replace("/* STATS_STRUCT */", definition(header, "rswap_io_stats", struct=True))
+        code = (stubs + definition(header, "fs_rdma_req", struct=True)
                 + definition(source, "rswap_remote_page", struct=True)
+                + definition(stats, "rswap_stats_wc") + definition(stats, "rswap_stats_submit_error")
                 + "\n".join(definition(source, name) for name in names) + SUPPORT)
         with tempfile.TemporaryDirectory(prefix="hermit-patch3-completion-") as tmp:
             c = Path(tmp) / "completion.c"
