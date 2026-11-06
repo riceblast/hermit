@@ -1,17 +1,19 @@
 # Patch 3 核心硬件测试流程
 
-按顺序执行：部署 → 单节点 → 双节点与生命周期 → 三项优化 → 不等容量尾段。
+按顺序执行：部署 → 单节点 → 双节点与生命周期 → 必要的异步路径 → 收尾。
 先完成前四节，再继续后面的用例；不用重跑 Patch 1/2 的全部连接异常组合。
 本文没有任何已经执行硬件测试的含义；需要操作者在宿主机上执行 sudo 命令。
 
 ## 0. 约定与停止条件
 
 - Client 仓库路径假定为 `/mnt/sdb3/data/yxr/projects/hermit`。
-- Server 0：`10.0.0.13:9400`，8 GiB；Server 1：`10.0.0.20:9400`，16 GiB。
+- Server 0：`10.0.0.13:9400`；Server 1：`10.0.0.20:9400`。
+  单节点示例使用 8 GiB；双节点使用 8＋16 或 16＋8 GiB。
 - 当前 Client 为 48 个在线 CPU（0–47）。Server 命令最后的 48 必须使用测试时的
   **Client 在线核数**；运行期间不改变在线 CPU 集合。
-- 本文使用已有合法 `/swap.img`（8 GiB），不重新格式化。它足以完成基础测试，
-  无法覆盖双节点 16 GiB 以后的尾段。不要把占用 8 GiB swap 当成尾段测试通过。
+- T1 使用已有合法 `/swap.img`（8 GiB）；T2 起使用你已准备好的
+  `/mnt/sdb4/yxr/projects/swap_24g.img`（24 GiB），均不重新格式化。
+  本轮小工作集不验收 16 GiB 以后的尾段。
 - 只使用一个活动 swap area。不要执行 `swapoff -a`、强制卸载 `rmmod -f`，
   或在还有远端数据时重启 Server／卸载 Client。
 - 除专门验证“卸载应被拒绝”外，命令非零退出、内容 FAIL、进程意外退出、
@@ -89,11 +91,12 @@ ls "$P3_CG"/memory.limit_in_bytes "$P3_CG"/memory.memsw.limit_in_bytes
 预期目录创建成功且两个 limit 文件存在。本文采用当前机器的 cgroup-v1；若不符合，
 停止并反馈挂载情况，不自行改成 cgroup-v2 命令或重挂载系统目录。
 
-设置 2 GiB 物理内存限制，6 GiB 内存＋swap 限制：
+设置 2 GiB 物理内存限制；解除旧的 memory＋swap 上限，避免已知记账 bug 触发配额 OOM。
+本轮不验证 cgroup swap 用量、配额或解除记账，只使用物理内存限制制造换页：
 
 ```bash
+echo -1 | sudo tee "$P3_CG/memory.memsw.limit_in_bytes"
 echo 2147483648 | sudo tee "$P3_CG/memory.limit_in_bytes"
-echo 6442450944 | sudo tee "$P3_CG/memory.memsw.limit_in_bytes"
 echo 100 | sudo tee "$P3_CG/memory.swappiness"
 ```
 
@@ -176,12 +179,12 @@ echo "workload_exit=$?"
 
 ```bash
 cat "$P3_CG/memory.usage_in_bytes"
-grep -E '^(swap|total_swap|pgmajfault|total_pgmajfault) ' "$P3_CG/memory.stat"
 swapon --show
 ```
 
-预期：物理内存大致受 2 GiB 限制，**cgroup swap 明显非零**（通常 GiB 量级），
-系统 `/swap.img` 的 Used 增加。若 swap 为零，这轮没有验证远端换页。
+预期：物理内存大致受 2 GiB 限制，系统 `/swap.img` 的 Used 相比 workload 启动前
+明显增加（通常 GiB 量级）。只看系统实际 swap 占用，不读取 cgroup 的 swap 统计。
+系统实际 swap 用量没有增加时，这轮不能算验证了远端换页。
 在 A 按一次 ENTER，等待 `VERIFIED generation=0` 和 `READY generation=1`；
 再按一次 ENTER，预期 `VERIFIED generation=1`、最终 `PASS`、退出码 0。
 
@@ -199,194 +202,423 @@ sudo dmesg > "$P3_RUN/t1-dmesg.after"
 
 ## 4. T2：双节点、活进程 swapoff 与再次 swapon
 
-### 4.1 重新连接并采集实际 I/O
+### 4.0 本轮范围与当前进度
 
-两端各自启动全新的 Server 进程：
+**目标／内容：**验证两个 Session 的真实读写、重复改写后的内容、活动 swap 的卸载保护、
+活进程 swapoff 读回，以及同一组 Session 再次 swapon。只用 cgroup 的物理内存限制制造压力。
+
+**固定路径：**Client 仓库为 `/mnt/sdb3/data/yxr/projects/hermit`，日志目录为
+`/tmp/hermit-p3`，cgroup 为 `/sys/fs/cgroup/memory/hermit-p3`，测试 area 为你已准备好的
+`/mnt/sdb4/yxr/projects/swap_24g.img`。后文命令使用绝对路径，不依赖另一个终端的变量。
+Server 0/1 容量可以是 16＋8 或 8＋16 GiB，总和必须是 24 GiB。
+
+**已完成的部分不重跑：**如果本轮已得到两个 `VERIFIED generation=0/1`，
+A 正停在 `READY generation=2`，且同一轮采样为 `8/8/8/8`，直接从 **4.3** 继续。
+不要重启 Server、重新加载模块或再启动一个 workload；保留 A 中的活页。
+
+本轮不测试或依赖以下内容：`memory.stat` 的 swap/total_swap、memsw usage/failcnt、
+cgroup swap 配额与引用回收。解除 memsw 上限仅用于绕过已知配额 OOM，不表示 bug 已修复。
+物理内存限制和父级限制仍然可能导致 OOM；发生 Killed 时停止，不计为通过。
+
+### 4.1 新开一轮时：确认双节点与实际 swap 已启用
+
+**目标／内容：**确认不是仅连接了 24 GiB Server，而是 Client 真正启用了合法 swap area。
+**仅在没有正在暂停／运行的校验进程时执行本节。**当前已到 generation=2 时跳过。
+
+**步骤 1：在 Client 终端 B 准备 workload 和物理内存限制。**
 
 ```bash
-# Server 0
-./rswap-server 10.0.0.13 9400 8 48
+cd /mnt/sdb3/data/yxr/projects/hermit
+mkdir -p /tmp/hermit-p3
+sudo mkdir -p /sys/fs/cgroup/memory/hermit-p3
+gcc -std=gnu11 -O2 -Wall -Wextra -Werror remoteswap/tests/swap_pattern.c -o /tmp/hermit-p3/swap_pattern
+# 一次性解除旧 memsw 上限；不要在后面的用例中再设置 6/12 GiB 上限。
+echo -1 | sudo tee /sys/fs/cgroup/memory/hermit-p3/memory.memsw.limit_in_bytes
+echo 2147483648 | sudo tee /sys/fs/cgroup/memory/hermit-p3/memory.limit_in_bytes
+echo 100 | sudo tee /sys/fs/cgroup/memory/hermit-p3/memory.swappiness
+# 各项优化先关闭。batch_account 在所有用例中保持 N。
+for flag in bypass_swapcache batch_swapout batch_tlb batch_io batch_account vaddr_swapout speculative_io speculative_lock lazy_poll apt_reclaim; do
+    echo N | sudo tee "/sys/kernel/debug/hermit/$flag"
+done
+echo 1 | sudo tee /sys/kernel/mm/swap/readahead_win
+```
+
+预期编译和写入成功。cgroup 使用当前机器的 v1；父级也应没有有限的 memsw 上限。
+前面若已保存 `.before` 文件，保留它们，不要用本轮设置覆盖原值备份。
+
+**步骤 2：检查连接状态。**
+
+```bash
+cd /mnt/sdb3/data/yxr/projects/hermit
+bash remoteswap/client/manage_rswap_client.sh status
+sudo dmesg | grep 'rswap:' | tail -15
+swapon --show --bytes --output NAME,SIZE,USED
+```
+
+若模块已正确连接两个节点，配置为 `nr_servers=2`、`rmsize=24`，直接执行步骤 3。
+否则按以下冷启动流程；每条命令失败都停止，不继续下一条：
+
+- 在无校验进程时，先 `swapon --show` 确认活动 area。仅停用其中明确的测试 area，
+  使用实际路径，例如 `sudo swapoff /mnt/sdb4/yxr/projects/swap_24g.img`。
+  若仍是原 SSD `/swap.img` 活动，则停用的是 `sudo swapoff /swap.img`。
+- `swapon --show` 必须为空。旧模块若加载，执行
+  `bash remoteswap/client/manage_rswap_client.sh uninstall`。
+- 在两端各自的 `remoteswap/server` 目录启动全新的 Server 进程。以下采用 16＋8 GiB，
+  最后的 48 是 Client 在线 CPU 数，测试时若改变则替换：
+
+```bash
+# 只在 Server 0 执行
+./rswap-server 10.0.0.13 9400 16 48
 ```
 
 ```bash
-# Server 1
-./rswap-server 10.0.0.20 9400 16 48
+# 只在 Server 1 执行
+./rswap-server 10.0.0.20 9400 8 48
 ```
 
-Client 配置改回 `NR_SERVERS=2`、`POOL_GIB=24`，地址与原配置一致。
-重复 T1 的 install/status/swapon，预期发现 8 GiB＋16 GiB，
-`pool ready servers=2 total=24 GiB (4-KiB swap ready)`。
+Client 的 `remoteswap/client/rswap_client.conf` 使用以下文件内容；已有配置一致则不修改。
+这是配置文件内容，不是在终端设置环境变量：
 
-在独立终端 C（先执行第 0 节公共设置），开启短时 trace 收集，再去 A 运行 workload：
+```text
+NR_SERVERS=2
+POOL_GIB=24
+CONNECT_TIMEOUT_MS=15000
+SERVER0_IP="10.0.0.13"
+SERVER0_PORT=9400
+SERVER1_IP="10.0.0.20"
+SERVER1_PORT=9400
+```
 
 ```bash
+# 回到 Client 仓库目录执行
+cd /mnt/sdb3/data/yxr/projects/hermit
+bash remoteswap/client/manage_rswap_client.sh install
+bash remoteswap/client/manage_rswap_client.sh status
+sudo dmesg | grep 'rswap:' | tail -15
+```
+
+**步骤 3：启用正确的 swap area。**
+
+```bash
+if swapon --show=NAME --noheadings | grep -Fxq /mnt/sdb4/yxr/projects/swap_24g.img; then
+    echo 'test swap already active'
+else
+    sudo swapon /mnt/sdb4/yxr/projects/swap_24g.img
+fi
+swapon --show --bytes --output NAME,SIZE,USED
+```
+
+**预期结果：**两个 Server 容量合计 24 GiB，日志有
+`pool ready servers=2 total=24 GiB (4-KiB swap ready)`；系统只启用上述一个约 24 GiB 的 area。
+**列表为空不能运行 workload：加载模块不会自动 swapon。**不创建或重新格式化文件。
+
+### 4.2 双节点逐页内容与实际 I/O
+
+**目标／内容：**验证两节点都完成 Write／同步 Read，以及同一批页面改写后仍能正确读回。
+
+**步骤 1：在终端 C 启动采集，再去 A 运行 workload。**
+
+```bash
+mkdir -p /tmp/hermit-p3
 echo 1 | sudo tee /sys/kernel/debug/tracing/tracing_on
-sudo awk 'match($0, /server: [01] type: [012]/) {
-    key = substr($0, RSTART, RLENGTH)
-    if (seen[key]++ < 8) { print; fflush() }
-}' /sys/kernel/debug/tracing/trace_pipe | tee "$P3_RUN/t2-rdma.trace"
+sudo awk -v since="$(cut -d ' ' -f1 /proc/uptime)" '
+match($0, /[0-9]+\.[0-9]+: /) {
+    stamp = substr($0, RSTART, RLENGTH) + 0
+    if (stamp < since) next
+    if (match($0, /server: [01] type: [012]/)) {
+        key = substr($0, RSTART, RLENGTH)
+        if (seen[key]++ < 8) { print; fflush() }
+    }
+}' /sys/kernel/debug/tracing/trace_pipe | tee /tmp/hermit-p3/t2-rdma.trace
 ```
 
-这会占住 C。完成一轮写入和校验后在 **C** 按 Ctrl-C 停止采集；不要在 A 中断 workload。
-每个 Server／type 只保存前 8 条样本，避免大量 trace 占满日志空间；后面的计数是样本数，
-不是总 I/O 数。不清空全局 dmesg。此方法适用于没有其他 tracing 使用者的测试机。
+C 持续等待是正常的。每节点／类型最多保存 8 条，且只接收采集启动后的时间戳，避免旧单节点
+记录混入。文件应立即创建，可在 B 用 `ls -l /tmp/hermit-p3/t2-rdma.trace` 确认；
+如有 Permission denied 或 trace WARNING，停止采集并反馈，不把它当成采集成功。
+此采集方式只在没有其他 tracing 使用者的测试机使用。
 
-### 4.2 双节点内容校验与保持活页
-
-A 执行（3 个版本）：
+**步骤 2：终端 A 写入 4 GiB，运行三个版本。**
 
 ```bash
 set -o pipefail
-sudo bash -c 'echo $$ > "$1/cgroup.procs"; exec "$2" 4096 3' bash "$P3_CG" "$P3_RUN/swap_pattern" | tee "$P3_RUN/t2-pattern.log"
+sudo bash -ceu 'echo $$ > "$1/cgroup.procs"; exec "$2" 4096 3' bash /sys/fs/cgroup/memory/hermit-p3 /tmp/hermit-p3/swap_pattern 2>&1 | tee /tmp/hermit-p3/t2-pattern.log
 echo "workload_exit=$?"
 ```
 
-按 T1 方法确认有实际换页。分别在 `READY generation=0` 和 `READY generation=1`
-时各按一次 ENTER。等待 `READY generation=2` 后暂停，**不要按第三次 ENTER**。
-
-停止 C 的 trace 采集，在 B 检查：
+A 到达 `READY generation=0` 后先暂停，在 B 查看：
 
 ```bash
-grep -E 'server: [01] type: [012]' "$P3_RUN/t2-rdma.trace" | head -30
+cat /sys/fs/cgroup/memory/hermit-p3/memory.usage_in_bytes
+swapon --show --bytes --output NAME,SIZE,USED
+```
+
+预期物理内存约受 2 GiB 限制，系统该 area 的 USED 比 workload 前增加约 GiB 量级。
+不读取 cgroup swap 统计。若没有实际换页，不算本项通过。
+
+**步骤 3：在 A 分别按两次 ENTER，每次等待下一条 READY 后再操作。**
+
+预期依次得到：
+
+```text
+VERIFIED generation=0 ...
+READY generation=1 ...
+VERIFIED generation=1 ...
+READY generation=2 ...
+```
+
+**在 generation=2 保持暂停，不按第三次 ENTER。**
+
+**步骤 4：在 C 按 Ctrl-C 停止采集，在 B 检查带标签的样本数。**
+
+```bash
 for server in 0 1; do
     for type in 0 1; do
-        grep -c "server: $server type: $type " "$P3_RUN/t2-rdma.trace"
+        printf 'server=%s type=%s samples=' "$server" "$type"
+        grep -c "server: $server type: $type " /tmp/hermit-p3/t2-rdma.trace
     done
 done
 ```
 
-预期两个 Server 的 type=0（Write）、type=1（同步 Read）都出现；type=2 是异步 Read。
-基线不要求 type=2。若没有捕获到读写，先检查采集窗口是否覆盖校验阶段，不能仅凭连接成功判通过。
+**预期结果：**四类样本数均大于 0，通常均为 8；type=0 是 Write、type=1 是同步 Read。
+8 是采样上限，不是总请求数。基线不要求 type=2。内容检查和四类实际 I/O 都满足才算本项通过；
+当前 A 尚未退出，因此最终 PASS 留到下一项的 swapoff 后检查。
 
-### 4.3 卸载保护和活进程读回
+### 4.3 活动 swap 卸载保护与活进程 swapoff
 
-保持 A 停在 `READY generation=2`，先在 B 再确认 cgroup swap 非零，再执行：
+**目标／内容：**验证活动 area 能阻止正常卸载，并验证进程仍存活时 swapoff 读回的数据。
+前提是 A 仍暂停在本轮 `READY generation=2`，系统实际 USED 仍明显非零。
+
+**步骤 1：终端 B 尝试普通卸载。**
 
 ```bash
 sudo rmmod rswap_client
 echo "rmmod_exit=$?"
-test -d /sys/module/rswap_client && echo "module remains loaded"
+test -d /sys/module/rswap_client && echo 'module remains loaded'
 ```
 
-预期 rmmod 非零，提示模块在使用中，模块仍在。此处直接使用普通 rmmod；
-管理脚本自身会拒绝活动 swap，不能用它证明内核模块引用保护有效。
+预期 rmmod 非零、提示正在使用，模块仍在。这是唯一一项预期失败的命令。
+不要使用管理脚本代替它，也不要加 `-f`。
 
-为活页读回留足空间：**先提高 memsw 上限，再提高物理内存上限**，然后 swapoff：
+**步骤 2：仅提高物理内存限制，为 4 GiB 活页读回留足空间。memsw 不设有限上限。**
 
 ```bash
-echo 12884901888 | sudo tee "$P3_CG/memory.memsw.limit_in_bytes"
-echo 8589934592 | sudo tee "$P3_CG/memory.limit_in_bytes"
-sudo swapoff /swap.img
+echo 8589934592 | sudo tee /sys/fs/cgroup/memory/hermit-p3/memory.limit_in_bytes
+sudo swapoff /mnt/sdb4/yxr/projects/swap_24g.img
+echo "swapoff_exit=$?"
 swapon --show
 ```
 
-预期 swapoff 返回 0，列表为空，A 仍存活，未重启 Server，Client 模块仍加载。
-现在回到 A 按第三次 ENTER。预期 `VERIFIED generation=2`、最终 `PASS`，退出码 0。
-这一步同时验证 swapoff 读回后的内容，而不是仅检查命令退出成功。
+预期 swapoff 返回 0，swap 列表为空；A 未退出，Server 和 Client 模块均未重启。
+
+**步骤 3：回到 A 按第三次 ENTER。**
+
+**预期结果：**`VERIFIED generation=2`、最终 `PASS`、`workload_exit=0`。
+这才完成活进程读回内容的验证。任何 Killed、FAIL、非零退出都不能继续判通过。
 
 ### 4.4 同一连接再次 swapon
 
-不卸载模块、不重启 Server，重新收紧 cgroup：
+**目标／内容：**验证同一组 Session 的 area 关闭后可以重新启用并进行新的真实读写。
+前提是上一程序已正常 PASS 退出，模块仍加载，swap 列表为空。
+
+**步骤 1：终端 B 恢复 2 GiB 物理限制，重新启用 area。**
 
 ```bash
-echo 2147483648 | sudo tee "$P3_CG/memory.limit_in_bytes"
-echo 6442450944 | sudo tee "$P3_CG/memory.memsw.limit_in_bytes"
-sudo swapon /swap.img
+echo 2147483648 | sudo tee /sys/fs/cgroup/memory/hermit-p3/memory.limit_in_bytes
+sudo swapon /mnt/sdb4/yxr/projects/swap_24g.img
+swapon --show --bytes --output NAME,SIZE,USED
 ```
 
-运行 T1 的 4096 MiB／2 轮命令，日志另存为 `t2-reopen-pattern.log`。
-确认重新产生 cgroup swap，两个版本均通过。然后：
+预期启用成功。不卸载模块、不重启 Server、不重新设置 memsw。
+
+**步骤 2：终端 A 运行一个新版本。**
 
 ```bash
-sudo swapoff /swap.img
-bash remoteswap/client/manage_rswap_client.sh uninstall
-bash remoteswap/client/manage_rswap_client.sh status
-sudo dmesg > "$P3_RUN/t2-dmesg.after"
+set -o pipefail
+sudo bash -ceu 'echo $$ > "$1/cgroup.procs"; exec "$2" 4096 1' bash /sys/fs/cgroup/memory/hermit-p3 /tmp/hermit-p3/swap_pattern 2>&1 | tee /tmp/hermit-p3/t2-reopen-pattern.log
+echo "workload_exit=$?"
 ```
 
-预期 swap 列表为空、模块未加载、资源正常释放。
+READY 时在 B 用 `swapon --show --bytes --output NAME,SIZE,USED` 确认 USED 增加，
+然后在 A 按一次 ENTER。
 
-## 5. T3：双节点上的必要优化回归
+**预期结果：**`VERIFIED generation=0`、最终 `PASS`、退出码 0。
+完成后可以直接进入第 5 节；保留模块、连接和活动 swap，避免无必要的 Server 重启。
+如本次只完成基础验收，直接按第 6 节收尾。
 
-重启两端 Server 并重新 install/swapon。cgroup 使用前述 2 GiB／6 GiB 限制。
-每小项独立运行 4096 MiB／2 轮内容校验并保存日志；只有前一项 PASS 后才进行下一项。
-开关只在 workload 已退出时切换，不在运行中切换。
+## 5. T3：必要的异步路径回归
 
-| 用例 | 相对基线的设置 | 预期 |
-| --- | --- | --- |
-| T3a 异步 Store | `batch_swapout=Y`、`batch_io=Y` | 多版本内容 PASS，写出与完成不会卡住 |
-| T3b 异步预读 | 恢复上述两个为 N；`bypass_swapcache=Y`、`readahead_win=8`、`vm.page-cluster=3` | 内容 PASS，短 trace 出现 type=2 |
-| T3c lazy poll | 窗口恢复 1；`bypass_swapcache=Y`、`lazy_poll=Y` | 内容 PASS，无页面锁卡住 |
+三项分别运行，均使用双节点、同一个 24 GiB area、2 GiB 物理限制和无限 memsw。
+每项开始前，上一 workload 必须已正常退出。`batch_account`、`speculative_io` 等其余开关保持 N。
+不做性能比较、不测 cgroup swap 统计、不做完整优化组合矩阵。
 
-写开关的方式为：
+### 5.1 T3a：异步 Store 与多 Session 完成收敛
+
+**目标／内容：**验证 `store_on_core` 路径、两节点写完成收敛，以及改写后的页面内容。
+
+**步骤 1：终端 B 检查 swap 已启用，开启批量换出与异步 I/O。**
 
 ```bash
+swapon --show --bytes --output NAME,SIZE,USED
 echo Y | sudo tee /sys/kernel/debug/hermit/batch_swapout
 echo Y | sudo tee /sys/kernel/debug/hermit/batch_io
+echo N | sudo tee /sys/kernel/debug/hermit/batch_account
+echo N | sudo tee /sys/kernel/debug/hermit/bypass_swapcache
+echo N | sudo tee /sys/kernel/debug/hermit/lazy_poll
+echo 1 | sudo tee /sys/kernel/mm/swap/readahead_win
 ```
 
-其他开关同理，窗口写 `/sys/kernel/mm/swap/readahead_win`。
-T3b 另执行 `echo 3 | sudo tee /proc/sys/vm/page-cluster`。
-当前 cache 路径的窗口固定为 1；需通过 bypass 路径实际计算预读窗口，且 page-cluster
-不能为 0。修正后的这些设置才有机会触发异步 Read。若内容 PASS 但始终未捕获 type=2，
-该项记录为“数据通过，异步路径未确认”，不要算异步验收通过。
-仅开启 `batch_io` 或仅开启 `lazy_poll`，不能保证覆盖目标路径。
-三项均无需开启 `speculative_io`、batch accounting、vaddr swapout 等其他优化。
-并发项开始前将 bypass_swapcache、lazy_poll 恢复 N，窗口恢复 1。
+预期 area 仍活动、设置成功。不能只开启 batch_io 而不启用 batch_swapout。
 
-再做一轮小规模并发：基线设置、同一 cgroup 内同时运行两个 **2048 MiB／2 轮**程序，
-分别用不同的 CPU，例如在上述 exec 命令中改为
-`exec taskset -c 0 "$2" 2048 2` 和 `exec taskset -c 1 "$2" 2048 2`，在两个终端分别操作。
-两个进程应均有完整 PASS；总工作集仍约 4 GiB，无需把每个都扩大到 4 GiB。
-
-`speculative_io=Y` 在当前 Hermit 中初始并不会立即激活实际路径，约 1000 万次相关调用后
-才首次启用。此次短测不把它算作硬件通过；刚修复的锁路径已有实际函数的 24 组合逻辑回归。
-
-结束后按 T1 收尾：workload 退出 → swapoff → 卸载；保留 `t3-*` 日志。
-
-## 6. T4：不等容量尾段（单独执行一次）
-
-完成基础项后再做，恢复全部优化为 N、窗口 1。当前 `/swap.img` 只有 8 GiB，
-需要操作者另行准备一个合法、约 24 GiB 的测试 swap area；本文不提供对现有文件
-执行 mkswap 的命令。不要格式化或覆盖当前 `/swap.img`。
-
-1. 保持双节点 8＋16 GiB；无活动 swap 时加载 Client，只启用该较大的测试 area。
-2. 将 cgroup memory 上限设为 4 GiB，memsw 上限设为 32 GiB；提高限制时先提高 memsw。
-3. 运行 `swap_pattern 24576 2`（24 GiB 工作集，两个版本），按前文方式加入该 cgroup。
-4. READY 时必须观察到**该 cgroup 的实际 swap 超过 16 GiB**；最好接近 20 GiB。
-   仅“申请了超过 16 GiB 内存”不够。swap 超过 16 GiB 才能确认占用了尾段 offset。
-5. 两轮逐页校验 PASS；程序结束后，swapoff 该测试 area，再卸载。
-
-这确认共同交错段之外、Server 1 尾段的实际读写，不要求重复所有优化组合。
-没有较大合法 swap area 时将 T4 记录为未执行，不能声称尾段硬件验收完成。
-
-## 7. 恢复与反馈
-
-确认所有校验进程已退出、测试 swap 已停用、Client 已卸载，再恢复：
+**步骤 2：终端 A 运行两轮。**
 
 ```bash
-cp "$P3_RUN/rswap_client.conf.before" remoteswap/client/rswap_client.conf
-for flag in bypass_swapcache batch_swapout batch_tlb batch_io batch_account vaddr_swapout speculative_io speculative_lock lazy_poll apt_reclaim; do
-    sudo tee "/sys/kernel/debug/hermit/$flag" < "$P3_RUN/$flag.before"
-done
-sudo tee /sys/kernel/mm/swap/readahead_win < "$P3_RUN/readahead_win.before"
-sudo tee /proc/sys/vm/page-cluster < "$P3_RUN/page-cluster.before"
-sudo tee /sys/kernel/debug/tracing/tracing_on < "$P3_RUN/tracing_on.before"
-sudo rmdir "$P3_CG"
+set -o pipefail
+sudo bash -ceu 'echo $$ > "$1/cgroup.procs"; exec "$2" 4096 2' bash /sys/fs/cgroup/memory/hermit-p3 /tmp/hermit-p3/swap_pattern 2>&1 | tee /tmp/hermit-p3/t3a-pattern.log
+echo "workload_exit=$?"
 ```
 
-若原来 `/swap.img` 是活动的，确认模块已卸载后再 `sudo swapon /swap.img` 恢复 SSD swap。
-原来没有活动 swap 则不额外启用。恢复原 tracing_on，结束 trace 采集终端。
+每次 READY 时按一次 ENTER，等待下一条 READY 后再操作。
 
-反馈时按下表记录，并附对应日志；不需要发送整份 trace：
+**预期结果：**实际系统 swap USED 增加，两个版本均 VERIFIED、最终 PASS、退出码 0；
+提交／校验能够结束，没有 WC/DMA 错误或页面锁卡住。仅检查正确性，不要求带宽或时延阈值。
 
-| 项目 | 需要反馈 |
+### 5.2 T3b：SOFTIRQ 异步 Read／预读
+
+**目标／内容：**验证实际进入 type=2 的异步 Read 完成路径，并检查预读页面内容。
+
+**步骤 1：终端 B 恢复同步换出，开启当前代码能够触发预读的配置。**
+
+```bash
+echo N | sudo tee /sys/kernel/debug/hermit/batch_swapout
+echo N | sudo tee /sys/kernel/debug/hermit/batch_io
+echo Y | sudo tee /sys/kernel/debug/hermit/bypass_swapcache
+echo N | sudo tee /sys/kernel/debug/hermit/lazy_poll
+echo 3 | sudo tee /proc/sys/vm/page-cluster
+echo 8 | sudo tee /sys/kernel/mm/swap/readahead_win
+swapon --show --bytes --output NAME,SIZE,USED
+```
+
+当前 cache 路径窗口固定为 1；需要 bypass 路径计算预读窗口，且 page-cluster 非零。
+
+**步骤 2：终端 C 开始本项采集。**
+
+```bash
+mkdir -p /tmp/hermit-p3
+echo 1 | sudo tee /sys/kernel/debug/tracing/tracing_on
+sudo awk -v since="$(cut -d ' ' -f1 /proc/uptime)" '
+match($0, /[0-9]+\.[0-9]+: /) {
+    stamp = substr($0, RSTART, RLENGTH) + 0
+    if (stamp < since) next
+    if (match($0, /server: [01] type: 2/)) {
+        key = substr($0, RSTART, RLENGTH)
+        if (seen[key]++ < 8) { print; fflush() }
+    }
+}' /sys/kernel/debug/tracing/trace_pipe | tee /tmp/hermit-p3/t3b-rdma.trace
+```
+
+**步骤 3：终端 A 运行一轮，到 READY 后按一次 ENTER 完成校验。**
+
+```bash
+set -o pipefail
+sudo bash -ceu 'echo $$ > "$1/cgroup.procs"; exec "$2" 4096 1' bash /sys/fs/cgroup/memory/hermit-p3 /tmp/hermit-p3/swap_pattern 2>&1 | tee /tmp/hermit-p3/t3b-pattern.log
+echo "workload_exit=$?"
+```
+
+程序 PASS 后在 C 按 Ctrl-C 停止采集，在 B 检查：
+
+```bash
+grep 'type: 2 ' /tmp/hermit-p3/t3b-rdma.trace
+```
+
+**预期结果：**内容 PASS、退出码 0，并捕获本项 type=2 样本。没有 type=2 时记录
+“内容通过，异步 Read 路径未确认”，不算该路径验收通过，也不据此宣称数据错误。
+
+### 5.3 T3c：lazy poll
+
+**目标／内容：**验证需求页延后 polling 时，页面在读取完成前不会被错误使用或解锁。
+
+**步骤 1：终端 B 关闭预读窗口、保持 bypass，开启 lazy poll。**
+
+```bash
+echo N | sudo tee /sys/kernel/debug/hermit/batch_swapout
+echo N | sudo tee /sys/kernel/debug/hermit/batch_io
+echo Y | sudo tee /sys/kernel/debug/hermit/bypass_swapcache
+echo Y | sudo tee /sys/kernel/debug/hermit/lazy_poll
+echo 1 | sudo tee /sys/kernel/mm/swap/readahead_win
+swapon --show --bytes --output NAME,SIZE,USED
+```
+
+**步骤 2：终端 A 运行一轮，到 READY 后按一次 ENTER。**
+
+```bash
+set -o pipefail
+sudo bash -ceu 'echo $$ > "$1/cgroup.procs"; exec "$2" 4096 1' bash /sys/fs/cgroup/memory/hermit-p3 /tmp/hermit-p3/swap_pattern 2>&1 | tee /tmp/hermit-p3/t3c-pattern.log
+echo "workload_exit=$?"
+```
+
+**预期结果：**实际系统 swap USED 增加，完整 VERIFIED、PASS、退出码 0，无持续锁等待。
+仅开启 lazy_poll 而不开 bypass 不能保证进入目标路径。
+
+本轮不额外安排双进程压力矩阵、大容量尾段、主动断连、推测读取和 cgroup swap 记账测试。
+尾段的实际硬件覆盖仍标记“未验收”；不能因双节点小工作集 PASS 就宣称全部 24 GiB 已验证。
+
+## 6. 收尾与需要反馈的结果
+
+**目标／内容：**确认正常退出后，area 可以停用、模块可以卸载，恢复原机器设置。
+前提是所有校验程序已正常退出；如仍有活页或出现异常，先保存日志，不直接卸载或重启 Server。
+
+**步骤 1：终端 B 停用测试 area，再卸载模块。**
+
+```bash
+cd /mnt/sdb3/data/yxr/projects/hermit
+sudo swapoff /mnt/sdb4/yxr/projects/swap_24g.img
+bash remoteswap/client/manage_rswap_client.sh uninstall
+bash remoteswap/client/manage_rswap_client.sh status
+sudo dmesg > /tmp/hermit-p3/t2-t3-dmesg.after
+```
+
+**预期结果：**swapoff、卸载都成功，状态显示模块未加载且没有活动 swap，无新增相关内核错误。
+
+**步骤 2：若第 2 节已保存原设置，则恢复；缺少备份的项跳过，不猜测原值。**
+
+```bash
+cd /mnt/sdb3/data/yxr/projects/hermit
+if [ -f /tmp/hermit-p3/rswap_client.conf.before ]; then
+    cp /tmp/hermit-p3/rswap_client.conf.before remoteswap/client/rswap_client.conf
+fi
+for flag in bypass_swapcache batch_swapout batch_tlb batch_io batch_account vaddr_swapout speculative_io speculative_lock lazy_poll apt_reclaim; do
+    if [ -f "/tmp/hermit-p3/$flag.before" ]; then
+        sudo tee "/sys/kernel/debug/hermit/$flag" < "/tmp/hermit-p3/$flag.before"
+    fi
+done
+if [ -f /tmp/hermit-p3/readahead_win.before ]; then
+    sudo tee /sys/kernel/mm/swap/readahead_win < /tmp/hermit-p3/readahead_win.before
+fi
+if [ -f /tmp/hermit-p3/page-cluster.before ]; then
+    sudo tee /proc/sys/vm/page-cluster < /tmp/hermit-p3/page-cluster.before
+fi
+if [ -f /tmp/hermit-p3/tracing_on.before ]; then
+    sudo tee /sys/kernel/debug/tracing/tracing_on < /tmp/hermit-p3/tracing_on.before
+fi
+```
+
+不以 cgroup swap 记账是否清零、cgroup 删除是否成功作为本轮验收项。
+保留已知问题的 cgroup，后续单独处理；不在收尾时重新设有限 memsw 上限。
+若测试前原 `/swap.img` 是活动的，确认模块已卸载后才执行 `sudo swapon /swap.img` 恢复 SSD swap。
+不要再启用远端测试文件来代替原 SSD area。原来没有活动 swap 则不额外启用。
+
+**反馈表：**只需核心结果和第一处异常，不需要整份大 trace。
+
+| 项目 | 通过标准／反馈 |
 | --- | --- |
-| 环境 | uname、v2 符号、在线 CPU、Server 容量、实际 Client 配置 |
-| T1 | 是否实际换页、两个 VERIFIED、最终 PASS、swapoff／卸载结果 |
-| T2 | 两节点 type=0/1 计数、rmmod 被拒绝、活进程 swapoff 后 PASS、再次 swapon 后 PASS |
-| T3 | 三项分别结果、异步 Read type=2 是否出现、双进程是否均 PASS |
-| T4 | 实际最大 cgroup swap、两轮 PASS，或明确未执行 |
-| 异常 | 第一处错误、相关 Client dmesg／Server 输出；进程是否仍存活 |
+| 双节点内容与 I/O | generation 0/1 VERIFIED；本轮两节点 type 0/1 样本均非零 |
+| 卸载保护 | 普通 rmmod 被拒绝，模块仍加载 |
+| 活页 swapoff | swapoff 成功，随后 generation 2 VERIFIED、最终 PASS／退出 0 |
+| 再次 swapon | 同一连接重新启用成功，新进程 PASS／退出 0 |
+| 异步 Store | 两个版本 VERIFIED，PASS／退出 0，无新增完成错误 |
+| 异步 Read | PASS／退出 0，且本项捕获 type=2；否则标记未确认 |
+| lazy poll | PASS／退出 0，无持续锁等待 |
+| 正常收尾 | swapoff／卸载成功，相关 dmesg 无新增错误 |
 
-**现在先执行第 1–3 节。T1 成功后再做第 4 节，不需要一次跑完所有用例。**
+日志在 `/tmp/hermit-p3/t2-*.log`、`t3*-pattern.log`、`t2-rdma.trace`、`t3b-rdma.trace`
+及 `t2-t3-dmesg.after`。cgroup swap 统计正确性和大容量尾段均不在本轮通过结论内。
