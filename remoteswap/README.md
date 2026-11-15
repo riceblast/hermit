@@ -1,6 +1,11 @@
 # Remoteswap
 
-**Development stage: Patch 4 (per-server RDMA counters and successful-payload bandwidth monitoring).**
+**Development stage: Patch 5 Server (NUMA-bound DRAM/PMem pool, control protocol v2).**
+The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
+Client protocol adaptation is pending: the Patch 1–4 Client cannot connect to this Server.
+The historical Server command lines below and in Patch 1–4 test guides no longer apply.
+
+The following Client capabilities describe the completed Patch 4 baseline:
 The Client discovers each selected Server's capacity and checks the configured sum.
 Static routing interleaves the common capacity and appends the larger Server's tail;
 single-server pools map directly. Multi-session polling, request retirement and

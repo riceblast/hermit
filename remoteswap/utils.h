@@ -3,6 +3,9 @@
 
 #include "constants.h"
 
+/* Version 1 was implicit. Version 2 requires matching Client and Server. */
+#define RSWAP_PROTOCOL_VERSION 2U
+
 enum rdma_queue_type { QP_STORE, QP_LOAD_SYNC, QP_LOAD_ASYNC, NUM_QP_TYPE };
 
 /* 2-sided RDMA message type */
@@ -34,6 +37,11 @@ struct message {
   int mapped_chunk;
 
   enum message_type type;
+
+  uint32_t protocol_version;
+  /* Descriptors [0, dram_chunks) are DRAM; the remainder are PMem. */
+  uint32_t dram_chunks;
+  uint32_t pmem_chunks;
 };
 
 #endif // __RSWAP_UTILS_H

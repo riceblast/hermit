@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <rdma/rdma_cma.h>
 #include <semaphore.h>
 #include <stdio.h>
@@ -61,7 +62,11 @@ struct context {
   struct rswap_rdma_queue *rdma_queues;
 
   struct ibv_comp_channel *comp_channel;
+  struct ibv_cq *control_cq;
   pthread_t cq_poller_thread; // daemon thread for two-sided RDMA
+  bool cq_poller_started;
+  bool pool_ready;
+  enum message_type expected_request;
 
   struct message *recv_msg;
   struct ibv_mr *recv_mr;
@@ -79,7 +84,12 @@ struct context {
  * Describe the memory pool
  */
 struct rdma_mem_pool {
-  char *heap_start;
+  struct tier_range {
+    char *start;
+    size_t size;
+    int node;
+    unsigned int chunks;
+  } tiers[2]; /* DRAM, PMem */
   int region_num;
 
   struct ibv_mr *mr_buffer[MAX_REGION_NUM];
@@ -126,7 +136,8 @@ void handle_cqe(struct ibv_wc *wc);
 void inform_memory_pool_available(struct rswap_rdma_queue *rdma_queue);
 void send_free_mem_size(struct rswap_rdma_queue *rdma_queue);
 void send_regions(struct rswap_rdma_queue *rdma_queue);
-void send_message(struct rswap_rdma_queue *rdma_queue);
+void send_message(struct rswap_rdma_queue *rdma_queue,
+                  const struct message &message);
 
 void destroy_connection(struct context *rdma_session);
 void *poll_cq(void *ctx);
@@ -149,7 +160,7 @@ static inline void print_debug(FILE *file, const char *format, ...)
 #ifdef DEBUG_RDMA_SERVER
 	va_list args;
 	va_start(args, format);
-	fprintf(file, format, args);
+	vfprintf(file, format, args);
 	va_end(args);
 #endif
 }
