@@ -9,6 +9,9 @@
 #include "rswap_rdma.h"
 #include "rswap_mapping.h"
 
+#define CREATE_TRACE_POINTS
+#include "rswap_trace.h"
+
 static unsigned int active_servers;
 static struct rswap_pool_layout pool_layout;
 static bool area_active;
@@ -114,7 +117,9 @@ void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 
 	ib_dma_unmap_page(dev, req->dma_addr, PAGE_SIZE,
 			type == QP_STORE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
-	rswap_stats_wc(queue->rdma_session, type, status);
+	rswap_stats_wc(queue->rdma_session, req->tier, type, status);
+	trace_placement(req->swap_type, (u64)req->offset,
+		queue->rdma_session->server_id, req->tier, type, status);
 	if (status) {
 		rswap_rdma_error(queue, status);
 		pr_err_ratelimited("rswap: server=%u queue=%d WC status=%d\n",
@@ -257,6 +262,7 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 	struct rdma_session_context *session = NULL;
 	struct rswap_rdma_queue *queue;
 	struct fs_rdma_req *req;
+	unsigned int tier = RSWAP_NR_TIERS;
 	int ret;
 
 	if (PageCompound(page)) {
@@ -271,6 +277,7 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 	if (ret)
 		goto submit_error;
 	session = remote.session;
+	tier = remote.tier;
 	queue = get_rdma_queue(remote.session, cpu, type);
 	req = kmem_cache_zalloc(queue->fs_rdma_req_cache, GFP_ATOMIC);
 	if (!req) {
@@ -280,8 +287,9 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 	req->rdma_queue = queue;
 	req->page = page;
 	req->offset = offset;
+	req->tier = tier;
+	req->swap_type = area_type;
 	if (type == QP_STORE) {
-		req->swap_type = area_type;
 		refcount_set(&req->store_refs, 2);
 	}
 	get_page(page);
@@ -305,7 +313,7 @@ free_req:
 	put_page(page);
 	kmem_cache_free(queue->fs_rdma_req_cache, req);
 submit_error:
-	rswap_stats_submit_error(session, type);
+	rswap_stats_submit_error(session, tier, type);
 	return ret;
 }
 
@@ -318,7 +326,7 @@ static int rswap_rdma_submit(int cpu, pgoff_t offset, struct page *page,
 	spin_lock_irqsave(&area_lock, flags);
 	if (!area_active) {
 		spin_unlock_irqrestore(&area_lock, flags);
-		rswap_stats_submit_error(NULL, type);
+		rswap_stats_submit_error(NULL, RSWAP_NR_TIERS, type);
 		return -ESHUTDOWN;
 	}
 	atomic_inc(&area_submissions);
@@ -333,7 +341,7 @@ int rswap_rdma_send(int cpu, pgoff_t offset, struct page *page,
 {
 	/* Stores must enter through prepare/commit, never bypass publication. */
 	if (type == QP_STORE) {
-		rswap_stats_submit_error(NULL, type);
+		rswap_stats_submit_error(NULL, RSWAP_NR_TIERS, type);
 		return -EINVAL;
 	}
 	return rswap_rdma_submit(cpu, offset, page, type, NULL);
@@ -347,7 +355,7 @@ static int rswap_store_prepare(unsigned int type, pgoff_t offset,
 
 	*cookie = NULL;
 	if (type != READ_ONCE(area_type)) {
-		rswap_stats_submit_error(NULL, QP_STORE);
+		rswap_stats_submit_error(NULL, RSWAP_NR_TIERS, QP_STORE);
 		return -EINVAL;
 	}
 	cpu = core == -1 ? get_cpu() : core;
@@ -427,7 +435,7 @@ static int rswap_frontswap_peek_load(int cpu)
 static int rswap_frontswap_load(unsigned int type, pgoff_t offset, struct page *page)
 {
 	if (type != READ_ONCE(area_type)) {
-		rswap_stats_submit_error(NULL, QP_LOAD_SYNC);
+		rswap_stats_submit_error(NULL, RSWAP_NR_TIERS, QP_LOAD_SYNC);
 		return -EINVAL;
 	}
 	return rswap_rdma_send(smp_processor_id(), offset, page, QP_LOAD_SYNC);
@@ -439,7 +447,7 @@ static int rswap_frontswap_load_async(unsigned int type, pgoff_t offset, struct 
 
 	put_cpu();
 	if (type != READ_ONCE(area_type)) {
-		rswap_stats_submit_error(NULL, QP_LOAD_ASYNC);
+		rswap_stats_submit_error(NULL, RSWAP_NR_TIERS, QP_LOAD_ASYNC);
 		return -EINVAL;
 	}
 	/* This queue completes by SOFTIRQ, so migration after selection is safe. */

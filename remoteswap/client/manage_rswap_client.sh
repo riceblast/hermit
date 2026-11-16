@@ -81,6 +81,10 @@ case "${1:-}" in
     monitor)
         run_as_root python3 "${script_dir}/../tools/rswap_stats.py" --interval "${2:-1}"
         ;;
+    trace-check)
+        [[ $# -eq 3 ]] || die 'Usage: trace-check TRACE_FILE DRAM_GiB:PMem_GiB[,DRAM_GiB:PMem_GiB]'
+        python3 "${script_dir}/../tools/rswap_trace.py" "$2" --layout "$3"
+        ;;
     status)
         if [[ -d /sys/module/rswap_client ]]; then
             echo 'rswap_client: loaded (actual module parameters below)'
@@ -96,7 +100,7 @@ case "${1:-}" in
         cat /proc/swaps
         ;;
     *)
-        echo "Usage: $0 {install|uninstall|status|stats|monitor [seconds]}" >&2
+        echo "Usage: $0 {install|uninstall|status|stats|monitor [seconds]|trace-check FILE LAYOUT}" >&2
         echo "Edit ${config_file} before install; environment overrides are not used." >&2
         exit 2
         ;;

@@ -115,6 +115,7 @@ struct fs_rdma_req {
 	bool io_done;
 	int status;
 	unsigned int swap_type;
+	unsigned int tier;
 	pgoff_t offset;
 	u64 start_ns;
 };
@@ -187,7 +188,7 @@ struct rswap_io_stats {
  */
 struct rdma_session_context {
 	unsigned int server_id;
-	struct rswap_io_stats io_stats[NUM_QP_TYPE];
+	struct rswap_io_stats io_stats[RSWAP_NR_TIERS][NUM_QP_TYPE];
 	unsigned int timeout_ms;
 	unsigned long deadline;
 	bool stopping;
@@ -213,9 +214,9 @@ struct rdma_session_context {
 int rswap_stats_init(unsigned int nr_servers);
 void rswap_stats_exit(void);
 void rswap_stats_wc(struct rdma_session_context *session,
-		enum rdma_queue_type type, int status);
+		unsigned int tier, enum rdma_queue_type type, int status);
 void rswap_stats_submit_error(struct rdma_session_context *session,
-		enum rdma_queue_type type);
+		unsigned int tier, enum rdma_queue_type type);
 
 static inline size_t pgoff2addr(pgoff_t offset)
 {

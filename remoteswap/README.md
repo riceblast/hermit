@@ -1,8 +1,8 @@
 # Remoteswap
 
-**Development stage: Patch 6 (protocol v2 Client and two-level page interleave).**
+**Development stage: Patch 7 (per-Tier RDMA statistics and optional placement trace).**
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
-Client 1.6 discovers each Server's DRAM/PMem topology and interleaves first across
+Client 1.7 discovers each Server's DRAM/PMem topology and interleaves first across
 Servers, then across the selected Server's Tiers. Each level stripes its common
 capacity and appends the larger side's tail. See the [Patch 6 guide](tests/patch6-client.md)
 for capacity limits, local checks and the minimal hardware acceptance plan.
@@ -13,8 +13,11 @@ The Client discovers each selected Server's capacity and checks the configured s
 Single-server pools still interleave DRAM/PMem. Multi-session polling, request retirement and
 managed Frontswap publication now permit one swap area no larger than the pool.
 Use 4-KiB pages; disable THP for validation workloads. Whole-THP remote I/O is rejected.
-Per-Server statistics remain in Patch 4 format; Tier statistics and placement trace
-are reserved for Patch 7. Current configuration expects two 48-GiB Servers (96 GiB total).
+Statistics now use format v2, with Server/Tier counters and successful-payload
+bandwidth. The optional `rswap:placement` event is disabled by default; see the
+[Patch 7 guide](tests/patch7-client.md) for the interface and core acceptance plan.
+Use the updated Python tools; old stats v1 snapshots are not supported.
+Current configuration expects two 48-GiB Servers (96 GiB total).
 
 Deploy the rebuilt kernel and Client together: the module now requires
 `frontswap_register_managed_ops_v2`, preventing accidental use with the older kernel.

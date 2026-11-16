@@ -20,6 +20,7 @@ ifneq ($(LINUXINCLUDE),)
 LINUXINCLUDE :=                 \
 	$(LINUXINCLUDE)						\
 	-I$(OFA_INCLUDE)        \
+	-I$(RSWAP_ROOT_PATH) \
 	-I$(RSWAP_ROOT_PATH)/..
 else
 

@@ -9,11 +9,14 @@ static atomic64_t unrouted_error = ATOMIC64_INIT(0);
 static const char * const stats_op_names[NUM_QP_TYPE] = {
 	"write", "read_sync", "read_async",
 };
+static const char * const stats_tier_names[RSWAP_NR_TIERS] = {
+	"dram", "pmem",
+};
 
 void rswap_stats_wc(struct rdma_session_context *session,
-		enum rdma_queue_type type, int status)
+		unsigned int tier, enum rdma_queue_type type, int status)
 {
-	struct rswap_io_stats *stats = &session->io_stats[type];
+	struct rswap_io_stats *stats = &session->io_stats[tier][type];
 
 	if (status)
 		atomic64_inc(&stats->wc_error);
@@ -22,32 +25,34 @@ void rswap_stats_wc(struct rdma_session_context *session,
 }
 
 void rswap_stats_submit_error(struct rdma_session_context *session,
-		enum rdma_queue_type type)
+		unsigned int tier, enum rdma_queue_type type)
 {
-	if (!session || (unsigned int)type >= NUM_QP_TYPE)
+	if (!session || tier >= RSWAP_NR_TIERS || (unsigned int)type >= NUM_QP_TYPE)
 		atomic64_inc(&unrouted_error);
 	else
-		atomic64_inc(&session->io_stats[type].submit_error);
+		atomic64_inc(&session->io_stats[tier][type].submit_error);
 }
 
 /* A live snapshot, not an atomic transaction across all counters. */
 static int rswap_stats_show(struct seq_file *m, void *unused)
 {
-	unsigned int id, type;
+	unsigned int id, tier, type;
 
-	seq_printf(m, "version=1 instance_ns=%llu sample_ns=%llu page_size=%lu\n",
+	seq_printf(m, "version=2 instance_ns=%llu sample_ns=%llu page_size=%lu\n",
 		(unsigned long long)stats_instance_ns,
 		(unsigned long long)ktime_get_ns(), PAGE_SIZE);
-	seq_puts(m, "server op ok wc_error submit_error\n");
+	seq_puts(m, "server tier op ok wc_error submit_error\n");
 	for (id = 0; id < stats_nr_servers; id++) {
-		for (type = 0; type < NUM_QP_TYPE; type++) {
-			struct rswap_io_stats *stats = &rdma_sessions[id].io_stats[type];
+		for (tier = 0; tier < RSWAP_NR_TIERS; tier++) {
+			for (type = 0; type < NUM_QP_TYPE; type++) {
+				struct rswap_io_stats *stats = &rdma_sessions[id].io_stats[tier][type];
 
-			seq_printf(m, "%u %s %llu %llu %llu\n", id,
-				stats_op_names[type],
-				(unsigned long long)atomic64_read(&stats->ok),
-				(unsigned long long)atomic64_read(&stats->wc_error),
-				(unsigned long long)atomic64_read(&stats->submit_error));
+				seq_printf(m, "%u %s %s %llu %llu %llu\n", id,
+					stats_tier_names[tier], stats_op_names[type],
+					(unsigned long long)atomic64_read(&stats->ok),
+					(unsigned long long)atomic64_read(&stats->wc_error),
+					(unsigned long long)atomic64_read(&stats->submit_error));
+			}
 		}
 	}
 	seq_printf(m, "unrouted_error=%llu\n",
@@ -74,7 +79,7 @@ static const struct file_operations rswap_stats_fops = {
 int rswap_stats_init(unsigned int nr_servers)
 {
 	struct dentry *file;
-	unsigned int id, type;
+	unsigned int id, tier, type;
 	int ret;
 
 	/* Called once before Frontswap registration, never while data I/O runs. */
@@ -82,12 +87,14 @@ int rswap_stats_init(unsigned int nr_servers)
 	stats_instance_ns = ktime_get_ns();
 	atomic64_set(&unrouted_error, 0);
 	for (id = 0; id < nr_servers; id++) {
-		for (type = 0; type < NUM_QP_TYPE; type++) {
-			struct rswap_io_stats *stats = &rdma_sessions[id].io_stats[type];
+		for (tier = 0; tier < RSWAP_NR_TIERS; tier++) {
+			for (type = 0; type < NUM_QP_TYPE; type++) {
+				struct rswap_io_stats *stats = &rdma_sessions[id].io_stats[tier][type];
 
-			atomic64_set(&stats->ok, 0);
-			atomic64_set(&stats->wc_error, 0);
-			atomic64_set(&stats->submit_error, 0);
+				atomic64_set(&stats->ok, 0);
+				atomic64_set(&stats->wc_error, 0);
+				atomic64_set(&stats->submit_error, 0);
+			}
 		}
 	}
 	stats_root = debugfs_create_dir("rswap", NULL);

@@ -19,13 +19,13 @@ sys.modules[spec.name] = stats
 spec.loader.exec_module(stats)
 
 
-def snapshot(instance=10, ns=1_000_000_000, rows=None, unrouted=0):
-    values = {(server, op): (0, 0, 0) for server in (0, 1) for op in stats.OPS}
+def snapshot(instance=10, ns=1_000_000_000, rows=None, unrouted=0, servers=(0, 1)):
+    values = {(server, tier, op): (0, 0, 0) for server in servers for tier in stats.TIERS for op in stats.OPS}
     values.update(rows or {})
-    text = "version=1 instance_ns={} sample_ns={} page_size=4096\n".format(instance, ns)
-    text += "server op ok wc_error submit_error\n"
-    for (server, op), counts in values.items():
-        text += "{} {} {} {} {}\n".format(server, op, *counts)
+    text = "version=2 instance_ns={} sample_ns={} page_size=4096\n".format(instance, ns)
+    text += "server tier op ok wc_error submit_error\n"
+    for (server, tier, op), counts in values.items():
+        text += "{} {} {} {} {} {}\n".format(server, tier, op, *counts)
     return text + "unrouted_error={}\n".format(unrouted)
 
 
@@ -43,6 +43,7 @@ typedef uint64_t u64;
 typedef long long atomic64_t;
 #define PAGE_SIZE 4096UL
 #define NUM_QP_TYPE 3
+#define RSWAP_NR_TIERS 2
 #define atomic64_read(p) (*(p))
 struct seq_file { int unused; };
 static void seq_printf(struct seq_file *m, const char *fmt, ...) {
@@ -63,12 +64,13 @@ static int single_open(struct file *f, int (*show)(struct seq_file *, void *), v
 }
 """
         support = r"""
-struct rdma_session_context { struct rswap_io_stats io_stats[3]; };
+struct rdma_session_context { struct rswap_io_stats io_stats[2][3]; };
 static struct rdma_session_context rdma_sessions[2];
 static unsigned int stats_nr_servers = 2;
 static u64 stats_instance_ns = 42;
 static atomic64_t unrouted_error = 7;
 static const char * const stats_op_names[] = {"write", "read_sync", "read_async"};
+static const char * const stats_tier_names[] = {"dram", "pmem"};
 """
         cases = r"""
 int main(void) {
@@ -79,8 +81,9 @@ int main(void) {
     module.state = MODULE_STATE_GOING;
     assert(rswap_stats_open(NULL, NULL) == -ENODEV && opens == 1);
     for (int s = 0; s < 2; s++)
-        for (int op = 0; op < 3; op++)
-            rdma_sessions[s].io_stats[op] = (struct rswap_io_stats){100 * s + op, op, s};
+        for (int tier = 0; tier < 2; tier++)
+            for (int op = 0; op < 3; op++)
+                rdma_sessions[s].io_stats[tier][op] = (struct rswap_io_stats){100 * s + 10 * tier + op, op, s + tier};
     return rswap_stats_show(&m, NULL);
 }
 """
@@ -99,24 +102,40 @@ int main(void) {
                          (42, 1_000_000_000, 4096))
         self.assertEqual(result.unrouted_error, 7)
         for server in (0, 1):
-            for op, name in enumerate(stats.OPS):
-                self.assertEqual(result.rows[(server, name)], (100 * server + op, op, server))
+            for tier, label in enumerate(stats.TIERS):
+                for op, name in enumerate(stats.OPS):
+                    self.assertEqual(result.rows[(server, label, name)],
+                                     (100 * server + 10 * tier + op, op, server + tier))
 
     def test_successful_payload_only_and_error_deltas(self):
-        before = stats.parse_snapshot(snapshot(rows={(0, "write"): (100, 2, 4)}))
+        before = stats.parse_snapshot(snapshot(rows={(0, "dram", "write"): (100, 2, 4)}))
         after = stats.parse_snapshot(snapshot(ns=3_000_000_000, unrouted=3, rows={
-            (0, "write"): (51300, 7, 10),
-            (0, "read_sync"): (25600, 2, 1),
-            (0, "read_async"): (12800, 3, 2),
-            (1, "write"): (25600, 1, 1),
+            (0, "dram", "write"): (51300, 7, 10),
+            (0, "dram", "read_sync"): (25600, 2, 1),
+            (0, "dram", "read_async"): (12800, 3, 2),
+            (1, "dram", "write"): (25600, 1, 1),
+            (0, "pmem", "write"): (25600, 0, 0),
         }))
         seconds, rates, unrouted = stats.rates_between(before, after)
         self.assertEqual(seconds, 2)
         self.assertEqual(unrouted, 3)
-        self.assertEqual(rates[0], dict(write=100, read_sync=50, read_async=25,
+        self.assertEqual(rates[(0, "dram")], dict(write=100, read_sync=50, read_async=25,
                                       read_total=75, total=175, wc_error=10, submit_error=9))
-        self.assertEqual(rates[1]["write"], 50)
-        self.assertEqual(rates[1]["read_total"], 0)
+        self.assertEqual(rates[(1, "dram")]["write"], 50)
+        self.assertEqual(rates[(1, "dram")]["read_total"], 0)
+        self.assertEqual(rates[(0, "pmem")]["write"], 50)
+        self.assertEqual(rates[(0, "all")]["write"], 150)
+        self.assertEqual(rates[(0, "all")]["total"], 225)
+        self.assertEqual(rates[(0, "all")]["wc_error"], 10)
+
+    def test_single_server_and_large_cumulative_counts(self):
+        before = stats.parse_snapshot(snapshot(servers=(0,), rows={(0, "pmem", "write"): (1 << 40, 0, 0)}))
+        after = stats.parse_snapshot(snapshot(servers=(0,), ns=2_000_000_000,
+                                             rows={(0, "pmem", "write"): ((1 << 40) + 256, 0, 0)}))
+        _, rates, _ = stats.rates_between(before, after)
+        self.assertEqual(rates[(0, "pmem")]["write"], 1)
+        self.assertEqual(rates[(0, "all")]["write"], 1)
+        self.assertEqual(set(rates), {(0, "dram"), (0, "pmem"), (0, "all")})
 
     def test_idle_interval(self):
         before = stats.parse_snapshot(snapshot())
@@ -128,12 +147,12 @@ int main(void) {
     def test_module_reload_even_when_new_counts_are_higher(self):
         before = stats.parse_snapshot(snapshot())
         after = stats.parse_snapshot(snapshot(instance=20, ns=2_000_000_000,
-                                               rows={(0, "write"): (99999, 0, 0)}))
+                                               rows={(0, "dram", "write"): (99999, 0, 0)}))
         with self.assertRaises(stats.BaselineChanged):
             stats.rates_between(before, after)
 
     def test_counter_decrease_and_invalid_time(self):
-        before = stats.parse_snapshot(snapshot(rows={(0, "write"): (10, 0, 0)}))
+        before = stats.parse_snapshot(snapshot(rows={(0, "dram", "write"): (10, 0, 0)}))
         after = stats.parse_snapshot(snapshot(ns=2_000_000_000))
         with self.assertRaises(stats.BaselineChanged):
             stats.rates_between(before, after)
@@ -142,12 +161,14 @@ int main(void) {
 
     def test_malformed_snapshots_are_rejected(self):
         good = snapshot()
-        cases = ["", good.replace("version=1", "version=2"),
-                 good.replace("version=1", "version=1 version=1"),
-                 good.replace("0 write 0 0 0\n", ""),
-                 good.replace("0 write 0 0 0", "0 write -1 0 0"),
-                 good.replace("0 write 0 0 0", "0 write 0 0 0\n0 write 1 0 0"),
-                 good.replace("unrouted_error=0", "unrouted_error=-1")]
+        cases = ["", good.replace("version=2", "version=1"),
+                 good.replace("version=2", "version=2 version=2"),
+                 good.replace("0 dram write 0 0 0\n", ""),
+                 good.replace("0 dram write 0 0 0", "0 dram write -1 0 0"),
+                 good.replace("0 dram write 0 0 0", "0 dram write 0 0 0\n0 dram write 1 0 0"),
+                 good.replace("unrouted_error=0", "unrouted_error=-1"),
+                 good.replace("0 pmem write 0 0 0\n", ""),
+                 good.replace("0 pmem write", "0 unknown write")]
         for text in cases:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 stats.parse_snapshot(text)
@@ -155,9 +176,9 @@ int main(void) {
     def test_monitor_rebaselines_without_printing_reload_as_traffic(self):
         first = stats.parse_snapshot(snapshot())
         second = stats.parse_snapshot(snapshot(instance=20, ns=2_000_000_000,
-                                                rows={(0, "write"): (99999, 0, 0)}))
+                                                rows={(0, "dram", "write"): (99999, 0, 0)}))
         third = stats.parse_snapshot(snapshot(instance=20, ns=3_000_000_000,
-                                               rows={(0, "write"): (99999 + 256, 0, 0)}))
+                                               rows={(0, "dram", "write"): (99999 + 256, 0, 0)}))
         out, err = io.StringIO(), io.StringIO()
         with patch.object(stats, "read_snapshot", side_effect=[first, second, third]), \
                 patch.object(stats.time, "sleep", side_effect=[None, None, KeyboardInterrupt]), \
@@ -166,7 +187,7 @@ int main(void) {
                 stats.monitor("unused", 1)
         self.assertIn("New baseline", err.getvalue())
         self.assertEqual(out.getvalue().count("interval="), 1)
-        self.assertIn("0 1.000 0.000", out.getvalue())
+        self.assertIn("0 dram 1.000 0.000", out.getvalue())
 
     def test_cli_reports_missing_interface_and_invalid_intervals(self):
         tool = ROOT / "tools/rswap_stats.py"

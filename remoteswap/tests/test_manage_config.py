@@ -163,6 +163,18 @@ class ManageConfigTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls()[0][-2:], ["--interval", "1"])
 
+    def test_trace_checker_ignores_config_and_preserves_arguments(self):
+        self.config.write_text("broken shell syntax (\n")
+        result = self.run_script("trace-check", "/tmp/trace with spaces.log", "16:32,16:32")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [["python3", str(self.root / "../tools/rswap_trace.py"),
+                                        "/tmp/trace with spaces.log", "--layout", "16:32,16:32"]])
+
+    def test_trace_checker_requires_file_and_layout(self):
+        result = self.run_script("trace-check", "/tmp/trace.log")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

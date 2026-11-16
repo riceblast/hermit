@@ -81,6 +81,8 @@ static int atomic_cmpxchg(atomic_t *p, int old, int value) {
 #define spin_lock_irqsave(p, flags) do { (flags) = 0; pthread_mutex_lock(p); } while (0)
 #define spin_unlock_irqrestore(p, flags) do { (void)(flags); pthread_mutex_unlock(p); } while (0)
 #define trace_printk(...) ((void)0)
+static void mock_trace_placement(unsigned int, u64, unsigned int, unsigned int, int, int);
+#define trace_placement(...) mock_trace_placement(__VA_ARGS__)
 #define pr_err_ratelimited(...) ((void)0)
 #define wake_up_all(p) ((void)(p))
 #define cpu_relax() sched_yield()
@@ -131,7 +133,7 @@ struct chunk_list { struct remote_chunk *chunks; unsigned int chunk_num, dram_ch
 /* STATS_STRUCT */
 struct rdma_session_context {
     unsigned int server_id;
-    struct rswap_io_stats io_stats[NUM_QP_TYPE];
+    struct rswap_io_stats io_stats[RSWAP_NR_TIERS][NUM_QP_TYPE];
     bool stopping;
     int error;
     struct rswap_rdma_dev *rdma_dev;
@@ -160,6 +162,10 @@ static int online_cores = 1, num_queues = 3;
 static atomic_int frees, maps, unmaps;
 static int alloc_error, map_error, post_error, wc_error, immediate, pins;
 static struct page *current_page;
+static pgoff_t expected_offset = 1;
+static bool trace_enabled = true;
+static int trace_calls;
+static int expected_trace_op = -1;
 static void fs_rdma_callback(struct ib_cq *, struct ib_wc *);
 static void *kmem_cache_zalloc(void *cache, int flags);
 static void kmem_cache_free(void *cache, void *ptr) { atomic_fetch_add(&frees, 1); free(ptr); }
@@ -168,7 +174,7 @@ static void put_cpu(void) { assert(pins-- > 0); }
 static u64 ktime_get_ns(void) { return 1; }
 static void rswap_rdma_error(struct rswap_rdma_queue *q, int error) { q->rdma_session->error = error; }
 static void frontswap_invalidate_page(unsigned int type, pgoff_t offset) {
-    assert(type == 0 && offset == 1);
+    assert(type == 0 && offset == expected_offset);
     assert(atomic_load(&current_page->dirty));
     assert(atomic_exchange(&current_page->valid, 0) == 1);
 }
@@ -192,6 +198,19 @@ static int ib_post_send(struct ib_qp *qp, struct ib_send_wr *wr, const struct ib
 """
 
 SUPPORT = r"""
+static void mock_trace_placement(unsigned int area, u64 offset, unsigned int server,
+                                 unsigned int tier, int op, int status) {
+    if (!trace_enabled) return;
+    unsigned int s, t;
+    u64 slot;
+    assert(!rswap_map_page(&pool_layout, offset, &s, &t, &slot));
+    assert(area == area_type && server == s && tier == t);
+    assert((expected_offset == (pgoff_t)-1 || offset == expected_offset) && op < NUM_QP_TYPE);
+    assert(expected_trace_op < 0 || op == expected_trace_op);
+    assert(status == (wc_error ? -EIO : 0));
+    trace_calls++;
+}
+
 static void *kmem_cache_zalloc(void *cache, int flags) {
     return alloc_error ? NULL : calloc(1, sizeof(struct fs_rdma_req));
 }
@@ -265,14 +284,18 @@ static void reset(struct page *p) {
     atomic_store(&p->refs, 1); atomic_store(&p->locked, 1);
     atomic_store(&p->reclaim, 1); current_page = p;
     alloc_error = map_error = post_error = wc_error = immediate = pins = 0;
+    expected_offset = 1; trace_enabled = true; trace_calls = 0;
+    expected_trace_op = -1;
     atomic_store(&frees, 0); atomic_store(&maps, 0); atomic_store(&unmaps, 0);
     atomic64_set(&unrouted_error, 0);
     for (int s = 0; s < 2; s++) {
         rdma_sessions[s].error = 0; rdma_sessions[s].stopping = false;
         for (int t = 0; t < 3; t++) {
-            atomic64_set(&rdma_sessions[s].io_stats[t].ok, 0);
-            atomic64_set(&rdma_sessions[s].io_stats[t].wc_error, 0);
-            atomic64_set(&rdma_sessions[s].io_stats[t].submit_error, 0);
+            for (int tier = 0; tier < RSWAP_NR_TIERS; tier++) {
+                atomic64_set(&rdma_sessions[s].io_stats[tier][t].ok, 0);
+                atomic64_set(&rdma_sessions[s].io_stats[tier][t].wc_error, 0);
+                atomic64_set(&rdma_sessions[s].io_stats[tier][t].submit_error, 0);
+            }
             assert(!atomic_load(&queues[s][t].rdma_post_counter));
             assert(!atomic_load(&queues[s][t].store_pending));
             assert(!cqs[s][t].queued); cqs[s][t].hold = false;
@@ -287,11 +310,15 @@ static void retired(struct page *p, bool unlocked) {
     assert(!atomic_load(&queues[1][0].rdma_post_counter));
     assert(!pins);
 }
-static void check_stats(int server, int type, int ok, int wc_error_count, int submit_error) {
-    struct rswap_io_stats *s = &rdma_sessions[server].io_stats[type];
+static void check_tier_stats(int server, int tier, int type, int ok, int wc_error_count, int submit_error) {
+    struct rswap_io_stats *s = &rdma_sessions[server].io_stats[tier][type];
     assert(atomic64_read(&s->ok) == ok);
     assert(atomic64_read(&s->wc_error) == wc_error_count);
     assert(atomic64_read(&s->submit_error) == submit_error);
+}
+static void check_stats(int server, int type, int ok, int wc_error_count, int submit_error) {
+    check_tier_stats(server, RSWAP_TIER_DRAM, type, ok, wc_error_count, submit_error);
+    check_tier_stats(server, RSWAP_TIER_PMEM, type, 0, 0, 0);
 }
 static void *callback_thread(void *arg) { complete_one(&cqs[1][0]); return NULL; }
 static void *commit_thread(void *arg) {
@@ -378,6 +405,49 @@ int main(void) {
         }
     }
 
+    /* Fast PMem completions and pre-WC failures on both Servers, all operations. */
+    for (int s = 0; s < 2; s++) {
+        pgoff_t offset = 2 + s;
+        for (int op = 0; op < 3; op++) {
+            for (int error = 0; error < 2; error++) {
+                reset(&p); expected_offset = offset; expected_trace_op = op; wc_error = error; immediate = 1;
+                if (op == QP_STORE) {
+                    assert(!rswap_store_prepare(0, offset, &p, 0, &cookie));
+                    atomic_store(&p.valid, 1); rswap_store_commit(cookie);
+                } else {
+                    assert(!rswap_rdma_submit(0, offset, &p, op, NULL));
+                }
+                retired(&p, op != QP_LOAD_SYNC);
+                assert(trace_calls == 1);
+                check_tier_stats(s, RSWAP_TIER_PMEM, op, !error, error, 0);
+                check_tier_stats(s, RSWAP_TIER_DRAM, op, 0, 0, 0);
+                check_tier_stats(1 - s, RSWAP_TIER_PMEM, op, 0, 0, 0);
+            }
+            for (int fail = 0; fail < 3; fail++) {
+                reset(&p); expected_offset = offset;
+                alloc_error = fail == 0; map_error = fail == 1;
+                post_error = fail == 2 ? -EIO : 0;
+                int ret = op == QP_STORE ? rswap_store_prepare(0, offset, &p, 0, &cookie) :
+                    rswap_rdma_submit(0, offset, &p, op, NULL);
+                assert(ret < 0 && !trace_calls);
+                assert(atomic_load(&p.refs) == 1 && atomic_load(&p.locked));
+                assert(atomic_load(&maps) == atomic_load(&unmaps));
+                check_tier_stats(s, RSWAP_TIER_PMEM, op, 0, 0, 1);
+                check_tier_stats(s, RSWAP_TIER_DRAM, op, 0, 0, 0);
+            }
+        }
+    }
+    reset(&p); expected_offset = 3; immediate = 1; trace_enabled = false;
+    assert(!rswap_rdma_submit(0, 3, &p, QP_LOAD_SYNC, NULL));
+    retired(&p, false);
+    assert(!trace_calls);
+    check_tier_stats(1, RSWAP_TIER_PMEM, QP_LOAD_SYNC, 1, 0, 0);
+    reset(&p); expected_offset = 3; immediate = 1; area_type = 7;
+    assert(!rswap_rdma_submit(0, 3, &p, QP_LOAD_SYNC, NULL));
+    retired(&p, false);
+    assert(trace_calls == 1);
+    area_type = 0;
+
     for (int before = 0; before < 2; before++) {
         for (int error = 0; error < 2; error++) {
             reset(&p); wc_error = error; immediate = before;
@@ -458,6 +528,7 @@ int main(void) {
         struct page other = {0};
         void *second;
         reset(&p);
+        expected_offset = (pgoff_t)-1; /* Two different offsets are in flight. */
         atomic_store(&other.refs, 1); atomic_store(&other.locked, 1);
         assert(!rswap_store_prepare(0, 1, &p, 0, &cookie));
         assert(!rswap_store_prepare(0, 2, &other, 0, &second));
@@ -470,7 +541,8 @@ int main(void) {
         assert(!rswap_poll_cpu(0, QP_STORE, true));
         assert(!atomic_load(&other.locked) && atomic_load(&frees) == 2);
         assert(atomic_load(&p.refs) == 1 && atomic_load(&other.refs) == 1);
-        check_stats(0, QP_STORE, 1, 0, 0);
+        check_tier_stats(0, RSWAP_TIER_PMEM, QP_STORE, 1, 0, 0);
+        check_tier_stats(0, RSWAP_TIER_DRAM, QP_STORE, 0, 0, 0);
         check_stats(1, QP_STORE, 1, 0, 0);
     }
     /* Fast demand completion keeps the lock; asynchronous CQ owns its unlock. */
@@ -508,7 +580,7 @@ int main(void) {
     assert(atomic64_read(&unrouted_error) == 1);
     check_stats(0, QP_LOAD_SYNC, 0, 0, 0);
     check_stats(1, QP_LOAD_SYNC, 0, 0, 0);
-    puts("PASS: actual resolver, publication races, failures, polling, read completion and per-server stats");
+    puts("PASS: actual resolver, publication races, failures, polling, per-Tier stats and placement metadata");
     return 0;
 }
 """

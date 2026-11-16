@@ -8,6 +8,7 @@ import sys
 import time
 
 OPS = ("write", "read_sync", "read_async")
+TIERS = ("dram", "pmem")
 DEFAULT_PATH = "/sys/kernel/debug/rswap/stats"
 
 
@@ -32,24 +33,25 @@ def parse_snapshot(text):
         if len(fields) != 4 or set(header) != {"version", "instance_ns", "sample_ns", "page_size"}:
             raise ValueError("unexpected metadata")
         header = {key: int(value) for key, value in header.items()}
-        if header["version"] != 1 or min(header.values()) <= 0:
+        if header["version"] != 2 or min(header.values()) <= 0:
             raise ValueError("unsupported version or metadata")
-        if lines[1] != "server op ok wc_error submit_error":
+        if lines[1] != "server tier op ok wc_error submit_error":
             raise ValueError("unexpected columns")
         rows = {}
         for line in lines[2:-1]:
-            server, op, ok, wc_error, submit_error = line.split()
-            key = (int(server), op)
+            server, tier, op, ok, wc_error, submit_error = line.split()
+            key = (int(server), tier, op)
             values = tuple(map(int, (ok, wc_error, submit_error)))
-            if key[0] not in (0, 1) or op not in OPS or key in rows or min(values) < 0:
+            if (key[0] not in (0, 1) or tier not in TIERS or op not in OPS or
+                    key in rows or min(values) < 0):
                 raise ValueError("invalid or duplicate counter row")
             rows[key] = values
         key, value = lines[-1].split("=", 1)
         unrouted = int(value)
-        servers = {server for server, _ in rows}
+        servers = {server for server, _, _ in rows}
         if (key != "unrouted_error" or unrouted < 0 or
                 servers not in ({0}, {0, 1}) or
-                set(rows) != {(server, op) for server in servers for op in OPS}):
+                set(rows) != {(server, tier, op) for server in servers for tier in TIERS for op in OPS}):
             raise ValueError("incomplete counters")
         return Snapshot(header["instance_ns"], header["sample_ns"],
                         header["page_size"], rows, unrouted)
@@ -79,14 +81,20 @@ def rates_between(before, after):
     if seconds <= 0:
         raise ValueError("Stats sample time did not advance")
     result = {}
-    for server in sorted({server for server, _ in deltas}):
-        rates = [deltas[(server, op)][0] * after.page_size / seconds / (1024 * 1024)
-                 for op in OPS]
-        result[server] = {
-            "write": rates[0], "read_sync": rates[1], "read_async": rates[2],
-            "read_total": rates[1] + rates[2], "total": sum(rates),
-            "wc_error": sum(deltas[(server, op)][1] for op in OPS),
-            "submit_error": sum(deltas[(server, op)][2] for op in OPS),
+    for server in sorted({server for server, _, _ in deltas}):
+        for tier in TIERS:
+            rates = [deltas[(server, tier, op)][0] * after.page_size / seconds / (1024 * 1024)
+                     for op in OPS]
+            result[(server, tier)] = {
+                "write": rates[0], "read_sync": rates[1], "read_async": rates[2],
+                "read_total": rates[1] + rates[2], "total": sum(rates),
+                "wc_error": sum(deltas[(server, tier, op)][1] for op in OPS),
+                "submit_error": sum(deltas[(server, tier, op)][2] for op in OPS),
+            }
+        # Derived Server totals; the kernel maintains only per-Tier counters.
+        result[(server, "all")] = {
+            key: sum(result[(server, tier)][key] for tier in TIERS)
+            for key in result[(server, TIERS[0])]
         }
     return seconds, result, unrouted
 
@@ -115,11 +123,11 @@ def monitor(path, interval):
             before = after
             continue
         print("interval={:.3f}s unrouted_error_delta={}".format(seconds, unrouted))
-        print("server write_MiB/s sync_read_MiB/s async_read_MiB/s read_total_MiB/s "
+        print("server tier write_MiB/s sync_read_MiB/s async_read_MiB/s read_total_MiB/s "
               "total_MiB/s wc_error_delta submit_error_delta")
-        for server, row in rates.items():
-            print("{} {:.3f} {:.3f} {:.3f} {:.3f} {:.3f} {} {}".format(
-                server, row["write"], row["read_sync"], row["read_async"],
+        for (server, tier), row in rates.items():
+            print("{} {} {:.3f} {:.3f} {:.3f} {:.3f} {:.3f} {} {}".format(
+                server, tier, row["write"], row["read_sync"], row["read_async"],
                 row["read_total"], row["total"], row["wc_error"], row["submit_error"]))
         sys.stdout.flush()
         before = after
