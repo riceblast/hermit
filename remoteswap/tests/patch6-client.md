@@ -68,6 +68,8 @@ git diff --check
 
 ## 最小硬件验收：先单 Server，再双 Server
 
+可直接执行的核心流程见 [Patch 6 核心测试](patch6-core-smoke.md)，只做下述两轮。
+
 不重装内核，沿用有 `frontswap_register_managed_ops_v2` 的配套内核。
 先完成以下两轮；本阶段不要求重跑全部故障用例、性能对比或 BFS。
 
