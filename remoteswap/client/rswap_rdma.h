@@ -97,6 +97,8 @@ struct chunk_list {
 	struct remote_chunk *chunks;
 	uint32_t remote_mem_size;
 	uint32_t chunk_num;
+	uint32_t dram_chunks;
+	uint32_t pmem_chunks;
 };
 
 struct fs_rdma_req {

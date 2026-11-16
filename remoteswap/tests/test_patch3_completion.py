@@ -127,7 +127,7 @@ struct rswap_rdma_queue;
 struct ib_cq { int poll_ctx; bool hold; struct fs_rdma_req *queued; };
 struct ib_qp { struct rswap_rdma_queue *queue; };
 struct remote_chunk { uint32_t remote_rkey; uint64_t remote_addr, mapped_size; enum chunk_mapping_state chunk_state; };
-struct chunk_list { struct remote_chunk *chunks; unsigned int chunk_num; };
+struct chunk_list { struct remote_chunk *chunks; unsigned int chunk_num, dram_chunks, pmem_chunks; };
 /* STATS_STRUCT */
 struct rdma_session_context {
     unsigned int server_id;
@@ -215,7 +215,11 @@ static int ib_post_send(struct ib_qp *qp, struct ib_send_wr *wr, const struct ib
     struct rswap_rdma_queue *q = qp->queue;
     assert(req->rdma_queue == q);
     assert(req->sge.lkey == q->rdma_session->rdma_dev->pd->local_dma_lkey);
-    assert(req->rdma_wr.rkey == 1000 + q->rdma_session->server_id);
+    struct rswap_remote_page remote;
+    assert(!rswap_resolve_remote_page(req->offset, &remote));
+    assert(remote.session == q->rdma_session);
+    assert(req->rdma_wr.rkey == remote.chunk->remote_rkey);
+    assert(req->rdma_wr.remote_addr == remote.chunk->remote_addr + remote.chunk_offset);
     if (post_error) return post_error;
     assert(!q->cq->queued);
     q->cq->queued = req;
@@ -225,7 +229,7 @@ static int ib_post_send(struct ib_qp *qp, struct ib_send_wr *wr, const struct ib
 static struct rswap_rdma_queue queues[2][3];
 static struct ib_cq cqs[2][3];
 static struct ib_qp qps[2][3];
-static struct remote_chunk chunks[2][2];
+static struct remote_chunk chunks[2][3];
 static struct ib_device devices[2];
 static struct ib_pd pds[2];
 static struct rswap_rdma_dev devs[2];
@@ -237,9 +241,11 @@ static void init(void) {
         rdma_sessions[s].rdma_dev = &devs[s];
         rdma_sessions[s].rdma_queues = queues[s];
         rdma_sessions[s].remote_mem_pool.chunks = chunks[s];
-        rdma_sessions[s].remote_mem_pool.chunk_num = s + 1;
-        for (int c = 0; c < 2; c++)
-            chunks[s][c] = (struct remote_chunk){1000 + s, 0x100000ULL + (s * 2ULL + c) * (1ULL << 34), 1ULL << 33, MAPPED};
+        rdma_sessions[s].remote_mem_pool.chunk_num = s + 2;
+        rdma_sessions[s].remote_mem_pool.dram_chunks = 1;
+        rdma_sessions[s].remote_mem_pool.pmem_chunks = s + 1;
+        for (int c = 0; c < 3; c++)
+            chunks[s][c] = (struct remote_chunk){1000 + 10 * s + c, 0x100000ULL + (s * 3ULL + c) * (1ULL << 34), 1ULL << 33, MAPPED};
         for (int t = 0; t < 3; t++) {
             queues[s][t].rdma_session = &rdma_sessions[s];
             queues[s][t].cq = &cqs[s][t]; queues[s][t].qp = &qps[s][t];
@@ -249,7 +255,10 @@ static void init(void) {
             pthread_mutex_init(&queues[s][t].cq_lock, NULL);
         }
     }
-    pool_layout = (struct rswap_pool_layout){{1ULL << 21, 1ULL << 22}, 3ULL << 21, 2};
+    pool_layout = (struct rswap_pool_layout){
+        .server_pages = {2ULL << 21, 3ULL << 21}, .total_pages = 5ULL << 21,
+        .nr_servers = 2, .tier_pages = {{1ULL << 21, 1ULL << 21}, {1ULL << 21, 2ULL << 21}},
+    };
 }
 static void reset(struct page *p) {
     *p = (struct page){0};
@@ -290,14 +299,55 @@ static void *commit_thread(void *arg) {
     rswap_store_commit(arg); return NULL;
 }
 static void *invalidate_thread(void *arg) { rswap_invalidate_area(0); return NULL; }
+
+static void large_resolver(void) {
+    /* Actual address resolver at 3.5 TiB, without allocating remote data. */
+    struct remote_chunk large[2][224] = {{{0}}};
+    struct chunk_list saved[2];
+    struct rswap_pool_layout old = pool_layout;
+    const u64 cp = 1ULL << 21;
+    pool_layout = (struct rswap_pool_layout){
+        .server_pages = {224 * cp, 224 * cp}, .total_pages = 448 * cp,
+        .nr_servers = 2, .tier_pages = {{32 * cp, 192 * cp}, {32 * cp, 192 * cp}},
+    };
+    for (int s = 0; s < 2; s++) {
+        saved[s] = rdma_sessions[s].remote_mem_pool;
+        rdma_sessions[s].remote_mem_pool = (struct chunk_list){
+            .chunks = large[s], .chunk_num = 224, .dram_chunks = 32, .pmem_chunks = 192,
+        };
+        for (int c = 0; c < 224; c++)
+            large[s][c] = (struct remote_chunk){10000 + 400 * s + c,
+                (1ULL << 48) + ((u64)s << 44) + ((u64)c << 33), 1ULL << 33, MAPPED};
+    }
+    for (int s = 0; s < 2; s++) {
+        for (int t = 0; t < 2; t++) {
+            for (u64 c = 0; c < (t ? 192 : 32); c++) {
+                for (int last = 0; last < 2; last++) {
+                    struct rswap_remote_page remote;
+                    u64 slot = c * cp + (last ? cp - 1 : 0);
+                    u64 local = slot < 32 * cp ? 2 * slot + t : 32 * cp + slot;
+                    assert(!rswap_resolve_remote_page(2 * local + s, &remote));
+                    assert(remote.session == &rdma_sessions[s] && remote.tier == (unsigned)t);
+                    assert(remote.chunk == &large[s][c + (t ? 32 : 0)]);
+                    assert(remote.chunk_offset == (last ? (1ULL << 33) - PAGE_SIZE : 0));
+                }
+            }
+        }
+    }
+    for (int s = 0; s < 2; s++) rdma_sessions[s].remote_mem_pool = saved[s];
+    pool_layout = old;
+}
+
 int main(void) {
     struct page p;
     void *cookie;
     struct rswap_remote_page remote;
     init();
+    large_resolver();
     /* Actual resolver: tail, descriptor limits and address overflow. */
-    assert(!rswap_resolve_remote_page(1ULL << 22, &remote));
-    assert(remote.session == &rdma_sessions[1] && remote.chunk == &chunks[1][1] && !remote.chunk_offset);
+    assert(!rswap_resolve_remote_page(4ULL << 21, &remote));
+    assert(remote.session == &rdma_sessions[1] && remote.chunk == &chunks[1][2] && !remote.chunk_offset);
+    assert(remote.tier == RSWAP_TIER_PMEM);
     assert(rswap_resolve_remote_page(pool_layout.total_pages, &remote) == -ERANGE);
     chunks[1][0].chunk_state = EMPTY;
     assert(rswap_resolve_remote_page(1, &remote) == -ENXIO);
@@ -307,7 +357,26 @@ int main(void) {
     chunks[1][0].mapped_size = 1ULL << 33;
     chunks[1][0].remote_addr = UINT64_MAX - PAGE_SIZE + 1;
     assert(rswap_resolve_remote_page(1, &remote) == -EOVERFLOW);
-    chunks[1][0].remote_addr = 0x100000ULL + 2 * (1ULL << 34);
+    chunks[1][0].remote_addr = 0x100000ULL + 3 * (1ULL << 34);
+
+    /* Both Tiers on both Sessions use the selected MR/key and data opcode. */
+    for (int s = 0; s < 2; s++) {
+        for (int t = 0; t < 2; t++) {
+            assert(!rswap_resolve_remote_page(2 * t + s, &remote));
+            assert(remote.session == &rdma_sessions[s] && remote.tier == (unsigned)t);
+            assert(remote.chunk == &chunks[s][t] && !remote.chunk_offset);
+            for (int op = 0; op < 3; op++) {
+                struct fs_rdma_req req = {0};
+                reset(&p);
+                assert(!fs_build_rdma_wr(&queues[s][op], &req, &remote, &p));
+                assert(req.rdma_wr.rkey == (unsigned)(1000 + 10 * s + t));
+                assert(req.rdma_wr.remote_addr == chunks[s][t].remote_addr);
+                assert(req.rdma_wr.wr.opcode == (op == QP_STORE ? IB_WR_RDMA_WRITE : IB_WR_RDMA_READ));
+                ib_dma_unmap_page(devs[s].dev, req.dma_addr, PAGE_SIZE,
+                                 op == QP_STORE ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+            }
+        }
+    }
 
     for (int before = 0; before < 2; before++) {
         for (int error = 0; error < 2; error++) {

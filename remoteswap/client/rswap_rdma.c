@@ -79,37 +79,59 @@ static int wait_queue_state(struct rswap_rdma_queue *queue,
 int handle_recv_wr(struct rswap_rdma_queue *queue, struct ib_wc *wc)
 {
 	struct rdma_session_context *session = queue->rdma_session;
+	struct chunk_list *pool = &session->remote_mem_pool;
 	struct message *msg = session->rdma_recv_req.recv_buf;
-	unsigned int i;
+	unsigned int i, j;
 	u64 end;
 
 	ib_dma_sync_single_for_cpu(session->rdma_dev->dev,
 		session->rdma_recv_req.recv_dma_addr, sizeof(*msg), DMA_BIDIRECTIONAL);
-	if (wc->byte_len != sizeof(*msg) || msg->type != queue->expected_message)
+	if (wc->byte_len != sizeof(*msg) ||
+	    msg->protocol_version != RSWAP_PROTOCOL_VERSION ||
+	    msg->type != (enum message_type)queue->expected_message)
+		return -EPROTO;
+	if (msg->mapped_chunk <= 0 || msg->mapped_chunk > MAX_REGION_NUM ||
+	    !msg->dram_chunks || !msg->pmem_chunks ||
+	    (u64)msg->dram_chunks + msg->pmem_chunks != (u64)msg->mapped_chunk)
+		return -EPROTO;
+	/* The first AVAILABLE records topology; every later QP/reply must agree. */
+	if (pool->chunk_num &&
+	    (pool->chunk_num != (u32)msg->mapped_chunk ||
+	     pool->dram_chunks != msg->dram_chunks ||
+	     pool->pmem_chunks != msg->pmem_chunks))
 		return -EPROTO;
 
 	switch (msg->type) {
 	case AVAILABLE_TO_QUERY:
+		if (!pool->chunk_num) {
+			pool->chunk_num = msg->mapped_chunk;
+			pool->dram_chunks = msg->dram_chunks;
+			pool->pmem_chunks = msg->pmem_chunks;
+		}
 		WRITE_ONCE(queue->state, MEMORY_SERVER_AVAILABLE);
 		break;
 	case FREE_SIZE:
 		/* Learn the actual per-server capacity; never divide the total. */
-		if (msg->mapped_chunk <= 0 || msg->mapped_chunk > MAX_REGION_NUM)
+		if (!pool->chunk_num)
 			return -EPROTO;
-		session->remote_mem_pool.chunk_num = msg->mapped_chunk;
-		session->remote_mem_pool.remote_mem_size =
-			msg->mapped_chunk * REGION_SIZE_GB;
+		pool->remote_mem_size = pool->chunk_num * REGION_SIZE_GB;
 		WRITE_ONCE(queue->state, FREE_MEM_RECV);
 		break;
 	case GOT_CHUNKS:
-		if (!session->remote_mem_pool.chunks ||
-		    msg->mapped_chunk != session->remote_mem_pool.chunk_num)
+		if (!pool->chunks || !pool->chunk_num)
 			return -EPROTO;
-		for (i = 0; i < session->remote_mem_pool.chunk_num; i++) {
+		for (i = 0; i < pool->chunk_num; i++) {
 			if (!msg->buf[i] || (msg->buf[i] & (PAGE_SIZE - 1)) ||
 			    msg->mapped_size[i] != (u64)REGION_SIZE_GB * ONE_GB ||
 			    check_add_overflow(msg->buf[i], msg->mapped_size[i], &end))
 				return -EPROTO;
+			/* Only compare within this Session. Independent mmap ranges
+			 * need not be contiguous, ordered, or Chunk-aligned.
+			 */
+			for (j = 0; j < i; j++)
+				if (msg->buf[i] < msg->buf[j] + msg->mapped_size[j] &&
+				    msg->buf[j] < end)
+					return -EPROTO;
 		}
 		bind_remote_memory_chunks(session);
 		WRITE_ONCE(queue->state, RECEIVED_CHUNKS);
@@ -163,18 +185,33 @@ static int post_control_recv(struct rdma_session_context *session,
 int send_message_to_remote(struct rdma_session_context *session,
 		int index, int type, int chunks)
 {
-	struct rswap_rdma_queue *queue = &session->rdma_queues[index];
+	struct rswap_rdma_queue *queue;
+	struct message *msg = session->rdma_send_req.send_buf;
 	const struct ib_send_wr *bad;
 	int ret;
 
+	if (index != 0 || (type != QUERY && type != REQUEST_CHUNKS) ||
+	    (type == QUERY ? chunks != 0 :
+	     (chunks <= 0 || (unsigned int)chunks != session->remote_mem_pool.chunk_num)))
+		return -EINVAL;
+	queue = &session->rdma_queues[index];
+	/* Setup is serial; never overwrite a still-owned SEND buffer. */
+	if (atomic_read(&queue->rdma_post_counter))
+		return -EBUSY;
 	ret = post_control_recv(session, queue,
 		type == QUERY ? FREE_SIZE : GOT_CHUNKS);
 	if (ret)
 		return ret;
 	ib_dma_sync_single_for_cpu(session->rdma_dev->dev,
 		session->rdma_send_req.send_dma_addr, sizeof(struct message), DMA_BIDIRECTIONAL);
-	session->rdma_send_req.send_buf->type = type;
-	session->rdma_send_req.send_buf->mapped_chunk = chunks;
+	memset(msg, 0, sizeof(*msg));
+	msg->protocol_version = RSWAP_PROTOCOL_VERSION;
+	msg->type = type;
+	if (type == REQUEST_CHUNKS) {
+		msg->mapped_chunk = chunks;
+		msg->dram_chunks = session->remote_mem_pool.dram_chunks;
+		msg->pmem_chunks = session->remote_mem_pool.pmem_chunks;
+	}
 	ib_dma_sync_single_for_device(session->rdma_dev->dev,
 		session->rdma_send_req.send_dma_addr, sizeof(struct message), DMA_BIDIRECTIONAL);
 	atomic_inc(&queue->rdma_post_counter);
@@ -463,10 +500,14 @@ int rdma_session_connect(struct rdma_session_context *session)
 	if (!ret)
 		ret = READ_ONCE(session->error);
 	if (!ret)
-		pr_info("rswap: server=%u ready queues=%d capacity=%u GiB regions=%u\n",
-			session->server_id, num_queues,
+		pr_info("rswap: server=%u ready protocol=%u queues=%d capacity=%u GiB regions=%u DRAM=%u GiB/%u chunks PMem=%u GiB/%u chunks\n",
+			session->server_id, RSWAP_PROTOCOL_VERSION, num_queues,
 			session->remote_mem_pool.remote_mem_size,
-			session->remote_mem_pool.chunk_num);
+			session->remote_mem_pool.chunk_num,
+			(unsigned int)(session->remote_mem_pool.dram_chunks * REGION_SIZE_GB),
+			session->remote_mem_pool.dram_chunks,
+			(unsigned int)(session->remote_mem_pool.pmem_chunks * REGION_SIZE_GB),
+			session->remote_mem_pool.pmem_chunks);
 	return ret;
 }
 

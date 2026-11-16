@@ -5,6 +5,8 @@
 
 #define RSWAP_MAX_SERVERS 2
 
+enum rswap_tier { RSWAP_TIER_DRAM, RSWAP_TIER_PMEM, RSWAP_NR_TIERS };
+
 struct rswap_endpoint {
 	const char *ip;
 	u16 port;

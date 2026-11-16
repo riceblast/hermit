@@ -94,10 +94,12 @@ class ManageConfigTest(unittest.TestCase):
         self.assertNotIn("Server 1:", result.stdout)
 
     def test_unequal_total_is_forwarded(self):
-        self.config.write_text(DUAL.replace("POOL_GIB=16", "POOL_GIB=24"))
-        result = self.run_script()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("rmsize=24", self.calls()[0])
+        for gib in (24, 3080, 3584):
+            with self.subTest(gib=gib):
+                self.config.write_text(DUAL.replace("POOL_GIB=16", f"POOL_GIB={gib}"))
+                result = self.run_script()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"rmsize={gib}", self.calls()[-1])
 
     def test_invalid_or_missing_values_never_invoke_module_commands(self):
         cases = [DUAL.replace("NR_SERVERS=2", "NR_SERVERS=3"),

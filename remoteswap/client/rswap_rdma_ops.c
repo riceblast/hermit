@@ -19,6 +19,7 @@ static atomic_t area_submissions = ATOMIC_INIT(0);
 struct rswap_remote_page {
 	struct rdma_session_context *session;
 	struct remote_chunk *chunk;
+	unsigned int tier;
 	u64 chunk_offset;
 };
 
@@ -209,10 +210,10 @@ static int rswap_resolve_remote_page(pgoff_t offset,
 	struct rdma_session_context *session;
 	struct remote_chunk *chunk;
 	u64 slot, byte_offset, chunk_idx, chunk_offset, end;
-	unsigned int server;
+	unsigned int server, tier, tier_chunks;
 	int ret;
 
-	ret = rswap_map_page(&pool_layout, offset, &server, &slot);
+	ret = rswap_map_page(&pool_layout, offset, &server, &tier, &slot);
 	if (ret)
 		return ret;
 	session = &rdma_sessions[server];
@@ -223,6 +224,12 @@ static int rswap_resolve_remote_page(pgoff_t offset,
 	byte_offset = slot << PAGE_SHIFT;
 	chunk_idx = byte_offset >> CHUNK_SHIFT;
 	chunk_offset = byte_offset & CHUNK_MASK;
+	tier_chunks = tier == RSWAP_TIER_DRAM ? session->remote_mem_pool.dram_chunks :
+		session->remote_mem_pool.pmem_chunks;
+	if (chunk_idx >= tier_chunks)
+		return -ERANGE;
+	if (tier == RSWAP_TIER_PMEM)
+		chunk_idx += session->remote_mem_pool.dram_chunks;
 	if (chunk_idx >= session->remote_mem_pool.chunk_num)
 		return -ERANGE;
 	chunk = &session->remote_mem_pool.chunks[chunk_idx];
@@ -237,6 +244,7 @@ static int rswap_resolve_remote_page(pgoff_t offset,
 
 	remote->session = session;
 	remote->chunk = chunk;
+	remote->tier = tier;
 	remote->chunk_offset = chunk_offset;
 	return 0;
 }
@@ -536,6 +544,10 @@ int rswap_client_init(const struct rswap_client_config *config)
 		total_gib += session->remote_mem_pool.remote_mem_size;
 		layout.server_pages[id] =
 			((u64)session->remote_mem_pool.remote_mem_size << GB_SHIFT) >> PAGE_SHIFT;
+		layout.tier_pages[id][RSWAP_TIER_DRAM] =
+			(u64)session->remote_mem_pool.dram_chunks << (CHUNK_SHIFT - PAGE_SHIFT);
+		layout.tier_pages[id][RSWAP_TIER_PMEM] =
+			(u64)session->remote_mem_pool.pmem_chunks << (CHUNK_SHIFT - PAGE_SHIFT);
 		layout.total_pages += layout.server_pages[id];
 	}
 	for (id = 0; id < active_servers; id++) {
@@ -557,7 +569,7 @@ int rswap_client_init(const struct rswap_client_config *config)
 		pr_err("rswap: statistics interface initialization failed: %d\n", ret);
 		goto fail;
 	}
-	pr_info("rswap: pool ready servers=%u total=%u GiB (4-KiB swap ready)\n",
+	pr_info("rswap: pool ready servers=%u total=%u GiB (two-level page interleave, 4-KiB swap ready)\n",
 		active_servers, total_gib);
 	return 0;
 fail:

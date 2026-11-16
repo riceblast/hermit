@@ -1,16 +1,20 @@
 # Remoteswap
 
-**Development stage: Patch 5 Server (NUMA-bound DRAM/PMem pool, control protocol v2).**
+**Development stage: Patch 6 (protocol v2 Client and two-level page interleave).**
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
-Client protocol adaptation is pending: the Patch 1–4 Client cannot connect to this Server.
+Client 1.6 discovers each Server's DRAM/PMem topology and interleaves first across
+Servers, then across the selected Server's Tiers. Each level stripes its common
+capacity and appends the larger side's tail. See the [Patch 6 guide](tests/patch6-client.md)
+for capacity limits, local checks and the minimal hardware acceptance plan.
+Use matching protocol v2 builds; the Patch 1–4 Client cannot connect to this Server.
 The historical Server command lines below and in Patch 1–4 test guides no longer apply.
 
-The following Client capabilities describe the completed Patch 4 baseline:
 The Client discovers each selected Server's capacity and checks the configured sum.
-Static routing interleaves the common capacity and appends the larger Server's tail;
-single-server pools map directly. Multi-session polling, request retirement and
+Single-server pools still interleave DRAM/PMem. Multi-session polling, request retirement and
 managed Frontswap publication now permit one swap area no larger than the pool.
 Use 4-KiB pages; disable THP for validation workloads. Whole-THP remote I/O is rejected.
+Per-Server statistics remain in Patch 4 format; Tier statistics and placement trace
+are reserved for Patch 7. Current configuration expects two 48-GiB Servers (96 GiB total).
 
 Deploy the rebuilt kernel and Client together: the module now requires
 `frontswap_register_managed_ops_v2`, preventing accidental use with the older kernel.

@@ -3,6 +3,9 @@
 范围：只修改 Server、共享协议和 Server 构建依赖。Client 解析与两级映射尚未修改，
 本版本不兼容旧 Client。没有修改内核、Client Completion、Frontswap 或统计。
 
+以上记录 Patch 5 Server 交接时的状态；后续 Client v2 适配和两级映射见
+[Patch 6](patch6-client.md)。本文中的 Client 待办保留为协议约定与交接参考。
+
 ## 构建与启动
 
 需要 C++11、libnuma 开发头文件／库，以及原有 RDMA CM／ibverbs／OFED 依赖。

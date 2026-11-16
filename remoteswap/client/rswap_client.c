@@ -6,9 +6,9 @@
 #include "constants.h"
 
 MODULE_AUTHOR("Chenxi Wang, Yifan Qiao");
-MODULE_DESCRIPTION("Hermit single/dual-server remote pool with per-server RDMA statistics");
+MODULE_DESCRIPTION("Hermit single/dual-server DRAM/PMem pool with two-level page interleave");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_VERSION("1.4");
+MODULE_VERSION("1.6");
 
 static char server_ip[INET_ADDRSTRLEN];
 static char server_ip2[INET_ADDRSTRLEN];

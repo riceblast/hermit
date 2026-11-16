@@ -13,113 +13,132 @@ HARNESS = r"""
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
-
-/* Kernel scalar aliases used by the header; no alternative mapping code. */
 typedef uint64_t u64;
 typedef uint16_t u16;
 #include "rswap_mapping.h"
 
-static void expect(const struct rswap_pool_layout *pool, u64 offset,
-                   unsigned int expected_server, u64 expected_slot)
+static struct rswap_pool_layout layout(u64 a, u64 b, u64 c, u64 d)
 {
-    unsigned int server;
-    u64 slot;
-
-    assert(rswap_map_page(pool, offset, &server, &slot) == 0);
-    assert(server == expected_server);
-    assert(slot == expected_slot);
+    struct rswap_pool_layout p = {
+        .server_pages = {a + b, c + d}, .total_pages = a + b + c + d,
+        .nr_servers = c || d ? 2 : 1, .tier_pages = {{a, b}, {c, d}},
+    };
+    return p;
 }
 
-static void small_pools(void)
+static void expect(const struct rswap_pool_layout *p, u64 offset,
+                   unsigned int server, unsigned int tier, u64 slot)
 {
-    unsigned int a, b, server;
+    unsigned int s, t;
+    u64 v;
+    assert(!rswap_map_page(p, offset, &s, &t, &v));
+    assert(s == server && t == tier && v == slot);
+}
+
+static void exhaustive(void)
+{
+    unsigned int a, b, c, d, s, t;
     u64 offset, slot;
-
-    for (a = 1; a <= 64; a++) {
-        struct rswap_pool_layout single = {{a, 0}, a, 1};
-
-        for (offset = 0; offset < a; offset++)
-            expect(&single, offset, 0, offset);
-        assert(rswap_map_page(&single, a, &server, &slot) == -ERANGE);
-
-        for (b = 1; b <= 64; b++) {
-            struct rswap_pool_layout pool = {{a, b}, a + b, 2};
-            unsigned char seen[2][64] = {{0}};
-
-            for (offset = 0; offset < pool.total_pages; offset++) {
-                assert(rswap_map_page(&pool, offset, &server, &slot) == 0);
-                assert(server < 2 && slot < pool.server_pages[server]);
-                assert(!seen[server][slot]);
-                seen[server][slot] = 1;
-            }
-            for (server = 0; server < 2; server++)
-                for (slot = 0; slot < pool.server_pages[server]; slot++)
-                    assert(seen[server][slot]);
-            assert(rswap_map_page(&pool, a + b, &server, &slot) == -ERANGE);
-        }
-    }
+    /* Both layers' independent tails, in either direction. */
+    for (a = 1; a <= 8; a++)
+        for (b = 1; b <= 8; b++)
+            for (c = 0; c <= 8; c++)
+                for (d = c ? 1 : 0; d <= (c ? 8 : 0); d++) {
+                    struct rswap_pool_layout p = layout(a, b, c, d);
+                    unsigned char seen[2][2][8] = {{{0}}};
+                    for (offset = 0; offset < p.total_pages; offset++) {
+                        assert(!rswap_map_page(&p, offset, &s, &t, &slot));
+                        assert(s < p.nr_servers && t < 2);
+                        assert(slot < p.tier_pages[s][t]);
+                        assert(!seen[s][t][slot]);
+                        seen[s][t][slot] = 1;
+                    }
+                    for (s = 0; s < p.nr_servers; s++)
+                        for (t = 0; t < 2; t++)
+                            for (slot = 0; slot < p.tier_pages[s][t]; slot++)
+                                assert(seen[s][t][slot]);
+                    assert(rswap_map_page(&p, p.total_pages, &s, &t, &slot) == -ERANGE);
+                }
 }
 
-static void real_pool(u64 a, u64 b)
+/* Independent inverse: locate a particular target Slot in the logical pool. */
+static u64 inverse(unsigned int target, u64 slot, u64 a, u64 b)
 {
-    const u64 chunk_pages = 8ULL << (30 - 12);
-    const u64 common = a < b ? a : b;
-    struct rswap_pool_layout pool = {{a, b}, a + b, b ? 2 : 1};
-    unsigned int server;
+    u64 common = a < b ? a : b;
+    return slot < common ? 2 * slot + target : common + slot;
+}
+
+static void real_pool(u64 a, u64 b, u64 c, u64 d)
+{
+    const u64 gib_pages = 1ULL << 18, chunk_pages = 1ULL << 21;
+    struct rswap_pool_layout p = layout(a * gib_pages, b * gib_pages,
+                                        c * gib_pages, d * gib_pages);
+    unsigned int s, t;
     u64 slot;
-
-    expect(&pool, 0, 0, 0);
-    expect(&pool, 1, b ? 1 : 0, b ? 0 : 1);
-    if (b) {
-        expect(&pool, 2 * common - 2, 0, common - 1);
-        expect(&pool, 2 * common - 1, 1, common - 1);
-        if (a != b)
-            expect(&pool, 2 * common, a > b ? 0 : 1, common);
-        expect(&pool, pool.total_pages - 1, a > b ? 0 : 1,
-               (a > b ? a : b) - 1);
-    } else {
-        expect(&pool, a - 1, 0, a - 1);
-    }
-
-    /* Check both sides of every server-local 8-GiB chunk boundary. */
-    for (server = 0; server < pool.nr_servers; server++) {
-        u64 boundary;
-
-        for (boundary = chunk_pages;
-             boundary < pool.server_pages[server]; boundary += chunk_pages) {
-            for (slot = boundary - 1; slot <= boundary; slot++) {
-                u64 offset = !b ? slot : slot < common ?
-                             2 * slot + server : common + slot;
-
-                expect(&pool, offset, server, slot);
+    for (s = 0; s < p.nr_servers; s++) {
+        for (t = 0; t < 2; t++) {
+            u64 n = p.tier_pages[s][t], boundary;
+            /* Every Chunk boundary, including Tier endpoints. */
+            for (boundary = 0; boundary <= n; boundary += chunk_pages) {
+                int delta;
+                for (delta = -1; delta <= 1; delta++) {
+                    if ((!boundary && delta < 0) ||
+                        (boundary == n && delta >= 0))
+                        continue;
+                    slot = boundary + delta;
+                    u64 local = inverse(t, slot, p.tier_pages[s][0], p.tier_pages[s][1]);
+                    u64 offset = p.nr_servers == 1 ? local :
+                        inverse(s, local, p.server_pages[0], p.server_pages[1]);
+                    assert(offset < p.total_pages);
+                    expect(&p, offset, s, t, slot);
+                }
             }
         }
     }
-    assert(rswap_map_page(&pool, pool.total_pages, &server, &slot) == -ERANGE);
-    assert(rswap_map_page(&pool, UINT64_MAX, &server, &slot) == -ERANGE);
+    assert(rswap_map_page(&p, p.total_pages, &s, &t, &slot) == -ERANGE);
+    assert(rswap_map_page(&p, UINT64_MAX, &s, &t, &slot) == -ERANGE);
 }
 
 int main(void)
 {
-    const u64 gib_pages = 1ULL << (30 - 12);
-    struct rswap_pool_layout empty = {0};
-    struct rswap_pool_layout too_many = {{1, 1}, 2, 3};
-    unsigned int server;
+    const u64 gib = 1ULL << 18;
+    unsigned int s, t;
     u64 slot;
-
-    assert(rswap_map_page(&empty, 0, &server, &slot) == -ENODEV);
-    assert(rswap_map_page(&too_many, 0, &server, &slot) == -ENODEV);
-    small_pools();
-    real_pool(8 * gib_pages, 0);
-    real_pool(64 * gib_pages, 0);
-    real_pool(8 * gib_pages, 8 * gib_pages);
-    real_pool(8 * gib_pages, 16 * gib_pages);
-    real_pool(16 * gib_pages, 8 * gib_pages);
-    real_pool(3200 * gib_pages, 0);
-    real_pool(3200 * gib_pages, 3200 * gib_pages);
-    real_pool(8 * gib_pages, 3200 * gib_pages);
-    real_pool(3200 * gib_pages, 8 * gib_pages);
-    puts("PASS: exhaustive small pools and real-capacity mapping boundaries");
+    struct rswap_pool_layout empty = {0};
+    struct rswap_pool_layout p = layout(16 * gib, 32 * gib, 16 * gib, 32 * gib);
+    assert(rswap_map_page(&empty, 0, &s, &t, &slot) == -ENODEV);
+    expect(&p, 0, 0, 0, 0); /* Original offset, no subtraction of header. */
+    expect(&p, 1, 1, 0, 0);
+    expect(&p, 2, 0, 1, 0);
+    expect(&p, 3, 1, 1, 0);
+    expect(&p, 4, 0, 0, 1);
+    expect(&p, 64 * gib - 2, 0, 1, 16 * gib - 1);
+    expect(&p, 64 * gib - 1, 1, 1, 16 * gib - 1);
+    expect(&p, 64 * gib, 0, 1, 16 * gib);
+    expect(&p, 96 * gib - 1, 1, 1, 32 * gib - 1);
+    p.nr_servers = 3;
+    assert(rswap_map_page(&p, 0, &s, &t, &slot) == -ENODEV);
+    p = layout(1, 0, 0, 0);
+    assert(rswap_map_page(&p, 0, &s, &t, &slot) == -ENODEV);
+    p = layout(1, 1, 0, 0);
+    p.server_pages[0] = 3; p.total_pages = 3;
+    assert(rswap_map_page(&p, 2, &s, &t, &slot) == -ERANGE);
+    exhaustive();
+    real_pool(8, 8, 0, 0);
+    real_pool(16, 32, 0, 0);
+    real_pool(32, 16, 0, 0);
+    real_pool(16, 32, 16, 32);
+    real_pool(8, 16, 16, 8); /* Equal Server totals, opposite Tier ratios. */
+    real_pool(16, 16, 16, 32);
+    real_pool(16, 32, 16, 16);
+    real_pool(256, 1280, 256, 1280); /* 3 TiB. */
+    real_pool(256, 1280, 256, 1288); /* Above 3 TiB. */
+    real_pool(256, 1536, 512, 1024); /* Both layers have tails; 3.25 TiB. */
+    real_pool(256, 1536, 256, 1536); /* 3.5 TiB total. */
+    real_pool(8, 3192, 8, 376); /* One Server at 400 Chunks; 3.5 TiB total. */
+    real_pool(8, 376, 8, 3192);
+    real_pool(8, 3192, 3192, 8); /* Existing protocol ceiling, 6400 GiB. */
+    puts("PASS: two-level bijection, all Chunk/tail boundaries, 3--3.5 TiB and protocol ceiling");
     return 0;
 }
 """
