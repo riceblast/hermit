@@ -83,6 +83,17 @@ static int atomic_cmpxchg(atomic_t *p, int old, int value) {
 #define trace_printk(...) ((void)0)
 static void mock_trace_placement(unsigned int, u64, unsigned int, unsigned int, int, int);
 #define trace_placement(...) mock_trace_placement(__VA_ARGS__)
+static bool sample_enabled;
+static unsigned int sample_calls;
+static u64 sampled_ns, sampled_pfn, sampled_offset;
+static int sampled_ret;
+static unsigned int sampled_type;
+#define trace_store_sample_enabled() sample_enabled
+#define trace_store_sample(ns, pfn, type, offset, ret) do { \
+    sample_calls++; sampled_ns = (ns); sampled_pfn = (pfn); sampled_type = (type); \
+    sampled_offset = (offset); sampled_ret = (ret); \
+} while (0)
+#define page_to_pfn(p) ((u64)(uintptr_t)(p) >> 12)
 #define pr_err_ratelimited(...) ((void)0)
 #define wake_up_all(p) ((void)(p))
 #define cpu_relax() sched_yield()
@@ -286,6 +297,7 @@ static void reset(struct page *p) {
     alloc_error = map_error = post_error = wc_error = immediate = pins = 0;
     expected_offset = 1; trace_enabled = true; trace_calls = 0;
     expected_trace_op = -1;
+    sample_enabled = true; sample_calls = 0;
     atomic_store(&frees, 0); atomic_store(&maps, 0); atomic_store(&unmaps, 0);
     atomic64_set(&unrouted_error, 0);
     for (int s = 0; s < 2; s++) {
@@ -496,6 +508,8 @@ int main(void) {
     for (int error = 0; error < 2; error++) {
         reset(&p); wc_error = error;
         assert(rswap_store_prepare(0, 1, &p, -1, &cookie) == (error ? -EIO : 0));
+        assert(sample_calls == 1 && sampled_ns == 1 && sampled_pfn == page_to_pfn(&p));
+        assert(sampled_type == 0 && sampled_offset == 1 && sampled_ret == 0);
         assert(atomic_load(&p.locked));
         if (!error) { atomic_store(&p.valid, 1); rswap_store_commit(cookie); }
         retired(&p, !error);
@@ -508,6 +522,7 @@ int main(void) {
         if (failure == 2) post_error = -EIO;
         if (failure == 3) p.compound = true;
         assert(rswap_store_prepare(0, 1, &p, -1, &cookie) < 0 && !cookie);
+        assert(sample_calls == 1 && sampled_ret < 0);
         assert(atomic_load(&p.locked) && atomic_load(&p.refs) == 1 && !pins);
         assert(!atomic_load(&queues[1][0].rdma_post_counter));
         assert(atomic_load(&maps) == atomic_load(&unmaps));
@@ -517,7 +532,9 @@ int main(void) {
     }
     /* Node 0 empty, node 1 pending: CPU-only polling must still complete it. */
     reset(&p);
+    sample_enabled = false;
     assert(!rswap_store_prepare(0, 1, &p, 0, &cookie));
+    assert(!sample_calls);
     atomic_store(&p.valid, 1); rswap_store_commit(cookie);
     cqs[1][0].hold = true;
     assert(rswap_poll_cpu(0, QP_STORE, true) == 1);

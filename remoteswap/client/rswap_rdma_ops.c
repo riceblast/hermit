@@ -352,16 +352,25 @@ static int rswap_store_prepare(unsigned int type, pgoff_t offset,
 {
 	struct fs_rdma_req *req;
 	int cpu, ret;
+	bool sample;
+	u64 sample_ns = 0, sample_pfn = 0;
 
 	*cookie = NULL;
 	if (type != READ_ONCE(area_type)) {
 		rswap_stats_submit_error(NULL, RSWAP_NR_TIERS, QP_STORE);
 		return -EINVAL;
 	}
+	sample = trace_store_sample_enabled();
+	if (sample) {
+		sample_ns = ktime_get_ns();
+		sample_pfn = page_to_pfn(page);
+	}
 	cpu = core == -1 ? get_cpu() : core;
 	ret = rswap_rdma_submit(cpu, offset, page, QP_STORE, &req);
 	if (core == -1)
 		put_cpu();
+	if (sample)
+		trace_store_sample(sample_ns, sample_pfn, type, (u64)offset, ret);
 	if (ret)
 		return ret;
 	if (core == -1) {

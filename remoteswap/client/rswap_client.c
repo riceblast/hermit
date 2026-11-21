@@ -6,9 +6,9 @@
 #include "constants.h"
 
 MODULE_AUTHOR("Chenxi Wang, Yifan Qiao");
-MODULE_DESCRIPTION("Hermit DRAM/PMem interleave pool with per-Tier RDMA stats and placement trace");
+MODULE_DESCRIPTION("Hermit interleave pool with per-Tier stats and hotness observation trace");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_VERSION("1.7");
+MODULE_VERSION("1.8");
 
 static char server_ip[INET_ADDRSTRLEN];
 static char server_ip2[INET_ADDRSTRLEN];

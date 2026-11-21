@@ -1,8 +1,8 @@
 # Remoteswap
 
-**Development stage: Patch 7 (per-Tier RDMA statistics and optional placement trace).**
+**Development stage: Patch 8 (userspace window hotness and optional Store PFN observation).**
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
-Client 1.7 discovers each Server's DRAM/PMem topology and interleaves first across
+Client 1.8 discovers each Server's DRAM/PMem topology and interleaves first across
 Servers, then across the selected Server's Tiers. Each level stripes its common
 capacity and appends the larger side's tail. See the [Patch 6 guide](tests/patch6-client.md)
 for capacity limits, local checks and the minimal hardware acceptance plan.
@@ -18,6 +18,13 @@ bandwidth. The optional `rswap:placement` event is disabled by default; see the
 [Patch 7 guide](tests/patch7-client.md) for the interface and core acceptance plan.
 Use the updated Python tools; old stats v1 snapshots are not supported.
 Current configuration expects two 48-GiB Servers (96 GiB total).
+
+The independent `tools/rswap_hotness` sampler observes a PID or launches a command,
+tracks activity over a configurable window, and exports per-page heat and means.
+The disabled-by-default `rswap:store_sample` event and offline checker correlate
+prior heat snapshots with Store PFNs. Placement remains static interleave;
+dynamic Slots and adaptive placement are not implemented by Patch 8.
+See the [Patch 8 guide](tests/patch8-monitor.md) for builds, semantics and hardware validation.
 
 Deploy the rebuilt kernel and Client together: the module now requires
 `frontswap_register_managed_ops_v2`, preventing accidental use with the older kernel.

@@ -7,6 +7,31 @@
 
 #include <linux/tracepoint.h>
 
+/* Observation only: ret is submission status, not terminal WC status.
+ * start_ns uses CLOCK_MONOTONIC, independent of the configured ftrace clock.
+ */
+TRACE_EVENT(store_sample,
+	TP_PROTO(u64 start_ns, u64 pfn, unsigned int swap_type, u64 offset, int ret),
+	TP_ARGS(start_ns, pfn, swap_type, offset, ret),
+	TP_STRUCT__entry(
+		__field(u64, start_ns)
+		__field(u64, pfn)
+		__field(unsigned int, swap_type)
+		__field(u64, offset)
+		__field(int, ret)
+	),
+	TP_fast_assign(
+		__entry->start_ns = start_ns;
+		__entry->pfn = pfn;
+		__entry->swap_type = swap_type;
+		__entry->offset = offset;
+		__entry->ret = ret;
+	),
+	TP_printk("start_ns=%llu pfn=%llu swap_type=%u offset=%llu submit_ret=%d",
+		(unsigned long long)__entry->start_ns, (unsigned long long)__entry->pfn,
+		__entry->swap_type, (unsigned long long)__entry->offset, __entry->ret)
+);
+
 /* One event per terminal data WC, before request retirement. Disabled by default. */
 TRACE_EVENT(placement,
 	TP_PROTO(unsigned int swap_type, u64 offset, unsigned int server,
