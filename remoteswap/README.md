@@ -25,6 +25,7 @@ The disabled-by-default `rswap:store_sample` event and offline checker correlate
 prior heat snapshots with Store PFNs. Placement remains static interleave;
 dynamic Slots and adaptive placement are not implemented by Patch 8.
 See the [Patch 8 guide](tests/patch8-monitor.md) for builds, semantics and hardware validation.
+Copyable core acceptance commands are in [Patch 8 core tests](tests/patch8-core-smoke.md).
 
 Deploy the rebuilt kernel and Client together: the module now requires
 `frontswap_register_managed_ops_v2`, preventing accidental use with the older kernel.
