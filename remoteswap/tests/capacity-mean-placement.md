@@ -114,7 +114,8 @@ decision Trace 继续使用全数字字段，新增实际阈值、policy/source/
 
 ## 本地验证与后续实机计划
 
-本轮只编译与无特权验证，不加载模块、不启用 swap、不运行实机 BFS。
+实现阶段仅编译与无特权验证；随后按要求只运行了一次 BFS，结果见文末。
+下列独立专项及同条件对照尚未执行，当前不自动追加实验。
 
 本地检查覆盖：真实 C 比例裁剪/部分已知样本/桶内截断/全零/同值/大数乘积；
 真实上传到内核 staging/COMMIT、旧 ABI 拒绝、非法阈值不影响已发布代；
@@ -122,7 +123,7 @@ decision Trace 继续使用全数字字段，新增实际阈值、policy/source/
 实际 sampler→Client 桥接、直方图重算、历史阈值继承及逐页/Trace 关联。
 复用全组生命周期、Completion、mapping、失败路径与旧日志回归。
 
-下一轮实机建议：
+尚未执行的新策略实机验证：
 
 1. 小工作集构造含热/次热/零/未知的分布，确认 μ 与 T 分开、裁剪结果正确；
    验证零/未知仍按原 offset Interleave，正热度等于 T 进入 DRAM。
@@ -132,7 +133,9 @@ decision Trace 继续使用全数字字段，新增实际阈值、policy/source/
    建议核对并使用既有 64 GiB swap，避免 80 GiB 在当前 16:32 Tier 布局中的 PMem 尾段偏好。
    分别汇报 Interleave/Adaptive Read、Write、总带宽，零热度 Interleave、正热度分类及 Fallback。
 
-放置比例和实际带宽是测量结果，不把“DRAM 必须更高”写成机制正确性的保证。
+当前期望完整 Adaptive 阶段两 Server 合计的成功 Read+Write 逻辑带宽满足 DRAM>PMem，
+分列 Read/Write，未设最低领先幅度；这是实验观察目标，不是机制正确性的保证。
+本次单轮达到 +1.38%，尚无同条件 A/B 或重复性结论；统一进展见 [Patch 11 总结](patch11-monitoring.md)。
 
 ### 2026-11-23 本地结果
 
