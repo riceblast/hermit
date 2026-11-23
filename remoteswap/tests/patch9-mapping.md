@@ -5,7 +5,8 @@
 在已完成的 Task 1/2 与 Patch 8 上，解除 swap offset 与远端物理位置的固定关系：
 Store 分配位置，Load 查询映射，Frontswap invalidate 结束映射，最后一个请求退出后归还 Slot。
 Client 为 **1.9**；Server 控制协议 **v2**、带宽 stats **v2**、managed Frontswap **v2** 不变。
-本 Patch 不修改 Server、内核核心、CQ 类型、QP 布局、polling/drain 机制或冷热采样语义。
+初版不修改内核核心；复核后增加 `mm/memory.c` 的失败读取/PTE 复核修复，
+**实机验收前需要安装并重启到重编译内核**。Server、CQ 类型、QP 布局、polling/drain 机制及冷热采样语义不变。
 不上传热度、不启用 Adaptive、不做迁移、重连、故障恢复或 PMem 持久化恢复。
 
 本轮已实现并进行本地构建、逻辑回归和用户态 stub sanitizer 检查。
@@ -163,8 +164,9 @@ ASan/UBSan 检查适用于用户态 stub，不能替代内核/HCA/DMA 验收。
 
 ## 待执行的实机验收方案
 
-需要 sudo 的宿主机命令仍由操作者执行。本轮不安装内核，不修改 Server；
-不要直接复制要求版本 1.8 的 Patch 8 核心脚本执行。
+以下矩阵是初版计划。按用户最新要求，复核修复后的验收收缩为双节点核心页面检查＋一次 BFS，
+具体目标、更新内核和协作流程以 [Patch 9 核心验收](patch9-core-smoke.md) 为准。
+需要 sudo 的宿主机命令仍由操作者执行，不修改 Server；不要直接复制要求版本 1.8 的 Patch 8 核心脚本执行。
 
 | 阶段 | 配置/操作 | 必须看到的结果 |
 | --- | --- | --- |

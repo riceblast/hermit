@@ -188,7 +188,9 @@ static void initialization(void) {
     struct rswap_pool_layout p = layout(2,2,0,0);
     for (int failure = 0; failure < 2; failure++) {
         mapping_alloc_fail_after = failure;
+        mapping_alloc_calls = 0;
         assert(rswap_mapping_init(&p) == -ENOMEM);
+        assert(mapping_alloc_calls == (unsigned int)failure + 1);
         assert(!mapping.index && !mapping.slots && !mapping.layout.total_pages);
     }
     mapping_alloc_fail_after = -1;

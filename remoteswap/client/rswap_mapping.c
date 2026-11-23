@@ -130,11 +130,11 @@ int rswap_mapping_init(const struct rswap_pool_layout *layout)
 		return -EINVAL;
 	mapping.layout = *layout;
 	mapping.index = kvcalloc(total, sizeof(*mapping.index), GFP_KERNEL);
+	if (!mapping.index)
+		goto no_memory;
 	mapping.slots = kvcalloc(total, sizeof(*mapping.slots), GFP_KERNEL);
-	if (!mapping.index || !mapping.slots) {
-		rswap_mapping_destroy();
-		return -ENOMEM;
-	}
+	if (!mapping.slots)
+		goto no_memory;
 	for (s = 0; s < layout->nr_servers; s++) {
 		for (t = 0; t < RSWAP_NR_TIERS; t++) {
 			struct rswap_slot_pool *pool = &mapping.pools[s][t];
@@ -155,6 +155,9 @@ int rswap_mapping_init(const struct rswap_pool_layout *layout)
 	pr_info("rswap: dynamic mapping pages=%llu metadata_bytes=%llu (12 bytes/page)\n",
 		(unsigned long long)total, (unsigned long long)(total * 12));
 	return 0;
+no_memory:
+	rswap_mapping_destroy();
+	return -ENOMEM;
 }
 
 void rswap_mapping_destroy(void)

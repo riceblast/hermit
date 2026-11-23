@@ -3837,8 +3837,18 @@ vm_fault_t do_swap_page_profiling(struct vm_fault *vmf, int *adc_pf_bits,
 		adc_pf_breakdown_end(pf_breakdown, ADC_PAGE_IO, pf_cycles_end());
 	}
 	if (unlikely(!PageUptodate(page))) {
-		ret = VM_FAULT_SIGBUS;
-		goto out_page;
+		/* A concurrent fault or unmap may have retired this swap entry
+		 * while the read was in flight (or before a speculative lookup).
+		 * Report an I/O error only if this PTE still needs that read.
+		 * Keep failed data out of KSM, rmap and swap accounting below.
+		 */
+		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+					     vmf->address, &vmf->ptl);
+		if (pte_same(*vmf->pte, vmf->orig_pte))
+			ret = VM_FAULT_SIGBUS;
+		adc_pf_breakdown_end(pf_breakdown, ADC_UPD_METADATA,
+				     pf_cycles_end());
+		goto out_nomap;
 	}
 	page = hermit_ksm_might_need_to_copy(page, vma, vmf->address, cpu);
 	if (unlikely(!page)) {

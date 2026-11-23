@@ -11,7 +11,9 @@ typedef uint32_t u32;
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define DEFINE_SPINLOCK(name) pthread_mutex_t name = PTHREAD_MUTEX_INITIALIZER
 static int mapping_alloc_fail_after = -1;
+static unsigned int mapping_alloc_calls;
 static void *mapping_calloc(size_t n, size_t size, int flags) {
+    mapping_alloc_calls++;
     if (mapping_alloc_fail_after == 0) return NULL;
     if (mapping_alloc_fail_after > 0) mapping_alloc_fail_after--;
     return calloc(n, size);

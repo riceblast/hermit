@@ -36,7 +36,9 @@ The [Patch 8 core tests](tests/patch8-core-smoke.md) target Client 1.8; use the 
 acceptance plan for this version.
 
 Use the matching Hermit kernel exporting `frontswap_register_managed_ops_v2`.
-Patch 9 only needs the rebuilt Client when that kernel is already deployed.
+The Patch 9 review fix also changes swap-fault error/PTE validation in the kernel:
+rebuild, install and reboot before hardware acceptance, even if v2 is already present.
+See the [minimal core acceptance and kernel handoff](tests/patch9-core-smoke.md).
 The kernel release string is unchanged, so `uname -r` alone does not identify this build.
 See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.
 Use the [Patch 3 hardware test guide](tests/patch3-smoke.md) for commands and expected results.

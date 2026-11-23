@@ -93,12 +93,12 @@ static void rswap_store_put(struct fs_rdma_req *req)
 		if (req->status) {
 			set_page_dirty(page);
 			ClearPageReclaim(page);
-			/* commit already published the bit, so it cannot reappear
-			 * after this invalidate. The dirty local copy stays resident.
-			 */
 			/* The page remains locked until this retirement: a legal
-			 * replacement Store cannot race this bit invalidation. Also
-			 * reject stale requests rather than invalidating a new Slot.
+			 * replacement Store cannot race this bit invalidation.
+			 * current() is only a defensive identity check, NOT an atomic
+			 * compare-and-invalidate of the Frontswap bit. Safety relies
+			 * on that page-lock contract and the completed publication.
+			 * The dirty local copy stays resident after invalidation.
 			 */
 			if (rswap_mapping_current(req->offset, req->mapping_id))
 				frontswap_invalidate_page(req->swap_type, req->offset);
