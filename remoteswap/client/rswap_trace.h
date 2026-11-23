@@ -7,6 +7,44 @@
 
 #include <linux/tracepoint.h>
 
+/* Serialized allocator lifecycle; users excludes index ownership. */
+TRACE_EVENT(mapping,
+	TP_PROTO(u64 seq, unsigned int action, u64 offset, unsigned int server,
+		 unsigned int tier, u64 slot, unsigned int users, unsigned int live,
+		 unsigned int fallback),
+	TP_ARGS(seq, action, offset, server, tier, slot, users, live, fallback),
+	TP_STRUCT__entry(
+		__field(u64, seq)
+		__field(unsigned int, action)
+		__field(u64, offset)
+		__field(unsigned int, server)
+		__field(unsigned int, tier)
+		__field(u64, slot)
+		__field(unsigned int, users)
+		__field(unsigned int, live)
+		__field(unsigned int, fallback)
+	),
+	TP_fast_assign(
+		__entry->seq = seq;
+		__entry->action = action;
+		__entry->offset = offset;
+		__entry->server = server;
+		__entry->tier = tier;
+		__entry->slot = slot;
+		__entry->users = users;
+		__entry->live = live;
+		__entry->fallback = fallback;
+	),
+	TP_printk("seq=%llu action=%s offset=%llu server=%u tier=%s slot=%llu users=%u live=%u fallback=%u",
+		(unsigned long long)__entry->seq,
+		__print_symbolic(__entry->action, {0, "alloc"}, {1, "get"},
+			{2, "put"}, {3, "invalidate"}, {4, "free"}),
+		(unsigned long long)__entry->offset, __entry->server,
+		__print_symbolic(__entry->tier, {0, "dram"}, {1, "pmem"}),
+		(unsigned long long)__entry->slot, __entry->users,
+		__entry->live, __entry->fallback)
+);
+
 /* Observation only: ret is submission status, not terminal WC status.
  * start_ns uses CLOCK_MONOTONIC, independent of the configured ftrace clock.
  */

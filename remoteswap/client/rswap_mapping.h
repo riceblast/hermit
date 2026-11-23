@@ -14,6 +14,38 @@ struct rswap_pool_layout {
 	u64 tier_pages[RSWAP_MAX_SERVERS][RSWAP_NR_TIERS];
 };
 
+/* id is a pool-global, zero-based Slot index. A held reference prevents reuse.
+ * slot remains Tier-local. Offset 0 is not subtracted from the logical index.
+ */
+struct rswap_location {
+	unsigned int id, server, tier;
+	u64 slot;
+};
+
+struct rswap_mapping_pool_stats {
+	u64 capacity, live, retired, free;
+};
+
+struct rswap_mapping_stats {
+	u64 pages, metadata_bytes, sequence;
+	unsigned int nr_servers;
+	struct rswap_mapping_pool_stats pools[RSWAP_MAX_SERVERS][RSWAP_NR_TIERS];
+};
+
+int rswap_mapping_init(const struct rswap_pool_layout *layout);
+void rswap_mapping_destroy(void);
+int rswap_mapping_alloc(u64 offset, struct rswap_location *location);
+/* Mechanism entry for a future policy; Client 1.9 uses interleave via alloc(). */
+int rswap_mapping_alloc_preferred(u64 offset, unsigned int server,
+		unsigned int tier, struct rswap_location *location);
+int rswap_mapping_get(u64 offset, struct rswap_location *location);
+void rswap_mapping_put(unsigned int id);
+void rswap_mapping_invalidate(u64 offset);
+int rswap_mapping_abort(u64 offset, unsigned int id);
+int rswap_mapping_current(u64 offset, unsigned int id);
+void rswap_mapping_reset(void); /* submissions closed and all I/O drained */
+void rswap_mapping_snapshot(struct rswap_mapping_stats *stats);
+
 /* Both levels stripe their common capacity and append the larger side's tail.
  * Capacities and their sums are validated before publishing the pool.
  */

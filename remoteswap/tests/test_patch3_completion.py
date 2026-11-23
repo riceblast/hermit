@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+import mapping_harness
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,6 +40,7 @@ STUBS = r"""
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sched.h>
+#include <string.h>
 typedef uint64_t u64;
 typedef uint16_t u16;
 typedef unsigned long pgoff_t;
@@ -62,7 +64,8 @@ typedef atomic_llong atomic64_t;
 #define IB_WR_RDMA_READ 2
 #define IB_SEND_SIGNALED 1
 #define GFP_ATOMIC 0
-#define WARN_ON(x) (!!(x))
+static int mock_warn(int value) { assert(!value); return value; }
+#define WARN_ON(x) mock_warn(!!(x))
 #define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_ACQUIRE)
 #define smp_store_release(p, v) __atomic_store_n(p, v, __ATOMIC_RELEASE)
 #define smp_load_acquire(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
@@ -188,6 +191,7 @@ static void frontswap_invalidate_page(unsigned int type, pgoff_t offset) {
     assert(type == 0 && offset == expected_offset);
     assert(atomic_load(&current_page->dirty));
     assert(atomic_exchange(&current_page->valid, 0) == 1);
+    rswap_mapping_invalidate(offset);
 }
 static struct rswap_rdma_queue *get_rdma_queue(struct rdma_session_context *s, unsigned int cpu, enum rdma_queue_type type) {
     assert(cpu == 0); return &s->rdma_queues[type];
@@ -209,6 +213,20 @@ static int ib_post_send(struct ib_qp *qp, struct ib_send_wr *wr, const struct ib
 """
 
 SUPPORT = r"""
+static void mock_mapping_trace(u64 seq, unsigned int action, u64 offset,
+                               unsigned int server, unsigned int tier, u64 slot,
+                               unsigned int users, unsigned int live, unsigned int fallback) {}
+/* Simulate the frontend invalidation which precedes every replacement Store. */
+static int prepare(unsigned int type, pgoff_t offset, struct page *page, int core, void **cookie) {
+    rswap_invalidate_page(type, offset);
+    return rswap_store_prepare(type, offset, page, core, cookie);
+}
+/* Static helper is used ONLY to test MR boundary arithmetic independently. */
+static int resolve_offset(pgoff_t offset, struct rswap_remote_page *remote) {
+    struct rswap_location loc;
+    int ret = rswap_map_page(&pool_layout, offset, &loc.server, &loc.tier, &loc.slot);
+    return ret ? ret : rswap_resolve_remote_page(&loc, remote);
+}
 static void mock_trace_placement(unsigned int area, u64 offset, unsigned int server,
                                  unsigned int tier, int op, int status) {
     if (!trace_enabled) return;
@@ -246,7 +264,9 @@ static int ib_post_send(struct ib_qp *qp, struct ib_send_wr *wr, const struct ib
     assert(req->rdma_queue == q);
     assert(req->sge.lkey == q->rdma_session->rdma_dev->pd->local_dma_lkey);
     struct rswap_remote_page remote;
-    assert(!rswap_resolve_remote_page(req->offset, &remote));
+    struct rswap_location loc;
+    assert(rswap_slot_location(req->mapping_id, &loc));
+    assert(!rswap_resolve_remote_page(&loc, &remote));
     assert(remote.session == q->rdma_session);
     assert(req->rdma_wr.rkey == remote.chunk->remote_rkey);
     assert(req->rdma_wr.remote_addr == remote.chunk->remote_addr + remote.chunk_offset);
@@ -289,8 +309,15 @@ static void init(void) {
         .server_pages = {2ULL << 21, 3ULL << 21}, .total_pages = 5ULL << 21,
         .nr_servers = 2, .tier_pages = {{1ULL << 21, 1ULL << 21}, {1ULL << 21, 2ULL << 21}},
     };
+    assert(!rswap_mapping_init(&pool_layout));
 }
 static void reset(struct page *p) {
+    for (u64 offset = 0; offset < 64; offset++) rswap_mapping_invalidate(offset);
+    for (u64 offset = 0; offset < 64; offset++) {
+        struct rswap_location loc;
+        assert(!rswap_mapping_alloc(offset, &loc));
+        rswap_mapping_put(loc.id);
+    }
     *p = (struct page){0};
     atomic_store(&p->refs, 1); atomic_store(&p->locked, 1);
     atomic_store(&p->reclaim, 1); current_page = p;
@@ -315,6 +342,10 @@ static void reset(struct page *p) {
     }
 }
 static void retired(struct page *p, bool unlocked) {
+    struct rswap_mapping_stats stats;
+    rswap_mapping_snapshot(&stats);
+    for (unsigned int s = 0; s < stats.nr_servers; s++)
+        for (unsigned int t = 0; t < 2; t++) assert(!stats.pools[s][t].retired);
     assert(atomic_load(&p->refs) == 1);
     assert(atomic_load(&p->locked) == !unlocked);
     assert(atomic_load(&frees) == 1);
@@ -365,7 +396,7 @@ static void large_resolver(void) {
                     struct rswap_remote_page remote;
                     u64 slot = c * cp + (last ? cp - 1 : 0);
                     u64 local = slot < 32 * cp ? 2 * slot + t : 32 * cp + slot;
-                    assert(!rswap_resolve_remote_page(2 * local + s, &remote));
+                    assert(!resolve_offset(2 * local + s, &remote));
                     assert(remote.session == &rdma_sessions[s] && remote.tier == (unsigned)t);
                     assert(remote.chunk == &large[s][c + (t ? 32 : 0)]);
                     assert(remote.chunk_offset == (last ? (1ULL << 33) - PAGE_SIZE : 0));
@@ -384,24 +415,24 @@ int main(void) {
     init();
     large_resolver();
     /* Actual resolver: tail, descriptor limits and address overflow. */
-    assert(!rswap_resolve_remote_page(4ULL << 21, &remote));
+    assert(!resolve_offset(4ULL << 21, &remote));
     assert(remote.session == &rdma_sessions[1] && remote.chunk == &chunks[1][2] && !remote.chunk_offset);
     assert(remote.tier == RSWAP_TIER_PMEM);
-    assert(rswap_resolve_remote_page(pool_layout.total_pages, &remote) == -ERANGE);
+    assert(resolve_offset(pool_layout.total_pages, &remote) == -ERANGE);
     chunks[1][0].chunk_state = EMPTY;
-    assert(rswap_resolve_remote_page(1, &remote) == -ENXIO);
+    assert(resolve_offset(1, &remote) == -ENXIO);
     chunks[1][0].chunk_state = MAPPED;
     chunks[1][0].mapped_size = PAGE_SIZE - 1;
-    assert(rswap_resolve_remote_page(1, &remote) == -ERANGE);
+    assert(resolve_offset(1, &remote) == -ERANGE);
     chunks[1][0].mapped_size = 1ULL << 33;
     chunks[1][0].remote_addr = UINT64_MAX - PAGE_SIZE + 1;
-    assert(rswap_resolve_remote_page(1, &remote) == -EOVERFLOW);
+    assert(resolve_offset(1, &remote) == -EOVERFLOW);
     chunks[1][0].remote_addr = 0x100000ULL + 3 * (1ULL << 34);
 
     /* Both Tiers on both Sessions use the selected MR/key and data opcode. */
     for (int s = 0; s < 2; s++) {
         for (int t = 0; t < 2; t++) {
-            assert(!rswap_resolve_remote_page(2 * t + s, &remote));
+            assert(!resolve_offset(2 * t + s, &remote));
             assert(remote.session == &rdma_sessions[s] && remote.tier == (unsigned)t);
             assert(remote.chunk == &chunks[s][t] && !remote.chunk_offset);
             for (int op = 0; op < 3; op++) {
@@ -424,7 +455,7 @@ int main(void) {
             for (int error = 0; error < 2; error++) {
                 reset(&p); expected_offset = offset; expected_trace_op = op; wc_error = error; immediate = 1;
                 if (op == QP_STORE) {
-                    assert(!rswap_store_prepare(0, offset, &p, 0, &cookie));
+                    assert(!prepare(0, offset, &p, 0, &cookie));
                     atomic_store(&p.valid, 1); rswap_store_commit(cookie);
                 } else {
                     assert(!rswap_rdma_submit(0, offset, &p, op, NULL));
@@ -439,9 +470,13 @@ int main(void) {
                 reset(&p); expected_offset = offset;
                 alloc_error = fail == 0; map_error = fail == 1;
                 post_error = fail == 2 ? -EIO : 0;
-                int ret = op == QP_STORE ? rswap_store_prepare(0, offset, &p, 0, &cookie) :
+                int ret = op == QP_STORE ? prepare(0, offset, &p, 0, &cookie) :
                     rswap_rdma_submit(0, offset, &p, op, NULL);
                 assert(ret < 0 && !trace_calls);
+                if (op == QP_STORE) {
+                    struct rswap_location missing;
+                    assert(rswap_mapping_get(offset, &missing) == -ENOENT);
+                }
                 assert(atomic_load(&p.refs) == 1 && atomic_load(&p.locked));
                 assert(atomic_load(&maps) == atomic_load(&unmaps));
                 check_tier_stats(s, RSWAP_TIER_PMEM, op, 0, 0, 1);
@@ -463,7 +498,7 @@ int main(void) {
     for (int before = 0; before < 2; before++) {
         for (int error = 0; error < 2; error++) {
             reset(&p); wc_error = error; immediate = before;
-            assert(!rswap_store_prepare(0, 1, &p, 0, &cookie));
+            assert(!prepare(0, 1, &p, 0, &cookie));
             assert(atomic_load(&p.locked) && !atomic_load(&frees));
             if (before) {
                 assert(!atomic_load(&queues[1][0].rdma_post_counter));
@@ -482,7 +517,7 @@ int main(void) {
     for (int i = 0; i < 200; i++) {
         pthread_t cb, commit;
         reset(&p); wc_error = i & 1;
-        assert(!rswap_store_prepare(0, 1, &p, 0, &cookie));
+        assert(!prepare(0, 1, &p, 0, &cookie));
         assert(!pthread_create(&cb, NULL, callback_thread, NULL));
         assert(!pthread_create(&commit, NULL, commit_thread, cookie));
         pthread_join(cb, NULL); pthread_join(commit, NULL);
@@ -492,7 +527,7 @@ int main(void) {
     {
         pthread_t drain;
         reset(&p);
-        assert(!rswap_store_prepare(0, 1, &p, 0, &cookie));
+        assert(!prepare(0, 1, &p, 0, &cookie));
         assert(!pthread_create(&drain, NULL, invalidate_thread, NULL));
         while (READ_ONCE(area_active)) sched_yield();
         assert(rswap_rdma_submit(0, 2, &p, QP_LOAD_SYNC, NULL) == -ESHUTDOWN);
@@ -507,7 +542,7 @@ int main(void) {
     }
     for (int error = 0; error < 2; error++) {
         reset(&p); wc_error = error;
-        assert(rswap_store_prepare(0, 1, &p, -1, &cookie) == (error ? -EIO : 0));
+        assert(prepare(0, 1, &p, -1, &cookie) == (error ? -EIO : 0));
         assert(sample_calls == 1 && sampled_ns == 1 && sampled_pfn == page_to_pfn(&p));
         assert(sampled_type == 0 && sampled_offset == 1 && sampled_ret == 0);
         assert(atomic_load(&p.locked));
@@ -521,7 +556,7 @@ int main(void) {
         if (failure == 1) map_error = 1;
         if (failure == 2) post_error = -EIO;
         if (failure == 3) p.compound = true;
-        assert(rswap_store_prepare(0, 1, &p, -1, &cookie) < 0 && !cookie);
+        assert(prepare(0, 1, &p, -1, &cookie) < 0 && !cookie);
         assert(sample_calls == 1 && sampled_ret < 0);
         assert(atomic_load(&p.locked) && atomic_load(&p.refs) == 1 && !pins);
         assert(!atomic_load(&queues[1][0].rdma_post_counter));
@@ -533,7 +568,7 @@ int main(void) {
     /* Node 0 empty, node 1 pending: CPU-only polling must still complete it. */
     reset(&p);
     sample_enabled = false;
-    assert(!rswap_store_prepare(0, 1, &p, 0, &cookie));
+    assert(!prepare(0, 1, &p, 0, &cookie));
     assert(!sample_calls);
     atomic_store(&p.valid, 1); rswap_store_commit(cookie);
     cqs[1][0].hold = true;
@@ -547,8 +582,8 @@ int main(void) {
         reset(&p);
         expected_offset = (pgoff_t)-1; /* Two different offsets are in flight. */
         atomic_store(&other.refs, 1); atomic_store(&other.locked, 1);
-        assert(!rswap_store_prepare(0, 1, &p, 0, &cookie));
-        assert(!rswap_store_prepare(0, 2, &other, 0, &second));
+        assert(!prepare(0, 1, &p, 0, &cookie));
+        assert(!prepare(0, 2, &other, 0, &second));
         atomic_store(&p.valid, 1); rswap_store_commit(cookie);
         atomic_store(&other.valid, 1); rswap_store_commit(second);
         cqs[0][0].hold = true;
@@ -583,7 +618,7 @@ int main(void) {
             if (failure == 1) map_error = 1;
             if (failure == 2) post_error = -EIO;
             if (failure == 3) rdma_sessions[1].error = -ECONNRESET;
-            int ret = type == QP_STORE ? rswap_store_prepare(0, 1, &p, 0, &cookie) :
+            int ret = type == QP_STORE ? prepare(0, 1, &p, 0, &cookie) :
                                         rswap_rdma_submit(0, 1, &p, type, NULL);
             assert(ret < 0 && atomic_load(&p.locked) && atomic_load(&p.refs) == 1);
             assert(atomic_load(&maps) == atomic_load(&unmaps));
@@ -597,6 +632,7 @@ int main(void) {
     assert(atomic64_read(&unrouted_error) == 1);
     check_stats(0, QP_LOAD_SYNC, 0, 0, 0);
     check_stats(1, QP_LOAD_SYNC, 0, 0, 0);
+    rswap_mapping_reset(); rswap_mapping_destroy();
     puts("PASS: actual resolver, publication races, failures, polling, per-Tier stats and placement metadata");
     return 0;
 }
@@ -829,22 +865,27 @@ int main(void) {
 """
 
 
-class CompletionTests(unittest.TestCase):
-    def test_actual_client_functions(self):
-        source = (ROOT / "client/rswap_rdma_ops.c").read_text()
-        header = (ROOT / "client/rswap_rdma.h").read_text()
-        stats = (ROOT / "client/rswap_stats.c").read_text()
-        names = ["rswap_poll_queue", "rswap_wait_progress", "drain_rdma_queue",
+def client_code(support=SUPPORT):
+    source = (ROOT / "client/rswap_rdma_ops.c").read_text()
+    header = (ROOT / "client/rswap_rdma.h").read_text()
+    stats = (ROOT / "client/rswap_stats.c").read_text()
+    names = ["rswap_poll_queue", "rswap_wait_progress", "drain_rdma_queue",
                  "drain_all_rdma_queues", "rswap_request_done", "rswap_store_put",
                  "fs_rdma_callback", "fs_enqueue_send_wr", "fs_build_rdma_wr",
                  "rswap_resolve_remote_page", "rswap_rdma_submit_active", "rswap_rdma_submit",
                  "rswap_store_prepare", "rswap_store_commit", "rswap_poll_cpu",
-                 "rswap_invalidate_area", "rswap_frontswap_init"]
-        stubs = STUBS.replace("/* STATS_STRUCT */", definition(header, "rswap_io_stats", struct=True))
-        code = (stubs + definition(header, "fs_rdma_req", struct=True)
+                 "rswap_invalidate_page", "rswap_invalidate_area", "rswap_frontswap_init"]
+    stubs = STUBS.replace("/* STATS_STRUCT */", definition(header, "rswap_io_stats", struct=True))
+    return (stubs + mapping_harness.STUBS + mapping_harness.production()
+                + definition(header, "fs_rdma_req", struct=True)
                 + definition(source, "rswap_remote_page", struct=True)
                 + definition(stats, "rswap_stats_wc") + definition(stats, "rswap_stats_submit_error")
-                + "\n".join(definition(source, name) for name in names) + SUPPORT)
+                + "\n".join(definition(source, name) for name in names) + support)
+
+
+class CompletionTests(unittest.TestCase):
+    def test_actual_client_functions(self):
+        code = client_code()
         with tempfile.TemporaryDirectory(prefix="hermit-patch3-completion-") as tmp:
             c = Path(tmp) / "completion.c"
             binary = Path(tmp) / "completion"

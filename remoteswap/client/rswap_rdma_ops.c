@@ -96,10 +96,22 @@ static void rswap_store_put(struct fs_rdma_req *req)
 			/* commit already published the bit, so it cannot reappear
 			 * after this invalidate. The dirty local copy stays resident.
 			 */
-			frontswap_invalidate_page(req->swap_type, req->offset);
+			/* The page remains locked until this retirement: a legal
+			 * replacement Store cannot race this bit invalidation. Also
+			 * reject stale requests rather than invalidating a new Slot.
+			 */
+			if (rswap_mapping_current(req->offset, req->mapping_id))
+				frontswap_invalidate_page(req->swap_type, req->offset);
 		}
-		unlock_page(page);
 	}
+	/* Failed prepare has no Frontswap bit, so invalidate_page may never run.
+	 * A request reference is retained through BOTH WC and publication.
+	 */
+	if (req->status || !req->store_published)
+		rswap_mapping_abort(req->offset, req->mapping_id);
+	rswap_mapping_put(req->mapping_id);
+	if (req->store_published)
+		unlock_page(page);
 	put_page(page);
 	kmem_cache_free(queue->fs_rdma_req_cache, req);
 	atomic_dec(&queue->store_pending);
@@ -136,6 +148,8 @@ void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 		rswap_request_done(queue);
 		return;
 	}
+	/* Terminal WC and DMA unmap precede Slot reuse and page visibility. */
+	rswap_mapping_put(req->mapping_id);
 	if (status) {
 		ClearPageUptodate(page);
 		SetPageError(page);
@@ -208,19 +222,21 @@ static int fs_build_rdma_wr(struct rswap_rdma_queue *queue,
 	return 0;
 }
 
-/* All store/load paths resolve the same immutable pool layout. */
-static int rswap_resolve_remote_page(pgoff_t offset,
+/* Resolve an already pinned location against immutable MR descriptors. */
+static int rswap_resolve_remote_page(const struct rswap_location *location,
 		struct rswap_remote_page *remote)
 {
 	struct rdma_session_context *session;
 	struct remote_chunk *chunk;
 	u64 slot, byte_offset, chunk_idx, chunk_offset, end;
 	unsigned int server, tier, tier_chunks;
-	int ret;
 
-	ret = rswap_map_page(&pool_layout, offset, &server, &tier, &slot);
-	if (ret)
-		return ret;
+	server = location->server;
+	tier = location->tier;
+	slot = location->slot;
+	if (server >= pool_layout.nr_servers || tier >= RSWAP_NR_TIERS ||
+	    slot >= pool_layout.tier_pages[server][tier])
+		return -ERANGE;
 	session = &rdma_sessions[server];
 	if (!session->remote_mem_pool.chunks)
 		return -ENODEV;
@@ -259,6 +275,7 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 		enum rdma_queue_type type, struct fs_rdma_req **store_req)
 {
 	struct rswap_remote_page remote;
+	struct rswap_location location;
 	struct rdma_session_context *session = NULL;
 	struct rswap_rdma_queue *queue;
 	struct fs_rdma_req *req;
@@ -273,21 +290,27 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 		ret = -EINVAL;
 		goto submit_error;
 	}
-	ret = rswap_resolve_remote_page(offset, &remote);
+	ret = type == QP_STORE ? rswap_mapping_alloc(offset, &location) :
+		rswap_mapping_get(offset, &location);
 	if (ret)
 		goto submit_error;
+	/* Resolve failures still own the reference obtained above. */
+	ret = rswap_resolve_remote_page(&location, &remote);
+	if (ret)
+		goto put_mapping;
 	session = remote.session;
 	tier = remote.tier;
 	queue = get_rdma_queue(remote.session, cpu, type);
 	req = kmem_cache_zalloc(queue->fs_rdma_req_cache, GFP_ATOMIC);
 	if (!req) {
 		ret = -ENOMEM;
-		goto submit_error;
+		goto put_mapping;
 	}
 	req->rdma_queue = queue;
 	req->page = page;
 	req->offset = offset;
 	req->tier = tier;
+	req->mapping_id = location.id;
 	req->swap_type = area_type;
 	if (type == QP_STORE) {
 		refcount_set(&req->store_refs, 2);
@@ -312,6 +335,10 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 free_req:
 	put_page(page);
 	kmem_cache_free(queue->fs_rdma_req_cache, req);
+put_mapping:
+	if (type == QP_STORE)
+		rswap_mapping_abort(offset, location.id);
+	rswap_mapping_put(location.id);
 submit_error:
 	rswap_stats_submit_error(session, tier, type);
 	return ret;
@@ -465,7 +492,9 @@ static int rswap_frontswap_load_async(unsigned int type, pgoff_t offset, struct 
 
 static void rswap_invalidate_page(unsigned int type, pgoff_t offset)
 {
-	/* Static slots follow Linux's entry lifetime; do not sleep here. */
+	/* Never wait for I/O here: the last request reference recycles the Slot. */
+	if (type == READ_ONCE(area_type))
+		rswap_mapping_invalidate(offset);
 }
 
 static void rswap_invalidate_area(unsigned int type)
@@ -481,6 +510,7 @@ static void rswap_invalidate_area(unsigned int type)
 		cond_resched();
 	for (id = 0; id < active_servers; id++)
 		drain_all_rdma_queues(id);
+	rswap_mapping_reset();
 }
 
 static void rswap_frontswap_init(unsigned int type)
@@ -581,12 +611,15 @@ int rswap_client_init(const struct rswap_client_config *config)
 	/* Publish only after every selected session and total capacity are valid. */
 	layout.nr_servers = active_servers;
 	pool_layout = layout;
+	ret = rswap_mapping_init(&pool_layout);
+	if (ret)
+		goto fail;
 	ret = rswap_stats_init(active_servers);
 	if (ret) {
 		pr_err("rswap: statistics interface initialization failed: %d\n", ret);
 		goto fail;
 	}
-	pr_info("rswap: pool ready servers=%u total=%u GiB (two-level page interleave, 4-KiB swap ready)\n",
+	pr_info("rswap: pool ready servers=%u total=%u GiB (dynamic Slots, two-level interleave, 4-KiB swap ready)\n",
 		active_servers, total_gib);
 	return 0;
 fail:
@@ -607,6 +640,8 @@ void rswap_client_exit(void)
 		WRITE_ONCE(rdma_sessions[id].stopping, true);
 	for (id = active_servers; id > 0; id--)
 		rswap_disconnect_and_collect_resource(&rdma_sessions[id - 1]);
+	/* QPs/CQs are gone; no callback can retain mapping storage. */
+	rswap_mapping_destroy();
 	active_servers = 0;
 	memset(&pool_layout, 0, sizeof(pool_layout));
 }

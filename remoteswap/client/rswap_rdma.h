@@ -116,6 +116,7 @@ struct fs_rdma_req {
 	int status;
 	unsigned int swap_type;
 	unsigned int tier;
+	unsigned int mapping_id; /* Request reference pins this pool-global Slot. */
 	pgoff_t offset;
 	u64 start_ns;
 };

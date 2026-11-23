@@ -1,6 +1,7 @@
 #include <linux/seq_file.h>
 
 #include "rswap_rdma.h"
+#include "rswap_mapping.h"
 
 static struct dentry *stats_root;
 static unsigned int stats_nr_servers;
@@ -76,6 +77,45 @@ static const struct file_operations rswap_stats_fops = {
 	.release = single_release,
 };
 
+static int rswap_mapping_show(struct seq_file *m, void *unused)
+{
+	struct rswap_mapping_stats stats;
+	unsigned int s, t;
+
+	rswap_mapping_snapshot(&stats);
+	seq_printf(m, "version=1 pages=%llu metadata_bytes=%llu sequence=%llu\n",
+		(unsigned long long)stats.pages,
+		(unsigned long long)stats.metadata_bytes,
+		(unsigned long long)stats.sequence);
+	seq_puts(m, "server tier capacity live retired free\n");
+	for (s = 0; s < stats.nr_servers; s++) {
+		for (t = 0; t < RSWAP_NR_TIERS; t++) {
+			struct rswap_mapping_pool_stats *p = &stats.pools[s][t];
+
+			seq_printf(m, "%u %s %llu %llu %llu %llu\n", s,
+				stats_tier_names[t], (unsigned long long)p->capacity,
+				(unsigned long long)p->live, (unsigned long long)p->retired,
+				(unsigned long long)p->free);
+		}
+	}
+	return 0;
+}
+
+static int rswap_mapping_open(struct inode *inode, struct file *file)
+{
+	if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
+		return -ENODEV;
+	return single_open(file, rswap_mapping_show, NULL);
+}
+
+static const struct file_operations rswap_mapping_fops = {
+	.owner = THIS_MODULE,
+	.open = rswap_mapping_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 int rswap_stats_init(unsigned int nr_servers)
 {
 	struct dentry *file;
@@ -104,6 +144,12 @@ int rswap_stats_init(unsigned int nr_servers)
 		return ret;
 	}
 	file = debugfs_create_file("stats", 0444, stats_root, NULL, &rswap_stats_fops);
+	if (IS_ERR_OR_NULL(file)) {
+		ret = file ? PTR_ERR(file) : -ENOMEM;
+		rswap_stats_exit();
+		return ret;
+	}
+	file = debugfs_create_file("mapping", 0444, stats_root, NULL, &rswap_mapping_fops);
 	if (IS_ERR_OR_NULL(file)) {
 		ret = file ? PTR_ERR(file) : -ENOMEM;
 		rswap_stats_exit();

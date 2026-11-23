@@ -1,10 +1,12 @@
 # Remoteswap
 
-**Development stage: Patch 8 (userspace window hotness and optional Store PFN observation).**
+**Development stage: Patch 9 (dynamic Slots with safe invalidation and in-flight references).**
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
-Client 1.8 discovers each Server's DRAM/PMem topology and interleaves first across
-Servers, then across the selected Server's Tiers. Each level stripes its common
-capacity and appends the larger side's tail. See the [Patch 6 guide](tests/patch6-client.md)
+Client 1.9 discovers each Server's DRAM/PMem topology and chooses a preferred pool
+by interleaving first across Servers, then across the selected Server's Tiers.
+Actual Slots are dynamically allocated and retained until invalidation and the
+last in-flight reference. Each interleave level stripes its common capacity and
+appends the larger side's tail. See the [Patch 6 guide](tests/patch6-client.md)
 for capacity limits, local checks and the minimal hardware acceptance plan.
 Use matching protocol v2 builds; the Patch 1–4 Client cannot connect to this Server.
 The historical Server command lines below and in Patch 1–4 test guides no longer apply.
@@ -22,13 +24,19 @@ Current configuration expects two 48-GiB Servers (96 GiB total).
 The independent `tools/rswap_hotness` sampler observes a PID or launches a command,
 tracks activity over a configurable window, and exports per-page heat and means.
 The disabled-by-default `rswap:store_sample` event and offline checker correlate
-prior heat snapshots with Store PFNs. Placement remains static interleave;
-dynamic Slots and adaptive placement are not implemented by Patch 8.
-See the [Patch 8 guide](tests/patch8-monitor.md) for builds, semantics and hardware validation.
-Copyable core acceptance commands are in [Patch 8 core tests](tests/patch8-core-smoke.md).
+prior heat snapshots with Store PFNs. Patch 9 keeps interleave as its preferred
+Server/Tier policy, with capacity fallback; adaptive placement remains future work.
+The dense mapping and free lists use 12 bytes per pool page (288 MiB for 96 GiB,
+10.5 GiB for 3.5 TiB), plus allocation/page-table overhead. They are allocated before
+Frontswap registration even when the swap area is smaller than the pool.
+See the [Patch 9 guide](tests/patch9-mapping.md) for design, local validation,
+the `mapping` command, dynamic trace replay and hardware acceptance plan.
+See the [Patch 8 guide](tests/patch8-monitor.md) for hotness semantics and prior hardware results.
+The [Patch 8 core tests](tests/patch8-core-smoke.md) target Client 1.8; use the Patch 9
+acceptance plan for this version.
 
-Deploy the rebuilt kernel and Client together: the module now requires
-`frontswap_register_managed_ops_v2`, preventing accidental use with the older kernel.
+Use the matching Hermit kernel exporting `frontswap_register_managed_ops_v2`.
+Patch 9 only needs the rebuilt Client when that kernel is already deployed.
 The kernel release string is unchanged, so `uname -r` alone does not identify this build.
 See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.
 Use the [Patch 3 hardware test guide](tests/patch3-smoke.md) for commands and expected results.

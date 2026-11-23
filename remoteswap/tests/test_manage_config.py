@@ -46,6 +46,9 @@ class ManageConfigTest(unittest.TestCase):
         self.stats = self.root / "stats"
         self.stats.write_text("fixture counters\n")
         script = script.replace("/sys/kernel/debug/rswap/stats", shlex.quote(str(self.stats)))
+        self.mapping = self.root / "mapping"
+        self.mapping.write_text("fixture mapping\n")
+        script = script.replace("/sys/kernel/debug/rswap/mapping", shlex.quote(str(self.mapping)))
         self.script.write_text(script)
         self.config = self.root / "rswap_client.conf"
         self.config.write_text(DUAL)
@@ -150,6 +153,20 @@ class ManageConfigTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "fixture counters\n")
         self.assertEqual(self.calls(), [])
+
+    def test_mapping_ignores_config_and_does_not_change_swap(self):
+        self.config.write_text("broken shell syntax (\n")
+        self.swap.write_text("Filename Type Size Used Priority\n/ssd file 10 1 -2\n")
+        result = self.run_script("mapping")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "fixture mapping\n")
+        self.assertEqual(self.calls(), [])
+
+    def test_dynamic_trace_flags_forwarded(self):
+        result = self.run_script("trace-check", "capture.log", "16:32,16:32",
+                                 "--dynamic", "--require-empty")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls()[0][-2:], ["--dynamic", "--require-empty"])
 
     def test_monitor_forwards_interval_and_quoted_tool_path(self):
         self.config.unlink()
