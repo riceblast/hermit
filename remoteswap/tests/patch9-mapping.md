@@ -10,7 +10,30 @@ Client 为 **1.9**；Server 控制协议 **v2**、带宽 stats **v2**、managed 
 不上传热度、不启用 Adaptive、不做迁移、重连、故障恢复或 PMem 持久化恢复。
 
 本轮已实现并进行本地构建、逻辑回归和用户态 stub sanitizer 检查。
-**本轮没有加载模块、启停 swap、连接 Server 或运行实机 BFS；硬件验收仍待操作者执行。**
+**2026-11-23 已完成内核复核修复后的双节点核心实机验收：四线程页面内容、活进程 swapoff、
+同 Session 再次启用及一次 BFS 均通过；Slot 全部归还、Client 卸载、Server 停止。**
+配置、证据及覆盖边界见 [核心测试执行记录](patch9-core-smoke.md#2026-11-23-实机核心验收结果)。
+
+## 下一阶段交接
+
+**当前进度：Patch 8 的冷热观测与 Patch 9 的动态位置管理均已具备，但两者尚未接通。**
+本阶段完成了逐页分配/查找、Invalidate 与在途引用共同决定的安全回收、容量 Fallback，
+以及必要的容量/生命周期观测。生产 Store 仍按 Interleave 选择首选 Server/Tier。
+
+- **Patch 10 尚需实现**：用户态热度/均值整代上传与发布、Start/Stop 及
+  Inactive/Warmup/Adaptive 状态机、热度查询与目标选择。可复用
+  `rswap_mapping_alloc_preferred()` 分配机制，在新 Store 时选择目标；Load 始终读取既有位置，
+  有效映射不因策略更新而改变，不做主动迁移。策略沿用已确认的 `h > mean` 放 DRAM、
+  否则 PMem，目标 Tier 内跨 Server RR，未知热度回退 Interleave，容量不足使用已有 Fallback。
+  采样窗口和更新语义承接 Patch 8；不能假定每秒都有完成的快照。
+- **Patch 11 尚需完成**：热度、阈值、策略状态和放置原因的决策记录及综合效果验收。
+  当前 `mapping` Trace 只验证分配/引用生命周期，stats 只描述成功 RDMA I/O，不能替代冷热效果证据。
+- **验证边界**：59 项本地回归及双节点核心页面/BFS 验收通过；特殊失败/PTE 交错有本地回归，
+  未做故障注入、TB 级或完整异步组合的硬件验收。后续优先核心验证，不默认重跑 Patch 1–8 全矩阵。
+- **部署起点**：Client 已使用修复后的内核 **#8**，release 名称仍与旧 #7 相同；
+  下一会话先核对 `uname -v`，无新增内核修改时无需重复安装。当前无活动 swap，Client/Server 均停止，
+  测试开关已恢复，THP 为原来的 always；下轮 4 KiB 测试需重新禁用 THP。
+  继续保持 batch_account 关闭、memsw 无有限配额；sudo 由操作者执行，其余由助手主导。
 
 ## 已确认约定
 

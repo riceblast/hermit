@@ -4,7 +4,8 @@
 
 助手负责修复、构建、本地回归、测试程序与控制、日志核对；操作者执行所有需要 sudo 的命令，
 以及内核重启和 Server 启动。每阶段只执行助手当时给出的具体操作，不提前启用 swap。
-本文件是验收方案，**不代表已经完成内核安装或硬件测试**。
+本文件包含验收方案和执行记录。**2026-11-23 内核更新后的双节点两项核心验收均通过，
+已完成正常收尾；实测结果与证据位置见末节。**
 
 按最新要求，只做两项双节点硬件检查，取消此前单节点矩阵、硬件故障注入、全池压力及完整 Trace：
 
@@ -59,7 +60,9 @@ git diff --check
   最终有效内核日志是 `/tmp/hermit-p9-fix-kernel-verified-build.log`；早前两份失败构建日志保留，
   不作为成功证据。Client 日志为 `/tmp/hermit-p9-fix-client-build.log`，
   最终回归日志为 `/tmp/hermit-p9-fix-regression-final.log`。
-- 本轮尚未安装内核、重启或执行硬件验收。
+- 以上为实现阶段的本地结果；该阶段结束时尚未安装内核或执行硬件验收。
+  后续实机结果见末节。原 `/tmp/hermit-p9-fix/` 构建交接文件已被重启清理，
+  不应直接重跑依赖该 READY 的安装脚本；下次重建需重新准备构建交接。
 
 ## 2. 操作者安装内核，再重启
 
@@ -132,3 +135,47 @@ Server 由操作者按已经验证的本机 NUMA 参数启动，node04 为 endpo
 
 不自动重试失败的内核/换页任务，不强制卸载或提前停止 Server。失败时先保留现场和日志，
 由助手定位后再给出下一条操作。
+
+## 2026-11-23 实机核心验收结果
+
+两项通过，正常收尾完成。本轮使用 Client optane / 10.0.0.11，48 个连续 CPU，
+运行内核 `5.14.0-rc5-hermit-syscall-v2 #8 SMP Mon Nov 23 11:25:57 CST 2026`；
+启动镜像与已构建 bzImage 的 SHA256 均为
+`519aa7b09f05ce90427439e32dfaa46babd081809e230acc5c7c8d17eb930609`。
+Client 1.9，协议/stats v2，总池 96 GiB，映射主体 288 MiB。
+
+助手通过 SSH 以普通用户启动并最终停止两台 Server；两台 memlock 均为 unlimited。
+node04 的 DRAM/PMem Node 为 0/1，server02 为 0/2，均为 16+32 GiB。
+两台完整物理放置查询 `misplaced=0`，各 6 个 MR 注册成功，最终均输出 `Server resources released`。
+用户执行了挂载/系统 swap 停用，以及 prepare、live-swapoff、bfs、finish 四个 root 阶段。
+助手通过 stdin FIFO 精确释放两次 READY；未使用 PTY 键盘注入。
+
+| 核心目标 | 实际结果 |
+| --- | --- |
+| 内容与并发 | `swap_shared_pattern 4096 2 4`，2 GiB 物理限制，bypass 开启；两代各 1048576 页均由 4 线程逐页逐字校验，最终 PASS，退出码 0，无 SIGBUS |
+| 实际远端访问 | 第一处 READY 时约 2 GiB 已在远端；四池均有成功读写，不能用程序正常退出替代发生换页的证据 |
+| 活进程 swapoff | 第二处 READY 期间解除物理限制并成功 swapoff，四池 `live=retired=0`、`free=capacity`；随后第二代最终内容仍正确 |
+| 同 Session 再启用 | 不重启 Server、不重载 Client，在原连接上从 48 GiB 切换至 80 GiB swap，成功运行 BFS |
+| BFS | 64G 图、40 线程、24 GiB 限制、`-rounds 1`，正常退出 0，一条 `Running time : 0.277` 输出；该值是算法计时输出，不是端到端运行时长 |
+| 错误与日志 | 两项四池 WC/提交错误及 unrouted_error 增量均为 0；本轮新增 dmesg 未见相关 BUG/WARN/Call Trace/WC/rswap 错误 |
+| 最终资源收尾 | 80 GiB swapoff 成功，Slot 全部归还，Client 卸载，两个测试 cgroup 清理；全部 HMT 开关、THP、readahead_win、page-cluster 恢复并读回原值；两台 Server 停止 |
+
+每次成功请求为 4096 字节；以下为原 stats 的成功 WC 次数，重复读写重复计数，不代表唯一页面数：
+
+| 测试 | Write 总次数 | Read 总次数 | WC/提交/未归属错误增量 |
+| --- | ---: | ---: | --- |
+| 四线程页面测试 | 2623624 | 5338971 | 全为 0 |
+| BFS | 24952570 | 18708048 | 全为 0 |
+
+本轮 Read 为同步路径，异步 Read 为 0。不声称硬件覆盖了完整异步组合、故障分支、
+全池容量或 TB 级规模；特殊失败/PTE 交错由本地回归覆盖，没有在硬件上注入或认证该竞态。
+BFS 不作为算法结果或性能改善的证明。没有启用 Adaptive，也不比较 DRAM/PMem 性能。
+
+原始日志在 `/tmp/hermit-p9-core/`；为避免再次重启丢失，已将常规文件转存数据盘：
+`remoteswap/tests/artifacts/patch9-core-20261123/`（Git 忽略）。
+其中 `results.json`、`pattern.check.log`、`bfs.check.log`、`SUCCESS` 为摘要；
+另保留两项 console/exit/stats/mapping、完整设置读回、内核日志、两台 Server 日志和本轮控制器。
+`host.py` / `observe.py` 是此次实验控制器，不是生产 API；不在旧 run 目录直接重复 prepare。
+
+最终无活动 swap。重启时自动启用的 `/swap.img` 本轮停用后未重新开启；fstab 未修改。
+`sdb2` / `sdb4` 本轮挂载保留，未格式化或修改已有测试文件。
