@@ -1,6 +1,6 @@
 # Remoteswap
 
-**Development stage: Client 1.13 Adaptive unknown-page DRAM default (hardware validation pending).**
+**Development stage: Client 1.13 Adaptive unknown-page DRAM default (one BFS observation completed; dedicated functional validation pending).**
 The new [capacity-mean policy](tests/capacity-mean-placement.md) uses an estimated
 remote-candidate mean and separates
 observed means from placement thresholds. Local upload ABI v2 requires matching
@@ -8,6 +8,8 @@ Client/sampler builds; Server protocol v2 is unchanged.
 In 1.13, Adaptive Stores without a snapshot/threshold or with a PFN miss prefer
 DRAM, sharing its Server round-robin with known-hot Stores. Zero heat keeps the
 original interleave preference. See [the change and validation plan](tests/unknown-dram-placement.md).
+The [single dual-Server BFS report](tests/unknown-dram-bfs-result.md) records balanced
+Interleave traffic and an Adaptive DRAM/PMem total bandwidth ratio of 2.64; no follow-up trials were run.
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
 Client 1.13 discovers each Server's DRAM/PMem topology. Its Inactive/Warmup preferred pool
 interleaves first across Servers, then across the selected Server's Tiers.

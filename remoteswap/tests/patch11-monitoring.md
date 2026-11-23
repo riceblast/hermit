@@ -6,6 +6,9 @@ Adaptive 无快照、无可用阈值和 PFN miss 均改为首选 DRAM，与已�
 零热度继续原 Interleave，容量回退和 Slot/I/O 生命周期沿用原机制。
 新 decision 带 `placement_rule=1`，工具按数字标识兼容历史未知 Interleave 日志。
 本轮修改、验证及后续实机计划见 [未知页 DRAM 默认策略](unknown-dram-placement.md)。
+随后仅运行一次双节点 BFS：Interleave DRAM/PMem 总带宽 386.42/386.39 MiB/s，
+Adaptive 524.25/198.81 MiB/s（DRAM 约 2.64 倍），无新增错误或容量回退，正常收尾。
+结果和归因见 [1.13 单次 BFS 报告](unknown-dram-bfs-result.md)；独立功能专项尚未执行。
 
 ## 历史 1.12 阶段
 

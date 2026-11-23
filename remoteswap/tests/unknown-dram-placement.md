@@ -75,7 +75,12 @@ Trace 覆盖新旧语义、共享 ticket 冲突（含失败分配）、容量 Fa
 日志位于 `/tmp/hermit-unknown-dram-client-build.log`、`/tmp/hermit-unknown-dram-tools-build.log`、
 `/tmp/hermit-unknown-dram-targeted.log` 和 `/tmp/hermit-unknown-dram-regression.log`。
 
-## 后续实机测试方案（尚未执行）
+## 实机测试方案与执行边界
+
+随后按操作者要求跳过独立功能测试，只执行一次双节点 BFS。
+Interleave DRAM/PMem 总带宽 386.42/386.39 MiB/s，Adaptive 524.25/198.81 MiB/s，
+后者 DRAM 约为 PMem 的 2.64 倍；无新增 I/O 错误或容量回退，正常收尾。
+详见 [本轮结果](unknown-dram-bfs-result.md)。以下独立功能项仍未执行，不追加实验。
 
 1. **单节点小工作集**：覆盖 Warmup、已知零/正热度、PFN miss；额外在首个快照前进入 Adaptive，
    并发布空热度快照，分别覆盖无快照/无阈值。未知首选 DRAM、零热度按原 offset 分布，
@@ -92,4 +97,5 @@ Trace 覆盖新旧语义、共享 ticket 冲突（含失败分配）、容量 Fa
    同时报告零热度、未知、正热度比例和跨 Tier Fallback。DRAM 带宽上升不代替内容/机制验收，
    也不保证算法运行时间改善；需要比较时与 1.12 使用相同配置。
 
-本轮只完成代码与本地验证，不加载模块、不连接/重启 Server、不启停 swap 或运行 BFS。
+实现阶段只完成代码与本地验证；随后另完成上述一次 BFS 观察。
+独立内容/容量专项及对照重复实验仍未执行。
