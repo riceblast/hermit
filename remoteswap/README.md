@@ -35,6 +35,9 @@ Client 1.11 adds module-lifetime `policy_stats`, Store post/WC correlation, and
 `pool-status` / `pool-monitor` / `pool-report` commands. See the
 [Patch 11 guide](tests/patch11-monitoring.md) and
 [single/dual-node acceptance plan and results](tests/patch11-core-smoke.md).
+For step-by-step commands to initialize both Servers and the Client, run BFS with
+hotness tracking, observe placement/bandwidth and clean up, see the
+[manual BFS guide](tests/bfs-end-to-end-guide.md).
 The dense mapping and free lists use 12 bytes per pool page (288 MiB for 96 GiB,
 10.5 GiB for 3.5 TiB), plus allocation/page-table overhead. They are allocated before
 Frontswap registration even when the swap area is smaller than the pool.
