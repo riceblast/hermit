@@ -45,7 +45,9 @@ TRACE_EVENT(decision,
 		__entry->tier, __entry->slot, __entry->fallback, __entry->rr, __entry->ret)
 );
 
-/* Serialized allocator lifecycle; users excludes index ownership. */
+/* Serialized allocator lifecycle; users excludes index ownership. Numeric
+ * text fields avoid the 5.14 string verifier's va_list handling when seq fills.
+ */
 TRACE_EVENT(mapping,
 	TP_PROTO(u64 seq, unsigned int action, u64 offset, unsigned int server,
 		 unsigned int tier, u64 slot, unsigned int users, unsigned int live,
@@ -73,12 +75,11 @@ TRACE_EVENT(mapping,
 		__entry->live = live;
 		__entry->fallback = fallback;
 	),
-	TP_printk("seq=%llu action=%s offset=%llu server=%u tier=%s slot=%llu users=%u live=%u fallback=%u",
+	TP_printk("seq=%llu action=%u offset=%llu server=%u tier=%u slot=%llu users=%u live=%u fallback=%u",
 		(unsigned long long)__entry->seq,
-		__print_symbolic(__entry->action, {0, "alloc"}, {1, "get"},
-			{2, "put"}, {3, "invalidate"}, {4, "free"}),
+		__entry->action,
 		(unsigned long long)__entry->offset, __entry->server,
-		__print_symbolic(__entry->tier, {0, "dram"}, {1, "pmem"}),
+		__entry->tier,
 		(unsigned long long)__entry->slot, __entry->users,
 		__entry->live, __entry->fallback)
 );
@@ -129,12 +130,10 @@ TRACE_EVENT(placement,
 		__entry->op = op;
 		__entry->status = status;
 	),
-	TP_printk("swap_type=%u offset=%llu server=%u tier=%s op=%s status=%d",
+	TP_printk("swap_type=%u offset=%llu server=%u tier=%u op=%d status=%d",
 		__entry->swap_type, (unsigned long long)__entry->offset,
 		__entry->server,
-		__print_symbolic(__entry->tier, {0, "dram"}, {1, "pmem"}),
-		__print_symbolic(__entry->op, {0, "write"}, {1, "read_sync"},
-				 {2, "read_async"}),
+		__entry->tier, __entry->op,
 		__entry->status)
 );
 

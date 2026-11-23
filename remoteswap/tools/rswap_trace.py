@@ -10,12 +10,12 @@ from rswap_stats import OPS, TIERS
 
 EVENT = re.compile(
     r"\bplacement:\s+swap_type=(\d+) offset=(\d+) server=(\d+) "
-    r"tier=(dram|pmem) op=(write|read_sync|read_async) status=(-?\d+)\s*$"
+    r"tier=(dram|pmem|[01]) op=(write|read_sync|read_async|[0-2]) status=(-?\d+)\s*$"
 )
 GIB_PAGES = 1 << 18
 MAPPING = re.compile(
-    r"\bmapping:\s+seq=(\d+) action=(alloc|get|put|invalidate|free) "
-    r"offset=(\d+) server=(\d+) tier=(dram|pmem) slot=(\d+) "
+    r"\bmapping:\s+seq=(\d+) action=(alloc|get|put|invalidate|free|[0-4]) "
+    r"offset=(\d+) server=(\d+) tier=(dram|pmem|[01]) slot=(\d+) "
     r"users=(\d+) live=([01]) fallback=([0-3])\s*$"
 )
 
@@ -65,6 +65,8 @@ def check_trace(lines, layout):
         if not match:
             raise ValueError(f"line {number}: malformed placement event")
         area, offset, server, tier, op, status = match.groups()
+        tier = TIERS[int(tier)] if tier.isdigit() else tier
+        op = OPS[int(op)] if op.isdigit() else op
         area, offset, server, status = map(int, (area, offset, server, status))
         if swap_type is None:
             swap_type = area
@@ -101,6 +103,8 @@ def check_mapping_records(lines, pages, require_empty=False, decisions=None):
         if not match:
             raise ValueError(f"line {number}: malformed mapping event")
         seq, action, offset, server, tier, slot, users, live, fallback = match.groups()
+        action = ("alloc", "get", "put", "invalidate", "free")[int(action)] if action.isdigit() else action
+        tier = TIERS[int(tier)] if tier.isdigit() else tier
         seq, offset, server, slot, users, live, fallback = map(
             int, (seq, offset, server, slot, users, live, fallback))
         if previous is not None and seq != previous + 1:

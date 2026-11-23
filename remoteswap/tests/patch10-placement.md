@@ -7,8 +7,8 @@ Client **1.10**；Server 协议 **v2**、stats **v2**、managed Frontswap **v2**
 不修改 Server、内核核心、RDMA Completion/poll/drain、映射所有权或 Slot 回收契约。
 当前 Client 已部署 Patch 9 修复内核 #8，本 Patch 不需要再次安装内核。
 
-已完成实现和本地验证；**尚未加载 1.10、启用测试 swap 或执行实机验收**。
-本轮按要求在构建/本地检查后停止。硬件计划见 [核心验收](patch10-core-smoke.md)。
+已完成实现和本地验证，随后按操作者要求开展实机核心验收。
+实机计划与执行记录见 [核心验收](patch10-core-smoke.md)。
 
 ## 采用的语义
 
@@ -104,6 +104,10 @@ BEGIN/COMMIT 的代次严格大于已发布代，不允许跨运行复用。
 它表示分配决策，不表示提交接受、Frontswap bit 发布或 WC 成功；后续失败仍由 mapping 回滚。
 
 原因编码：0 Inactive，1 Warmup，2 无快照，3 均值未知，4 PFN 未知，5 热，6 冷。
+实机复核后 mapping/placement 文本改为数字字段，避开本机 5.14 字符串校验在
+seq 缓冲区已满时不推进 va_list 的告警路径：action=0/1/2/3/4 分别为
+alloc/get/put/invalidate/free，tier=0/1 为 DRAM/PMem，op=0/1/2 为 Write/同步 Read/异步 Read。
+解析器同时接受历史符号格式；二进制事件字段及 stats 格式不变，不需要修改内核。
 Fallback 编码沿用 Patch 9 的 0/1/2/3 四候选次序。失败分配 alloc_seq=0；
 成功 alloc_seq 对应 `rswap:mapping` 的 alloc.seq，避免仅靠 offset 错配多次生命周期。
 Trace 在分配锁外发出，可晚于其他 CPU 事件；校验器通过序号关联，而非依赖 decision 行顺序。
@@ -151,3 +155,28 @@ modinfo -F version remoteswap/client/rswap-client.ko
 日志位于 `/tmp/hermit-p10-client-build.log`、`/tmp/hermit-p10-tools-build.log`、
 `/tmp/hermit-p10-regression.log`；新程序产物 `/tmp/hermit-p10-adaptive-pattern`。
 早期编译/测试适配错误已修正，最终上述构建和整组回归均成功。
+
+### 实机发现的 Trace 输出问题及修复后本地检查
+
+首次实机页面内容、16384 次决策和 98304 条映射事件检查通过，但 trace_pipe 读取器
+触发 `trace_check_vprintf` WARNING；该次运行未作为完整通过，保留现场后暂停进入 BFS。
+本机实际 `trace_seq_vprintf()` 在 seq 已满时不消费 va_list，字符串校验器继续读取
+`%s` 参数时可能读到前面的数值参数。新增回归直接编译本内核的实际校验函数，
+在 full seq 条件下复现旧格式告警，并验证数字格式不经过该字符串校验分支。
+
+修复只修改 mapping/placement 的文本格式和 Python 兼容解析，不改放置、映射或 RDMA。
+重新编译 Client 1.10 成功，整组 **67 项**回归通过。源代码和二进制格式均不需要新内核。
+旧运行安全 swapoff/卸载、恢复设置后，重启两台 Server，以新 SHA256 产物重新开始核心验收。
+修复后的 module SHA256：`8ada6b878c32959f7654b8d753d6d960de8254c6772ba54d029b2f2489899f79`。
+旧 WARNING 为 WARN_ONCE，因此不能单凭后续没有新增告警证明问题消失；
+本轮还以实际函数复现、移除 `%s` 的格式检查和实际数字格式 Trace 完整校验作为证据。
+
+### 最终交接
+
+修复后的双节点可控冷热/内容/生命周期和 BFS 集成均通过，操作者完成 root 控制器启动，
+其余同步推进、Server 生命周期和日志核对由助手完成。
+完整数字和覆盖限制见 [核心测试执行记录](patch10-core-smoke.md#2026-11-23-实机核心验收结果)。
+当前无活动 swap、Client/Server 均停止，测试配置已恢复。
+
+Patch 11 接手完整监控分析、BFS 实际冷热/未知覆盖与效果比较；
+本轮不要求 DRAM 带宽高于 PMem，不宣称 BFS 性能提升或精确页面身份。

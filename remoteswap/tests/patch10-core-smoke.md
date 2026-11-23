@@ -1,8 +1,8 @@
-# Patch 10：待执行的核心实机验收
+# Patch 10：核心实机验收与执行记录
 
 ## 目标与执行边界
 
-本轮只完成代码、构建和本地检查。下面是下一阶段计划，**尚未执行**。
+以下为本轮核心验收方案；实际执行结果、首次 Trace 问题与修复重测另记于文末。
 沿用 Client optane / 10.0.0.11 的修复内核 #8；Client 为新构建 1.10。
 Server 和协议不变：endpoint 0=node04 / 10.0.0.13，endpoint 1=server02 / 10.0.0.20，
 每台 DRAM 16 GiB + PMem 32 GiB，总池 96 GiB。
@@ -76,3 +76,87 @@ Server 保持在线 → 成功 swapoff → 核对 mapping 全空及策略 Inacti
 
 本次不认证 TB 级、故障注入、全部异步 CQ 组合、BFS 算法结果或性能提升。
 完整效果比较及监控分析工具的扩充留给 Patch 11。
+
+## 2026-11-23 实机核心验收结果
+
+**修复后两项核心验收通过，正常收尾完成。** Client 使用现有 #8 内核、模块 1.10，
+48 个连续在线 CPU；两台 Server 各 DRAM 16 / PMem 32 GiB，总池 96 GiB。
+node04 的 Tier Node 为 0/1，server02 为 0/2，两台全部物理查询均 misplaced=0，
+各 6 个 MR 注册成功。Server 没有修改代码或协议。
+
+### 首次运行发现问题与重测
+
+首次运行完成两代内容和全部映射回收，但读取 mixed decision/mapping Trace 时出现
+`trace_check_vprintf` WARNING。因此该次没有作为完整通过，也没有继续启动 BFS。
+先保留现场，再以本机实际内核校验函数复现：seq 缓冲区已满后 vprintf 未消费 va_list，
+后续 `%s` 校验可能读到前面的数值。修复将 mapping/placement 文本改为数字字段，
+工具兼容旧格式；不改数据路径、放置、内核或协议。
+
+重新编译和 67 项本地回归通过后，操作者启动受控 restart：停止旧控制器、确认无活动
+swap/映射、恢复设置并卸载旧 Client。助手确认两个旧 Server 均已释放资源，再启动新进程；
+使用新的产物 SHA256 清单、全新 run 目录重测。内核无需重启。
+详细修复与格式说明见 [Patch 10 设计](patch10-placement.md)。
+
+### 修复后页面与策略验收
+
+| 目标 | 实际结果 |
+| --- | --- |
+| 热度分离 | 32 MiB / 8192 页；第一轮前半 4096 页全为热、后半全为冷；交换后角色反转。ENTER 前验证已完成快照及内核 Adaptive |
+| 内容 | 两代各 8192 页逐页逐 word 校验通过；活进程 swapoff 后最终内容仍正确，程序和采样器均退出 0 |
+| 实际放置 | 16384 次成功分配均与内核实际使用的 generation/PFN/heat/mean 相符；热/冷各 8192 次，分别进入 DRAM/PMem |
+| 两节点 RR | 四个 Server/Tier 各 4096 次分配及成功 Write、4096 次成功同步 Read；无容量 Fallback |
+| Trace 生命周期 | 98304 条 mapping 事件完整通过；16384 次分配全部归还，无 live/retired/引用残留；48 个 CPU 的 overrun/commit overrun/dropped events 均为 0 |
+| 控制接口 | 手动 Warmup 到期前切换 EAGAIN，到期后仍等待手动命令；显式切换、Stop、关闭 owner fd 自动 Stop、新 run_id 及旧 fd ESTALE 均通过 |
+| 收尾 | 活进程 swapoff 成功，四池全部空闲、策略 Inactive；同 Session 再 swapon 80 GiB 成功，重新 Start 的 run_id 从 3 变为 4 |
+
+页面阶段共 49 轮观察、33 代上传；swapoff 后采样器检测 ESTALE 并继续纯观察，直到程序正常退出。
+该阶段没有采样超期，最大扫描 200.323 ms，最大上传 143.605 ms。
+全部实际 Store 均在 Adaptive 阶段；不声称硬件覆盖了 Warmup Store 路由。
+PFN 查表一致不等于消除了 PFN 身份复用/采样竞争误差。
+
+### BFS 集成
+
+同一组 Session，既有 80 GiB swap，64G 图、OMP_NUM_THREADS=40、24 GiB 物理限制，
+仅目标程序进入 cgroup，采样器在外，memsw 无有限配额。
+配置 `--placement --interval 1 --window 20 --warmup 20`，关闭逐页 TSV 和全程 Trace。
+
+- BFS 和采样器退出码均为 0，有且仅有一条 `Running time : 0.253`；该值为算法输出，
+  不作为端到端时长或性能提升证据。监控运行约 224.79 秒，包含输入/初始化/预热/退出检测等。
+- 32 轮采样、32 代完整上传；summary 有 Warmup/observe，内核状态有 Warmup/Adaptive。
+  最终采样器退出自动结束策略，swap area 尚活动时状态已为 Inactive。
+- 四池全部有成功读写，WC/submit/unrouted 错误增量全为 0。
+- 22/32 轮超期，最大扫描 **17.187 秒**，最大上传 **2.065 秒**；
+  状态采样观察到的最大快照年龄 **18.295 秒**。不能将配置周期或窗口解释为固定秒数。
+- 最大上传 resident 记录数 5088246，观测到的已发布热度表最大约 81.4 MB。
+  该值不含 staging、用户态采样/排序数组及页表，不是总监控内存峰值。
+- 大工作集阶段 known 曾降至 31，之后最大达到 8815797；VMA 变化及换页竞争等近似限制
+  延续 Patch 8。BFS 未保存逐页快照，不宣称测得其内核 PFN 命中率或冷热策略收益。
+
+每次成功操作为 4096 字节；下表重复 I/O 重复计数，不表示唯一页或驻留容量：
+
+| 阶段 | 成功 Write | 成功 Read | WC/submit/unrouted 错误增量 |
+| --- | ---: | ---: | --- |
+| 可控冷热页面 | 16384 | 16384 | 全为 0 |
+| BFS | 24833706 | 18380669 | 全为 0 |
+
+本次 Read 全为同步路径。容量 Fallback、异步及失败竞争沿用本地实际函数回归，不声称
+新增硬件认证；Inactive 后仍有效映射的 RDMA Load 由本地检查覆盖，本轮不单独认证该硬件交错。
+DRAM 带宽高于 PMem 不作为验收条件。
+
+### 最终状态与证据
+
+80 GiB swapoff 成功，四池 live=retired=0、free=capacity，策略 Inactive；
+Client 卸载，两台 Server 正常退出并输出 `Server resources released`。
+HMT 全部开关、THP=always、page-cluster=3、readahead_win=0 恢复并读回，测试 cgroup 和
+Trace instance 清理，原 Client 配置未改。修复后新增 dmesg 无相关 BUG/WARN/Call Trace/WC 错误。
+
+当前无活动 swap，Client/Server 均停止。下次 4 KiB 测试需重新禁用 THP；
+不要直接在旧 run 目录再次执行控制器。
+
+原日志：`/tmp/hermit-p10-core/`（首次未接受运行）和 `/tmp/hermit-p10-core-fixed/`（有效重测）。
+常规文件转存数据盘，Git 忽略：`remoteswap/tests/artifacts/patch10-core-20261123/`，
+分别为 `first-run/` 和 `fixed-run/`。
+有效运行的 `results.json`、`pattern.results.json`、`bfs.results.json`、`SUCCESS` 为摘要；
+另保存完整 heat/publication、短窗口 Trace/buffer stats、console/exit、stats/mapping/policy、
+内核日志、两台 Server 日志、产物校验和以及本轮 host/observe/check 控制器。
+控制器只是本轮实验工具，不是生产 API。

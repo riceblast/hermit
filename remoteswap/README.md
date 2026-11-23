@@ -1,6 +1,6 @@
 # Remoteswap
 
-**Development stage: Patch 10 (opt-in snapshot-based adaptive placement; hardware acceptance pending).**
+**Development stage: Patch 10 (opt-in snapshot-based adaptive placement; dual-node core acceptance passed).**
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
 Client 1.10 discovers each Server's DRAM/PMem topology. Its default preferred pool
 interleaves first across Servers, then across the selected Server's Tiers.
