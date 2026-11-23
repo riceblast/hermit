@@ -1,6 +1,6 @@
 # Remoteswap
 
-**Development stage: Client 1.13 Adaptive unknown-page DRAM default (one BFS observation completed; dedicated functional validation pending).**
+**Development stage: Client 1.13 Adaptive unknown-page DRAM default (single/dual-Server BFS observations completed; dedicated functional validation pending).**
 The new [capacity-mean policy](tests/capacity-mean-placement.md) uses an estimated
 remote-candidate mean and separates
 observed means from placement thresholds. Local upload ABI v2 requires matching
@@ -10,6 +10,12 @@ DRAM, sharing its Server round-robin with known-hot Stores. Zero heat keeps the
 original interleave preference. See [the change and validation plan](tests/unknown-dram-placement.md).
 The [single dual-Server BFS report](tests/unknown-dram-bfs-result.md) records balanced
 Interleave traffic and an Adaptive DRAM/PMem total bandwidth ratio of 2.64; no follow-up trials were run.
+The separately requested [single-Server BFS](tests/unknown-dram-single-bfs-result.md)
+used a 16/32-GiB pool: DRAM filled, capacity fallback reversed the traffic balance,
+and Adaptive DRAM/PMem bandwidth was 217.20/332.04 MiB/s. Neither run establishes a general performance guarantee.
+The later requested [32/32-GiB single-Server run](tests/unknown-dram-single32-bfs-result.md)
+had balanced Interleave traffic and Adaptive bandwidth of 536.08/224.57 MiB/s, with no capacity fallback.
+Its short decision trace lost events; the cumulative WC bandwidth results remain available, while complete trace validation is uncertified.
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
 Client 1.13 discovers each Server's DRAM/PMem topology. Its Inactive/Warmup preferred pool
 interleaves first across Servers, then across the selected Server's Tiers.

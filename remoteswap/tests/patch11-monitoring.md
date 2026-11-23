@@ -9,6 +9,13 @@ Adaptive 无快照、无可用阈值和 PFN miss 均改为首选 DRAM，与已�
 随后仅运行一次双节点 BFS：Interleave DRAM/PMem 总带宽 386.42/386.39 MiB/s，
 Adaptive 524.25/198.81 MiB/s（DRAM 约 2.64 倍），无新增错误或容量回退，正常收尾。
 结果和归因见 [1.13 单次 BFS 报告](unknown-dram-bfs-result.md)；独立功能专项尚未执行。
+后续单节点 16/32 GiB 池的一轮 BFS 未满足 DRAM>PMem：Adaptive 为 217.20/332.04 MiB/s，
+DRAM 满池且发生 4995599 次 DRAM→PMem 容量回退。只运行该轮、正常收尾，
+详见 [单节点报告](unknown-dram-single-bfs-result.md)。
+随后按要求将单节点改为 32/32 GiB、使用 64 GiB swap，仅运行一轮：Interleave 总带宽
+349.19/349.14 MiB/s，Adaptive 536.08/224.57 MiB/s（DRAM 约 2.39 倍），无容量回退。
+本轮短 Trace 的 overrun=24150，完整逐决策验证未认证；累计 WC 带宽统计正常。
+结果与限制见 [32/32 GiB 单节点报告](unknown-dram-single32-bfs-result.md)。
 
 ## 历史 1.12 阶段
 

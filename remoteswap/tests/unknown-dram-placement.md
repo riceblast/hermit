@@ -81,6 +81,11 @@ Trace 覆盖新旧语义、共享 ticket 冲突（含失败分配）、容量 Fa
 Interleave DRAM/PMem 总带宽 386.42/386.39 MiB/s，Adaptive 524.25/198.81 MiB/s，
 后者 DRAM 约为 PMem 的 2.64 倍；无新增 I/O 错误或容量回退，正常收尾。
 详见 [本轮结果](unknown-dram-bfs-result.md)。以下独立功能项仍未执行，不追加实验。
+随后另按要求完成一次单节点 16/32 GiB BFS：Adaptive DRAM/PMem 217.20/332.04 MiB/s，
+DRAM 满池和大量容量回退使 PMem 更高；结果见 [单节点报告](unknown-dram-single-bfs-result.md)。
+再按要求以单节点 32/32 GiB、64 GiB swap 运行一轮：Interleave 349.19/349.14 MiB/s，
+Adaptive 536.08/224.57 MiB/s，无容量回退；短 Trace 丢事件，完整决策验证未认证。
+详见 [32/32 GiB 报告](unknown-dram-single32-bfs-result.md)。
 
 1. **单节点小工作集**：覆盖 Warmup、已知零/正热度、PFN miss；额外在首个快照前进入 Adaptive，
    并发布空热度快照，分别覆盖无快照/无阈值。未知首选 DRAM、零热度按原 offset 分布，
@@ -97,5 +102,5 @@ Interleave DRAM/PMem 总带宽 386.42/386.39 MiB/s，Adaptive 524.25/198.81 MiB/
    同时报告零热度、未知、正热度比例和跨 Tier Fallback。DRAM 带宽上升不代替内容/机制验收，
    也不保证算法运行时间改善；需要比较时与 1.12 使用相同配置。
 
-实现阶段只完成代码与本地验证；随后另完成上述一次 BFS 观察。
+实现阶段只完成代码与本地验证；随后分别按要求完成上述双节点/单节点各一次 BFS 观察。
 独立内容/容量专项及对照重复实验仍未执行。
