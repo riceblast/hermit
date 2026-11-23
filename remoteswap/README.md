@@ -1,9 +1,9 @@
 # Remoteswap
 
-**Development stage: Patch 9 (dynamic Slots with safe invalidation and in-flight references).**
+**Development stage: Patch 10 (opt-in snapshot-based adaptive placement; hardware acceptance pending).**
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
-Client 1.9 discovers each Server's DRAM/PMem topology and chooses a preferred pool
-by interleaving first across Servers, then across the selected Server's Tiers.
+Client 1.10 discovers each Server's DRAM/PMem topology. Its default preferred pool
+interleaves first across Servers, then across the selected Server's Tiers.
 Actual Slots are dynamically allocated and retained until invalidation and the
 last in-flight reference. Each interleave level stripes its common capacity and
 appends the larger side's tail. See the [Patch 6 guide](tests/patch6-client.md)
@@ -24,20 +24,26 @@ Current configuration expects two 48-GiB Servers (96 GiB total).
 The independent `tools/rswap_hotness` sampler observes a PID or launches a command,
 tracks activity over a configurable window, and exports per-page heat and means.
 The disabled-by-default `rswap:store_sample` event and offline checker correlate
-prior heat snapshots with Store PFNs. Patch 9 keeps interleave as its preferred
-Server/Tier policy, with capacity fallback; adaptive placement remains future work.
+prior heat snapshots with Store PFNs. With `--placement`, the sampler starts the
+Client policy before launching a workload and publishes complete heat generations.
+After warmup, known pages above the mean prefer DRAM, others PMem, with per-Tier
+Server round-robin. Unknown pages keep interleave; all choices use capacity fallback.
+Stop, uploader exit and swapoff clear policy without changing existing mappings.
+See the [Patch 10 design and interfaces](tests/patch10-placement.md) and
+[core acceptance plan](tests/patch10-core-smoke.md). No active migration is performed.
 The dense mapping and free lists use 12 bytes per pool page (288 MiB for 96 GiB,
 10.5 GiB for 3.5 TiB), plus allocation/page-table overhead. They are allocated before
 Frontswap registration even when the swap area is smaller than the pool.
 See the [Patch 9 guide](tests/patch9-mapping.md) for design, local validation,
 the `mapping` command, dynamic trace replay and hardware acceptance plan.
 See the [Patch 8 guide](tests/patch8-monitor.md) for hotness semantics and prior hardware results.
-The [Patch 8 core tests](tests/patch8-core-smoke.md) target Client 1.8; use the Patch 9
-acceptance plan for this version.
+The Patch 8/9 core instructions target older Client versions; use the Patch 10
+plan for this version.
 
 Use the matching Hermit kernel exporting `frontswap_register_managed_ops_v2`.
 The Patch 9 review fix also changes swap-fault error/PTE validation in the kernel:
-rebuild, install and reboot before hardware acceptance, even if v2 is already present.
+its fixed kernel must be deployed before hardware acceptance. The current Client
+already runs the verified #8 build; Patch 10 does not change the kernel.
 See the [minimal core acceptance and kernel handoff](tests/patch9-core-smoke.md).
 The kernel release string is unchanged, so `uname -r` alone does not identify this build.
 See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.
@@ -45,8 +51,8 @@ Use the [Patch 3 hardware test guide](tests/patch3-smoke.md) for commands and ex
 See [Patch 4 statistics](tests/patch4_summary.md) for counter definitions and `stats` / `monitor` commands.
 Use the [Patch 4 BFS test guide](tests/patch4-bfs-smoke.md) for the single-server 48-GiB and dual-server 80-GiB runs.
 Patch 1/2 smoke guides are historical and must not be used as Patch 3 swap instructions.
-The management script still only connects/disconnects; it does not create, format,
-activate or deactivate a swap area. Edit `client/rswap_client.conf` before install;
+The management script connects/disconnects and exposes monitoring/policy controls;
+it does not create, format, activate or deactivate swap. Edit `client/rswap_client.conf` before install;
 environment overrides are not used. The historical deployment instructions below
 predate this prototype and its managed Frontswap lifecycle.
 

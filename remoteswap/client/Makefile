@@ -9,6 +9,7 @@ else
 	rswap-client-y += rswap_rdma.o
 	rswap-client-y += rswap_stats.o
 	rswap-client-y += rswap_mapping.o
+	rswap-client-y += rswap_placement.o
 endif
 
 OFA_DIR ?= /usr/src/ofa_kernel/default

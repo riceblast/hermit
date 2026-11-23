@@ -181,11 +181,11 @@ int main(int argc, char **argv) {
     /* Launcher handshake and command status do not need privileged interfaces. */
     uint64_t start; int status;
     char *command[] = {"/bin/sh", "-c", "exit 7", NULL};
-    pid_t child = launch(command, &start);
+    pid_t child = launch(command, &start, &config);
     assert(child > 0 && start <= monotonic_ns());
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 7);
     char *missing[] = {"/nonexistent-rswap-command", NULL};
-    assert(launch(missing, &start) == -1 && errno == ENOENT);
+    assert(launch(missing, &start, &config) == -1 && errno == ENOENT);
     puts("PASS: production sampler fixtures, windows, aliases, mapping changes and launcher");
 }
 '''

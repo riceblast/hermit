@@ -220,6 +220,7 @@ int rswap_mapping_alloc_preferred(u64 offset, unsigned int s,
 		pool->stats.live++;
 		rswap_slot_location(id, loc);
 		rswap_slot_trace(0, id, offset, attempt);
+		loc->alloc_seq = mapping.sequence;
 		ret = 0;
 		goto out;
 	}

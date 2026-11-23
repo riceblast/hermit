@@ -6,6 +6,44 @@
 #define _RSWAP_TRACE_H
 
 #include <linux/tracepoint.h>
+#include "rswap_placement.h"
+
+/* Emitted immediately after the allocation attempt. alloc_seq joins the
+ * serialized mapping event even if CPUs emit decision events out of order.
+ */
+TRACE_EVENT(decision,
+	TP_PROTO(u64 offset, u64 pfn, const struct rswap_decision *d,
+		 const struct rswap_location *loc, int ret),
+	TP_ARGS(offset, pfn, d, loc, ret),
+	TP_STRUCT__entry(
+		__field(u64, offset) __field(u64, pfn) __field(u64, alloc_seq)
+		__field(u64, run) __field(u64, generation)
+		__field(u64, decision_ns) __field(u64, publish_ns) __field(u64, rr)
+		__field(unsigned int, state) __field(unsigned int, reason)
+		__field(int, heat) __field(int, mean)
+		__field(unsigned int, preferred_server) __field(unsigned int, preferred_tier)
+		__field(unsigned int, server) __field(unsigned int, tier)
+		__field(u64, slot) __field(unsigned int, fallback) __field(int, ret)
+	),
+	TP_fast_assign(
+		__entry->offset = offset; __entry->pfn = pfn;
+		__entry->alloc_seq = ret ? 0 : loc->alloc_seq;
+		__entry->run = d->run_id; __entry->generation = d->generation;
+		__entry->decision_ns = d->decision_ns; __entry->publish_ns = d->publish_ns;
+		__entry->rr = d->rr; __entry->state = d->state; __entry->reason = d->reason;
+		__entry->heat = d->heat; __entry->mean = d->mean;
+		__entry->preferred_server = d->server; __entry->preferred_tier = d->tier;
+		__entry->server = loc->server; __entry->tier = loc->tier; __entry->slot = loc->slot;
+		__entry->fallback = ret ? 0 : (loc->server ^ d->server) + 2 * (loc->tier ^ d->tier);
+		__entry->ret = ret;
+	),
+	TP_printk("alloc_seq=%llu offset=%llu pfn=%llu run=%llu generation=%llu decision_ns=%llu publish_ns=%llu state=%u reason=%u heat_ppm=%d mean_ppm=%d preferred_server=%u preferred_tier=%u server=%u tier=%u slot=%llu fallback=%u rr=%llu alloc_ret=%d",
+		__entry->alloc_seq, __entry->offset, __entry->pfn, __entry->run,
+		__entry->generation, __entry->decision_ns, __entry->publish_ns,
+		__entry->state, __entry->reason, __entry->heat, __entry->mean,
+		__entry->preferred_server, __entry->preferred_tier, __entry->server,
+		__entry->tier, __entry->slot, __entry->fallback, __entry->rr, __entry->ret)
+);
 
 /* Serialized allocator lifecycle; users excludes index ownership. */
 TRACE_EVENT(mapping,

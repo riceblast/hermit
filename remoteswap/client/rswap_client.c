@@ -6,9 +6,9 @@
 #include "constants.h"
 
 MODULE_AUTHOR("Chenxi Wang, Yifan Qiao");
-MODULE_DESCRIPTION("Hermit dynamic Slot pool with interleave placement and hotness observation");
+MODULE_DESCRIPTION("Hermit dynamic Slot pool with snapshot-based adaptive placement");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_VERSION("1.9");
+MODULE_VERSION("1.10");
 
 static char server_ip[INET_ADDRSTRLEN];
 static char server_ip2[INET_ADDRSTRLEN];

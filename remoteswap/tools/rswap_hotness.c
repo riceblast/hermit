@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Read-only process observation plus writes of target bits to page_idle.
- * Does not change swap configuration, placement policy, or process memory.
+/* Process observation plus target page_idle writes. Optional --placement
+ * publishes snapshots to the Client; never configures swap or cgroups.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "rswap_hotness.h"
+#include "../rswap_placement_uapi.h"
 
 #define PAGE_BYTES UINT64_C(4096)
 #define PM_PRESENT (UINT64_C(1) << 63)
@@ -51,7 +52,10 @@ struct config {
 	double interval, warmup;
 	unsigned int window;
 	const char *out;
-	bool pages;
+	bool pages, placement, manual;
+	int upload_fd;
+	const char *upload_path;
+	FILE *placement_log;
 };
 
 static volatile sig_atomic_t interrupted;
@@ -416,7 +420,104 @@ static int identity(pid_t pid, uint64_t *start)
 	return state == 'Z' || state == 'X' ? 0 : 1;
 }
 
-static int snapshot(const struct config *c, FILE *summary, const struct page_list *pages,
+static int upload_command(int fd, struct rswap_upload_command *command,
+		struct rswap_upload_ack *ack)
+{
+	ssize_t written;
+	do { written = write(fd, command, sizeof(*command)); }
+	while (written < 0 && errno == EINTR && !interrupted);
+	if (written != sizeof(*command)) {
+		if (written >= 0) errno = EIO;
+		return -1;
+	}
+	return ack ? exact_io(fd, ack, sizeof(*ack), 0, false) : 0;
+}
+
+static int placement_start(const struct config *c, uint64_t *t0)
+{
+	struct rswap_upload_command command = {.version = RSWAP_PLACEMENT_VERSION,
+		.op = RSWAP_UPLOAD_START, .count = (uint64_t)(c->warmup * 1e9),
+		.value = c->manual};
+	struct rswap_upload_ack ack;
+	if (upload_command(c->upload_fd, &command, &ack)) return -1;
+	if (!ack.run_id || !ack.start_ns || ack.generation) { errno = EPROTO; return -1; }
+	*t0 = ack.start_ns;
+	return 0;
+}
+
+static int heat_record_compare(const void *a, const void *b)
+{
+	const struct rswap_heat_record *x = a, *y = b;
+	return (x->pfn > y->pfn) - (x->pfn < y->pfn);
+}
+
+static int placement_snapshot(const struct config *c, const struct page_list *pages,
+		uint64_t generation, size_t known, int mean)
+{
+	size_t n = 0;
+	struct rswap_heat_record *records = NULL;
+	struct {
+		struct rswap_upload_command command;
+		struct rswap_heat_record records[RSWAP_UPLOAD_BATCH];
+	} packet;
+	struct rswap_upload_ack ack;
+	struct rswap_upload_command command = {.version = RSWAP_PLACEMENT_VERSION,
+		.op = RSWAP_UPLOAD_BEGIN, .generation = generation + 1,
+		.value = known, .mean_ppm = mean};
+	uint64_t begin = monotonic_ns();
+	int ret = -1;
+
+	for (size_t i = 0; i < pages->n; i++) {
+		const struct hot_page *p = &pages->v[i];
+		n += p->state == RESIDENT && !p->alias && p->pfn && heat_valid(&p->heat);
+	}
+	if (n) {
+		records = malloc(n * sizeof(*records));
+		if (!records) return -1;
+	}
+	n = 0;
+	for (size_t i = 0; i < pages->n; i++) {
+		const struct hot_page *p = &pages->v[i];
+		if (p->state == RESIDENT && !p->alias && p->pfn && heat_valid(&p->heat))
+			records[n++] = (struct rswap_heat_record){.pfn = p->pfn,
+				.heat_ppm = heat_ppm(&p->heat)};
+	}
+	if (n > 1) qsort(records, n, sizeof(*records), heat_record_compare);
+	command.count = n;
+	if (upload_command(c->upload_fd, &command, NULL)) goto out;
+	for (size_t i = 0; i < n;) {
+		size_t count = n - i;
+		if (count > RSWAP_UPLOAD_BATCH) count = RSWAP_UPLOAD_BATCH;
+		packet.command = (struct rswap_upload_command){.version = RSWAP_PLACEMENT_VERSION,
+			.op = RSWAP_UPLOAD_DATA, .generation = generation + 1, .count = count};
+		memcpy(packet.records, records + i, count * sizeof(*records));
+		size_t bytes = sizeof(packet.command) + count * sizeof(*records);
+		ssize_t written;
+		do { written = write(c->upload_fd, &packet, bytes); }
+		while (written < 0 && errno == EINTR && !interrupted);
+		if (written != (ssize_t)bytes) { if (written >= 0) errno = EIO; goto out; }
+		i += count;
+	}
+	command = (struct rswap_upload_command){.version = RSWAP_PLACEMENT_VERSION,
+		.op = RSWAP_UPLOAD_COMMIT, .generation = generation + 1};
+	if (upload_command(c->upload_fd, &command, &ack)) goto out;
+	if (ack.generation != generation + 1) { errno = EPROTO; goto out; }
+	fprintf(c->placement_log, "1\t%" PRIu64 "\t%llu\t%llu\t%llu\t%llu\t%zu\t%zu\t%d\t%.3f\n",
+		generation, (unsigned long long)ack.run_id, (unsigned long long)ack.start_ns,
+		(unsigned long long)ack.generation, (unsigned long long)ack.publish_ns,
+		n, known, mean, (monotonic_ns() - begin) / 1e6);
+	if (fflush(c->placement_log) || ferror(c->placement_log)) goto out;
+	ret = 0;
+out:
+	free(records);
+	/* An explicit Stop or swapoff ends this run, not observation/the workload.
+	 * Other upload failures retain Patch 8's explicit monitor-error behavior.
+	 */
+	if (ret && errno == ESTALE) return 1;
+	return ret;
+}
+
+static int snapshot(struct config *c, FILE *summary, const struct page_list *pages,
 		    uint64_t generation, uint64_t begin, uint64_t end, uint64_t t0)
 {
 	size_t known = 0, active = 0, idle = 0, present = 0, swapped = 0;
@@ -453,9 +554,22 @@ static int snapshot(const struct config *c, FILE *summary, const struct page_lis
 	/* A row commits a fully written snapshot. Only ready_ns <= Store time may
  	 * be used by the offline checker; end_ns alone would permit future data.
 	 */
+	double mean = known ? (double)(sum / known) : -1;
+	/* Kernel uses integer ppm: floor both the page heat and the original mean.
+	 * Equal fixed-point values are cold; no floating point in the Store path.
+	 */
+	if (c->placement && c->upload_fd >= 0) {
+		int uploaded = placement_snapshot(c, pages, generation, known,
+			known ? (int)(sum * RSWAP_HEAT_SCALE / known) : -1);
+		if (uploaded < 0) return -1;
+		if (uploaded > 0) {
+			close(c->upload_fd);
+			c->upload_fd = -1;
+			printf("PLACEMENT stopped by control/swapoff; continuing observation only\n");
+		}
+	}
 	uint64_t ready = monotonic_ns();
 	const char *phase = ready - t0 < c->warmup * 1e9 ? "warmup" : "observe";
-	double mean = known ? (double)(sum / known) : -1;
 	fprintf(summary, "1\t%ld\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%.9f\t%.3f\t%d\t%s\n",
 		(long)c->pid, generation, t0, begin, end, ready, phase, pages->n, present, swapped,
 		active, idle, pages->n - active - idle, known, mean, (end - begin) / 1e6,
@@ -470,11 +584,12 @@ static int snapshot(const struct config *c, FILE *summary, const struct page_lis
 static void usage(FILE *f)
 {
 	fprintf(f, "Usage: rswap_hotness --out DIR [--interval SEC] [--window N] [--warmup SEC]\n"
-		"                     [--pages] (--pid PID | -- COMMAND [ARGS...])\n"
+		"                     [--pages] [--placement [--manual]] (--pid PID | -- COMMAND [ARGS...])\n"
 		"Defaults: interval=1, window=20 (1..64 rounds), warmup=20.\n"
 		"DIR must not exist. --pages writes per-round TSVs for offline Store matching.\n"
 		"Requires 4-KiB pages, CAP_SYS_ADMIN/PFN visibility, and page_idle write access.\n"
-		"No placement changes. Ctrl-C stops observation; launched children receive the signal.\n");
+		"--placement starts Client policy before launch (active swap required); --manual waits for adaptive command.\n"
+		"Default is observation only. Ctrl-C stops; launched children receive the signal.\n");
 }
 
 static int run_metadata(const struct config *c, uint64_t token, uint64_t start,
@@ -513,7 +628,7 @@ static long integer_value(const char *s, long max)
 	return errno || end == s || *end || value < 1 || value > max ? -1 : value;
 }
 
-static pid_t launch(char **command, uint64_t *t0)
+static pid_t launch(char **command, uint64_t *t0, const struct config *c)
 {
 	int gate[2], result[2], error = 0;
 	pid_t pid;
@@ -522,6 +637,7 @@ static pid_t launch(char **command, uint64_t *t0)
 	pid = fork();
 	if (!pid) {
 		char go;
+		if (c->placement) close(c->upload_fd);
 		close(gate[1]); close(result[0]);
 		if (read(gate[0], &go, 1) != 1) _exit(127);
 		close(gate[0]);
@@ -534,6 +650,13 @@ static pid_t launch(char **command, uint64_t *t0)
 	close(gate[0]); close(result[1]);
 	if (pid < 0) { close(gate[1]); close(result[0]); return -1; }
 	*t0 = monotonic_ns();
+	if (c->placement && placement_start(c, t0)) {
+		int saved = errno;
+		close(gate[1]); close(result[0]);
+		while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+		errno = saved;
+		return -1;
+	}
 	ssize_t sent = write(gate[1], "x", 1);
 	close(gate[1]);
 	ssize_t got;
@@ -550,10 +673,12 @@ static pid_t launch(char **command, uint64_t *t0)
 
 int main(int argc, char **argv)
 {
-	struct config c = {.interval = 1, .window = 20, .warmup = 20};
+	struct config c = {.interval = 1, .window = 20, .warmup = 20, .upload_fd = -1,
+		.upload_path = "/sys/kernel/debug/rswap/hotness"};
 	const struct option options[] = {{"pid", 1, NULL, 'p'}, {"interval", 1, NULL, 'i'},
 		{"window", 1, NULL, 'w'}, {"warmup", 1, NULL, 't'}, {"out", 1, NULL, 'o'},
-		{"pages", 0, NULL, 'P'}, {"help", 0, NULL, 'h'}, {NULL, 0, NULL, 0}};
+		{"pages", 0, NULL, 'P'}, {"placement", 0, NULL, 'A'},
+		{"manual", 0, NULL, 'M'}, {"help", 0, NULL, 'h'}, {NULL, 0, NULL, 0}};
 	struct page_list old = {0};
 	int option, flags_fd = -1, idle_fd = -1, status = 0, ret = 1, monitor_error;
 	pid_t child = -1;
@@ -569,11 +694,13 @@ int main(int argc, char **argv)
 		case 't': c.warmup = seconds_value(optarg, true); if (c.warmup < 0) goto bad; break;
 		case 'o': c.out = optarg; break;
 		case 'P': c.pages = true; break;
+		case 'A': c.placement = true; break;
+		case 'M': c.manual = true; break;
 		case 'h': usage(stdout); return 0;
 		default: goto bad;
 		}
 	}
-	if (!c.out || (!!c.pid == (optind < argc))) goto bad;
+	if (!c.out || (!!c.pid == (optind < argc)) || (c.manual && !c.placement)) goto bad;
 	if (sysconf(_SC_PAGESIZE) != 4096) { fprintf(stderr, "4-KiB system pages required\n"); return 1; }
 	flags_fd = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
 	idle_fd = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
@@ -585,15 +712,27 @@ int main(int argc, char **argv)
 	if (fcntl(fileno(summary), F_SETFD, FD_CLOEXEC)) goto fail;
 	fputs(summary_header, summary);
 	if (fflush(summary)) goto fail;
+	if (c.placement) {
+		c.upload_fd = open(c.upload_path, O_RDWR | O_CLOEXEC);
+		if (c.upload_fd < 0) goto fail;
+		if (snprintf(path, sizeof(path), "%s/placement.tsv", c.out) >= (int)sizeof(path)) {
+			errno = ENAMETOOLONG; goto fail;
+		}
+		c.placement_log = fopen(path, "wx");
+		if (!c.placement_log || fcntl(fileno(c.placement_log), F_SETFD, FD_CLOEXEC)) goto fail;
+		fputs("version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean_ppm\tupload_ms\n", c.placement_log);
+	}
 	struct sigaction action = {.sa_handler = on_signal};
 	sigemptyset(&action.sa_mask);
 	sigaction(SIGINT, &action, NULL); sigaction(SIGTERM, &action, NULL);
 	signal(SIGPIPE, SIG_IGN);
 	t0 = monotonic_ns();
 	if (!c.pid) {
-		child = launch(argv + optind, &t0);
+		child = launch(argv + optind, &t0, &c);
 		if (child < 0) goto fail;
 		c.pid = child;
+	} else if (c.placement && placement_start(&c, &t0)) {
+		goto fail;
 	}
 	int alive = identity(c.pid, &token);
 	if (alive < 0) goto fail;
@@ -632,6 +771,11 @@ fail:
 	perror("rswap hotness");
 out:
 	observation_end = monotonic_ns();
+	/* Closing the owner fd stops policy even on errors, before waiting for a
+	 * launched child. SIGKILL also closes it; inherited child copy was closed.
+	 */
+	if (c.upload_fd >= 0) close(c.upload_fd);
+	if (c.placement_log && fclose(c.placement_log)) ret = 1;
 	if (flags_fd >= 0) close(flags_fd);
 	if (idle_fd >= 0) close(idle_fd);
 	if (summary && fclose(summary)) ret = 1;

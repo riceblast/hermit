@@ -51,6 +51,7 @@ typedef atomic_llong atomic64_t;
 #define atomic64_set(p, value) atomic_store(p, value)
 #define atomic64_read(p) atomic_load(p)
 #include "rswap_mapping.h"
+#include "rswap_placement.h"
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 4096ULL
 #define CHUNK_SHIFT 33
@@ -167,6 +168,17 @@ struct rswap_rdma_queue {
 };
 static struct rdma_session_context rdma_sessions[2];
 static struct rswap_pool_layout pool_layout;
+static int policy_override = -1;
+int rswap_placement_choose(u64 offset, u64 pfn, struct rswap_decision *d) {
+    u64 ignored;
+    memset(d, 0, sizeof(*d));
+    int ret = rswap_map_page(&pool_layout, offset, &d->server, &d->tier, &ignored);
+    if (!ret && policy_override >= 0) { d->server = 0; d->tier = policy_override; }
+    return ret;
+}
+void rswap_placement_area(bool active) {}
+static void trace_decision(u64 offset, u64 pfn, const struct rswap_decision *d,
+                          const struct rswap_location *loc, int ret) {}
 static unsigned int active_servers = 2, area_type;
 static bool area_active = true;
 static pthread_mutex_t area_lock = PTHREAD_MUTEX_INITIALIZER;

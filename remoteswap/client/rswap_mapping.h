@@ -20,6 +20,7 @@ struct rswap_pool_layout {
 struct rswap_location {
 	unsigned int id, server, tier;
 	u64 slot;
+	u64 alloc_seq; /* allocation event identity; only set by alloc_preferred */
 };
 
 struct rswap_mapping_pool_stats {
@@ -35,7 +36,7 @@ struct rswap_mapping_stats {
 int rswap_mapping_init(const struct rswap_pool_layout *layout);
 void rswap_mapping_destroy(void);
 int rswap_mapping_alloc(u64 offset, struct rswap_location *location);
-/* Mechanism entry for a future policy; Client 1.9 uses interleave via alloc(). */
+/* Mechanism entry: policy supplies preference, allocator owns fallback/lifetime. */
 int rswap_mapping_alloc_preferred(u64 offset, unsigned int server,
 		unsigned int tier, struct rswap_location *location);
 int rswap_mapping_get(u64 offset, struct rswap_location *location);

@@ -8,6 +8,7 @@
 
 #include "rswap_rdma.h"
 #include "rswap_mapping.h"
+#include "rswap_placement.h"
 
 #define CREATE_TRACE_POINTS
 #include "rswap_trace.h"
@@ -275,7 +276,8 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 		enum rdma_queue_type type, struct fs_rdma_req **store_req)
 {
 	struct rswap_remote_page remote;
-	struct rswap_location location;
+	struct rswap_location location = {};
+	struct rswap_decision decision;
 	struct rdma_session_context *session = NULL;
 	struct rswap_rdma_queue *queue;
 	struct fs_rdma_req *req;
@@ -290,8 +292,17 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 		ret = -EINVAL;
 		goto submit_error;
 	}
-	ret = type == QP_STORE ? rswap_mapping_alloc(offset, &location) :
-		rswap_mapping_get(offset, &location);
+	if (type == QP_STORE) {
+		ret = rswap_placement_choose(offset, page_to_pfn(page), &decision);
+		if (!ret) {
+			ret = rswap_mapping_alloc_preferred(offset, decision.server,
+				decision.tier, &location);
+			/* Allocation decision, not post status or terminal WC success. */
+			trace_decision((u64)offset, page_to_pfn(page), &decision, &location, ret);
+		}
+	} else {
+		ret = rswap_mapping_get(offset, &location);
+	}
 	if (ret)
 		goto submit_error;
 	/* Resolve failures still own the reference obtained above. */
@@ -505,6 +516,7 @@ static void rswap_invalidate_area(unsigned int type)
 	spin_lock_irqsave(&area_lock, flags);
 	area_active = false;
 	spin_unlock_irqrestore(&area_lock, flags);
+	rswap_placement_area(false);
 	/* No submitter can reserve a WR after the drain has passed its queue. */
 	while (atomic_read(&area_submissions))
 		cond_resched();
@@ -517,6 +529,7 @@ static void rswap_frontswap_init(unsigned int type)
 {
 	unsigned long flags;
 
+	rswap_placement_area(true);
 	spin_lock_irqsave(&area_lock, flags);
 	WRITE_ONCE(area_type, type);
 	area_active = true;
@@ -614,12 +627,13 @@ int rswap_client_init(const struct rswap_client_config *config)
 	ret = rswap_mapping_init(&pool_layout);
 	if (ret)
 		goto fail;
+	rswap_placement_init(&pool_layout);
 	ret = rswap_stats_init(active_servers);
 	if (ret) {
 		pr_err("rswap: statistics interface initialization failed: %d\n", ret);
 		goto fail;
 	}
-	pr_info("rswap: pool ready servers=%u total=%u GiB (dynamic Slots, two-level interleave, 4-KiB swap ready)\n",
+	pr_info("rswap: pool ready servers=%u total=%u GiB (dynamic Slots, opt-in adaptive placement, 4-KiB swap ready)\n",
 		active_servers, total_gib);
 	return 0;
 fail:
@@ -635,6 +649,7 @@ void rswap_client_exit(void)
 
 	/* Remove the interface before any Session storage is released. */
 	rswap_stats_exit();
+	rswap_placement_exit();
 	/* Stop every selected session before reverse-order destruction. */
 	for (id = 0; id < active_servers; id++)
 		WRITE_ONCE(rdma_sessions[id].stopping, true);
