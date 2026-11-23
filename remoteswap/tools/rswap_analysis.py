@@ -46,7 +46,7 @@ def publications(directory):
             raise ValueError('Publication references absent sample')
         summary = summaries[sample]
         identity = int(row['run_id'])
-        if (int(row['version']) != 1 or identity <= 0 or gen != sample+1 or gen <= previous or
+        if (int(row['version']) not in (1, 2) or identity <= 0 or gen != sample+1 or gen <= previous or
                 (run_id is not None and identity != run_id) or int(row['start_ns']) != start or
                 int(row['known']) != int(summary['known']) or
                 not 0 <= int(row['records']) <= int(row['known']) or
@@ -60,6 +60,8 @@ def publications(directory):
             raise ValueError('Publication/summary mean mismatch')
         previous, run_id = gen, identity
         result[gen] = row
+    from rswap_threshold_check import validate_thresholds
+    validate_thresholds(directory, result)
     return run, summaries, result
 
 
@@ -73,6 +75,10 @@ def hotness_summary(directory):
                 max_upload_ms=max(float(r['upload_ms']) for r in pubs.values()),
                 max_known=max(int(r['known']) for r in summaries),
                 max_resident_records=max(int(r['records']) for r in pubs.values()),
+                threshold=({key: int(list(pubs.values())[-1][key]) for key in
+                            ('policy', 'threshold_ppm', 'threshold_source', 'threshold_generation',
+                             'population_pages', 'threshold_sample_pages', 'candidate_pages', 'local_pages')}
+                           if int(next(iter(pubs.values()))['version']) == 2 else None),
                 note='Known history pages differ from uploaded resident PFNs; neither is a kernel Store hit rate.')
 
 
@@ -90,12 +96,14 @@ def check_heat(decisions, directory, detail=None):
         if d['generation']:
             groups[d['generation']].append(d)
     totals = Counter()
+    from rswap_threshold_check import distribution
+    model_histograms = distribution(directory) if any(int(p['version']) == 2 for p in pubs.values()) else {}
     writer = None
     stream = Path(detail).open('x') if detail else None
     try:
         if stream:
             fields = ['alloc_seq', 'run', 'generation', 'pfn', 'va', 'reason', 'heat_ppm', 'mean_ppm',
-                      'snapshot_age_ns', 'preferred_server', 'preferred_tier', 'server', 'tier', 'slot', 'fallback']
+                      'snapshot_age_ns', 'threshold_ppm', 'policy', 'threshold_source', 'threshold_generation', 'threshold_status', 'preferred_server', 'preferred_tier', 'server', 'tier', 'slot', 'fallback']
             writer = csv.DictWriter(stream, fieldnames=fields, delimiter='\t')
             writer.writeheader()
         for generation, records in sorted(groups.items()):
@@ -105,8 +113,11 @@ def check_heat(decisions, directory, detail=None):
             snapshot = snapshots[int(pub['sample_generation'])]
             # Reuse Patch 8's production validator for VA/history/aliases/mean.
             pfns = read_pages(snapshot)
+            model = Counter()
             with snapshot.path.open() as src:
                 for row in csv.DictReader(src, delimiter='\t'):
+                    if row['state'] in ('resident', 'swapped') and row['alias'] == '0':
+                        model[int(row['heat_ppm'])] += 1
                     if row['state'] == 'resident' and row['alias'] == '0':
                         pfn = int(row['pfn'])
                         if pfn not in pfns:
@@ -115,17 +126,27 @@ def check_heat(decisions, directory, detail=None):
                             pfns[pfn] = (int(row['va'], 16), int(row['heat_ppm']))
                         else:
                             del pfns[pfn]
+            if int(pub['version']) == 2:
+                if dict(model) != model_histograms.get(int(pub['sample_generation']), {}):
+                    raise ValueError('Threshold histogram differs from page snapshot')
             if len(pfns) != int(pub['records']):
                 raise ValueError('Upload record count differs from page snapshot')
             for d in records:
                 if (d['run'] != int(pub['run_id']) or d['publish_ns'] != int(pub['publish_ns']) or
                         d['mean_ppm'] != int(pub['mean_ppm']) or d['decision_ns'] < d['publish_ns']):
                     raise ValueError('Decision/publication mismatch')
+                if 'threshold_ppm' in d:
+                    if int(pub['version']) != 2 or any(d[k] != int(pub[k]) for k in
+                            ('threshold_ppm', 'policy', 'threshold_source', 'threshold_generation', 'threshold_status')):
+                        raise ValueError('Decision/threshold publication mismatch')
+                elif int(pub['version']) == 2:
+                    raise ValueError('New publication paired with legacy decision')
                 frame = pfns.get(d['pfn'])
-                if d['reason'] in (5, 6):
+                if d['reason'] in (5, 6, 7):
                     if frame is None or d['heat_ppm'] != frame[1]:
                         raise ValueError('Decision/PFN heat mismatch')
                     totals['known_pfn_consistent'] += 1
+                    if d['reason'] == 7: totals['zero_interleave_consistent'] += 1
                 elif d['reason'] == 4:
                     if frame is not None:
                         raise ValueError('PFN miss was present in uploaded table')

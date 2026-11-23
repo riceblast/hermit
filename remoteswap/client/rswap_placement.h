@@ -8,11 +8,13 @@
 enum rswap_policy_state { RSWAP_INACTIVE, RSWAP_WARMUP, RSWAP_ADAPTIVE };
 enum rswap_policy_reason { RSWAP_REASON_INACTIVE, RSWAP_REASON_WARMUP,
 	RSWAP_REASON_NO_SNAPSHOT, RSWAP_REASON_NO_MEAN, RSWAP_REASON_UNKNOWN,
-	RSWAP_REASON_HOT, RSWAP_REASON_COLD, RSWAP_REASON_COUNT };
+	RSWAP_REASON_HOT, RSWAP_REASON_COLD, RSWAP_REASON_ZERO, RSWAP_REASON_COUNT };
 
 struct rswap_decision {
 	u64 run_id, generation, publish_ns, decision_ns, rr;
-	int heat, mean;
+	int heat, mean, threshold;
+	u64 threshold_generation;
+	unsigned int policy, threshold_source, threshold_status;
 	unsigned int state, reason, server, tier;
 };
 

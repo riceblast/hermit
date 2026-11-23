@@ -1,8 +1,12 @@
 # Remoteswap
 
-**Development stage: Patch 11 (policy counters and formal monitoring/reporting; single/dual-node core hardware acceptance passed).**
+**Development stage: Client 1.12 capacity-mean placement (compiled/local validation; new policy hardware acceptance pending).**
+The new [capacity-mean policy](tests/capacity-mean-placement.md) uses an estimated
+remote-candidate mean, keeps unknown/zero-heat Stores on Interleave, and separates
+observed means from placement thresholds. Local upload ABI v2 requires matching
+Client/sampler builds; Server protocol v2 is unchanged.
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
-Client 1.11 discovers each Server's DRAM/PMem topology. Its default preferred pool
+Client 1.12 discovers each Server's DRAM/PMem topology. Its default preferred pool
 interleaves first across Servers, then across the selected Server's Tiers.
 Actual Slots are dynamically allocated and retained until invalidation and the
 last in-flight reference. Each interleave level stripes its common capacity and
@@ -26,8 +30,8 @@ tracks activity over a configurable window, and exports per-page heat and means.
 The disabled-by-default `rswap:store_sample` event and offline checker correlate
 prior heat snapshots with Store PFNs. With `--placement`, the sampler starts the
 Client policy before launching a workload and publishes complete heat generations.
-After warmup, known pages above the mean prefer DRAM, others PMem, with per-Tier
-Server round-robin. Unknown pages keep interleave; all choices use capacity fallback.
+After warmup, known positive pages at or above the configured threshold prefer DRAM, lower positive pages PMem, with per-Tier
+Server round-robin. Unknown and zero-heat pages keep interleave; all choices use capacity fallback.
 Stop, uploader exit and swapoff clear policy without changing existing mappings.
 See the [Patch 10 design and interfaces](tests/patch10-placement.md) and
 [core acceptance plan](tests/patch10-core-smoke.md). No active migration is performed.

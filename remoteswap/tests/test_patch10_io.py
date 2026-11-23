@@ -15,7 +15,7 @@ int main(void) {
     init(); reset(&p); trace_enabled=false; /* legacy observer assumes interleave */
     struct rswap_heat_snapshot *snap=calloc(1,sizeof(*snap)+sizeof(snap->records[0]));
     assert(snap);
-    snap->count=snap->known=1; snap->generation=1; snap->publish_ns=1; snap->mean=500000;
+    snap->count=snap->known=1; snap->generation=1; snap->publish_ns=1; snap->mean=500000; snap->threshold.threshold_ppm=500000;
     snap->records[0]=(struct rswap_heat_record){.pfn=page_to_pfn(&p),.heat_ppm=1000000};
     struct rswap_policy_run run={.id=1,.start_ns=1,.snapshot=snap}; policy_run=&run;
     assert(!prepare(0,1,&p,0,&cookie));
@@ -28,7 +28,7 @@ int main(void) {
     assert(cqs[0][QP_LOAD_SYNC].queued->mapping_id==old);
     rswap_invalidate_page(0,1);
     atomic_store(&fresh.refs,1); atomic_store(&fresh.locked,1);
-    snap->records[0]=(struct rswap_heat_record){.pfn=page_to_pfn(&fresh),.heat_ppm=0};
+    snap->records[0]=(struct rswap_heat_record){.pfn=page_to_pfn(&fresh),.heat_ppm=250000};
     snap->generation=2;
     assert(!prepare(0,1,&fresh,0,&cookie)); req=cookie;
     assert(req->tier==RSWAP_TIER_PMEM && req->rdma_queue==&queues[0][QP_STORE]);

@@ -1,8 +1,12 @@
 # BFS：双节点冷热识别、页面放置与带宽观察
 
-适用当前 Client **1.11**、协议 v2，以及 optane 上已验证的 Hermit **#8 内核**。
+适用当前 Client **1.12**、协议 v2，以及 optane 上已验证的 Hermit **#8 内核**。
 下面按终端与操作顺序拆分，每个命令块可以单独复制；使用 Bash，不需要把整篇拼成一个脚本。
 本文件是手动实验指南，写入文档本身不会启动实验。
+
+后续手动切换、缩短窗口及改变内存限制的实测结果，见
+[BFS 分阶段带宽排查](bfs-tier-bandwidth-study.md)。其中区分了完整阶段均值、短窗口波动，
+以及当前 80 GiB swap 在静态 Interleave 中的 PMem 尾段偏好。
 
 ## 先明确这次能观察什么
 
@@ -97,7 +101,7 @@ make -C remoteswap/tools
 modinfo -F version remoteswap/client/rswap-client.ko
 ```
 
-期望版本为 `1.11`。
+期望版本为 `1.12`。
 
 ## 2. 两个远端终端：分别启动 Server
 
@@ -336,6 +340,7 @@ ls -lh "$BFS_RUN/pool/samples.jsonl"
 ```bash
 sudo env OMP_NUM_THREADS=40 remoteswap/tools/rswap_hotness \
   --out "$BFS_RUN/heat" --placement --interval 1 --window 20 --warmup 20 \
+  --threshold-policy capacity-mean --memory-cgroup "$BFS_CGROUP" --reserve-gib 1 \
   -- bash -ec 'echo "$$" > "$1/cgroup.procs"; exec "$2" -s -rounds 1 "$3"' \
   bfs "$BFS_CGROUP" \
   /mnt/sdb2/yxr/K_R_benchmarks/ligra/apps/BFS \
@@ -346,8 +351,8 @@ printf '%s\n' "${PIPESTATUS[0]}" > "$BFS_RUN/bfs.exit"
 
 这是启动冷热识别的显式 Start：`--placement` 先建立策略 run，再放行 BFS，
 从启动时开始计时，包含读图、初始化和 Ligra 预热；不等 BFS 的算法计时段才开始。
-前 20 秒 Warmup，继续 Interleave；到期自动 Adaptive，每次完整上传后更新热度和均值。
-目标时间到了即可切换，但首次完整快照/有效均值未准备好时仍会回退 Interleave。
+前 20 秒 Warmup，继续 Interleave；到期自动 Adaptive，每次完整上传后更新热度、真实均值和容量裁剪阈值。
+目标时间到了即可切换，但首次完整快照/有效阈值未准备好时仍会回退 Interleave。
 
 默认不加 `--pages`，避免 64G 工作集生成海量逐页 TSV。摘要、逐代上传、实际决策累计计数仍然保留。
 BFS 的 `-rounds 1` 表示一次计时轮次，程序仍有自带预热。
@@ -420,9 +425,9 @@ sudo cat /sys/kernel/debug/rswap/policy_stats
 | `fallback ID count` | 容量 Fallback；0=首选，1=另一 Server 同 Tier，2/3=跨 Tier |
 | `allocation_error count` | 没有可分配 Slot 的次数 |
 
-Reason：0 Inactive、1 Warmup、2 无快照、3 无有效均值、4 PFN miss、5 热、6 冷。
-Adaptive 中 `heat_ppm > mean_ppm` 首选 DRAM，否则首选 PMem；目标 Tier 内两 Server 轮转。
-未知热度继续 Interleave，首选池不足才尝试 Fallback。
+Reason：0 Inactive、1 Warmup、2 无快照、3 无有效阈值、4 PFN miss、5 正热度 DRAM 优先、6 正热度 PMem 优先、7 零热度 Interleave。
+Adaptive 中已知正热度 `heat_ppm >= threshold_ppm` 首选 DRAM，较低正热度首选 PMem；目标 Tier 内两 Server 轮转。
+未知和零热度继续 Interleave，首选池不足才尝试 Fallback。mean_ppm 是真实均值，不能代替 threshold_ppm。
 
 想看工具转换后的带拓扑、容量和覆盖率的 JSON：
 
@@ -490,7 +495,7 @@ echo 0 | sudo tee "$BFS_TRACE/events/rswap/decision/enable"
 head -n 10 "$BFS_RUN/decisions-short.log"
 ```
 
-关注 `reason=5/6`、`heat_ppm`、`mean_ppm`、`preferred_server/preferred_tier`、
+关注 `reason=5/6/7`、`heat_ppm`、真实 `mean_ppm`、实际 `threshold_ppm`、`preferred_server/preferred_tier`、
 实际 `server/tier/slot`、`fallback`、`alloc_ret`。`alloc_ret=0` 表示已分配位置，
 不单凭该事件认定后续 RDMA 成功；成功写入仍看 WC 统计。
 `heat_ppm=-1` 是未查询到已知热度的标记，不是“极冷”；`alloc_seq` 区分分配生命周期。
@@ -571,10 +576,11 @@ python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r[
 
 本流程不重载模块，所以报告应只有一个 segment，且 `settled_checked=true`。
 `window.policy` 是 collector 基线到最终快照的增量，不会把此模块更早的累计值误当本轮结果。
-热度覆盖率分母是所有 Adaptive Store 决策；有快照 PFN 命中率分母排除无快照和无均值决策。
+热度覆盖率分母是所有 Adaptive Store 决策，分子包含已知零热度；positive_heat_coverage 仅计正热度分类。
+有快照 PFN 命中率分母排除无快照和无可用阈值决策。
 分母为 0 会显示 null。带宽窗口包括启动/收尾，不能直接当作 BFS 算法计时段的带宽。
 
-参考刚通过的同配置验收：实际热度覆盖约 **29.97%**，33 轮采样、21 轮超期；
+参考历史 Client 1.11 的同工作负载验收（旧全局均值策略）：实际热度覆盖约 **29.97%**，33 轮采样、21 轮超期；
 这些只是示例，不是下一轮必须达到的数值。是否开启短 Trace 也会影响实验开销。
 
 ## 11. Client A：卸载、恢复参数、保存 Server 日志

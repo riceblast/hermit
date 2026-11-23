@@ -12,14 +12,19 @@ static struct rswap_pool_layout layout = {.nr_servers=2, .total_pages=32,
 static struct file owner;
 static loff_t position;
 static ssize_t command(struct file *f, unsigned op, u64 gen, u64 count, u64 value, int mean) {
-    struct rswap_upload_command c = {.version=1, .op=op, .generation=gen,
+    struct rswap_upload_command c = {.version=RSWAP_PLACEMENT_VERSION, .op=op, .generation=gen,
         .count=count, .value=value, .mean_ppm=mean};
+    if (op == RSWAP_UPLOAD_BEGIN) {
+        struct { struct rswap_upload_command command; struct rswap_threshold_metadata metadata; } packet = {
+            .command=c, .metadata={.threshold_ppm=mean,.generation=mean>=0 ? gen : 0}};
+        return rswap_upload_write(f,(void *)&packet,sizeof(packet),&position);
+    }
     return rswap_upload_write(f, (void *)&c, sizeof(c), &position);
 }
 static ssize_t data(struct file *f, u64 gen, struct rswap_heat_record *records, size_t n) {
     char buf[sizeof(struct rswap_upload_command) + 4 * sizeof(*records)];
     assert(n <= 4);
-    struct rswap_upload_command c = {.version=1, .op=RSWAP_UPLOAD_DATA,
+    struct rswap_upload_command c = {.version=RSWAP_PLACEMENT_VERSION, .op=RSWAP_UPLOAD_DATA,
         .generation=gen, .count=n};
     memcpy(buf, &c, sizeof(c)); memcpy(buf+sizeof(c), records, n*sizeof(*records));
     return rswap_upload_write(f, buf, sizeof(c)+n*sizeof(*records), &position);
@@ -57,7 +62,7 @@ static void phases(void) {
     d = choose(65); assert(d.server == 1 && d.rr == 1);
     assert(choose(66).reason == RSWAP_REASON_UNKNOWN);
     publish(2, 500000, 500000);
-    d = choose(65); assert(d.reason == RSWAP_REASON_COLD && d.tier == 1 && d.rr == 0);
+    d = choose(65); assert(d.reason == RSWAP_REASON_HOT && d.tier == 0 && d.rr == 2);
     assert(command(&owner, 2, 3, 0, 0, -1) > 0);
     assert(command(&owner, 4, 3, 0, 0, 0) > 0);
     assert(choose(65).reason == RSWAP_REASON_NO_MEAN);
@@ -110,7 +115,7 @@ static void transactions(void) {
     assert(command(&owner, 4, 2, 0, 0, 0) == -EFAULT); copy_fault=false;
     assert(!((struct rswap_uploader *)owner.private_data)->staging);
     publish(2, 0, 500000);
-    assert(choose(65).generation == 2 && choose(65).tier == 1);
+    assert(choose(65).generation == 2 && choose(65).reason == RSWAP_REASON_ZERO);
     struct rswap_upload_ack ack; loff_t pos=0;
     assert(rswap_upload_read(&owner, (void *)&ack, sizeof(ack), &pos) == sizeof(ack));
     assert(ack.generation == 2 && ack.run_id && ack.publish_ns);

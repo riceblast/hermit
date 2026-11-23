@@ -8,7 +8,7 @@ import time
 
 from rswap_stats import BaselineChanged, parse_snapshot, positive_interval, rates_between
 
-REASONS = ('inactive', 'warmup', 'no_snapshot', 'no_mean', 'pfn_miss', 'hot', 'cold')
+REASONS = ('inactive', 'warmup', 'no_snapshot', 'no_mean', 'pfn_miss', 'hot', 'cold', 'zero_interleave')
 OUTCOMES = ('decisions', 'post_ok', 'post_error', 'wc_ok', 'wc_error')
 TIERS = ('dram', 'pmem')
 
@@ -20,8 +20,9 @@ def parse_policy(text):
         if len(lines[0].split()) != 5 or set(head) != {'version', 'instance_ns', 'sample_ns', 'nr_servers', 'page_size'}:
             raise ValueError('invalid header')
         head = {k: int(v) for k, v in head.items()}
-        if head['version'] != 1 or head['nr_servers'] not in (1, 2) or min(head.values()) <= 0:
+        if head['version'] not in (1, 2) or head['nr_servers'] not in (1, 2) or min(head.values()) <= 0:
             raise ValueError('unsupported metadata')
+        reason_count = 7 if head['version'] == 1 else 8
         counters = {}
         for line in lines[1:]:
             words = line.split()
@@ -29,7 +30,7 @@ def parse_policy(text):
             values = tuple(map(int, words[1:]))
             if min(values) < 0:
                 raise ValueError('negative counter')
-            if kind == 'reason' and len(values) == 6 and values[0] < len(REASONS):
+            if kind == 'reason' and len(values) == 6 and values[0] < reason_count:
                 key, row = ('reason', values[0]), values[1:]
             elif kind == 'pool' and len(values) == 4 and values[0] < head['nr_servers'] and values[1] < 2:
                 key, row = ('pool', values[0], values[1]), values[2:]
@@ -42,7 +43,7 @@ def parse_policy(text):
             if key in counters:
                 raise ValueError('duplicate counter')
             counters[key] = row
-        expected = ({('reason', r) for r in range(7)} | {('pool', s, t) for s in range(head['nr_servers']) for t in range(2)} |
+        expected = ({('reason', r) for r in range(reason_count)} | {('pool', s, t) for s in range(head['nr_servers']) for t in range(2)} |
                     {(kind, b) for kind in ('age', 'fallback') for b in range(4)} | {('allocation_error',)})
         if counters.keys() != expected:
             raise ValueError('incomplete counters')
@@ -118,12 +119,14 @@ def counter_delta(before, after):
 
 
 def policy_summary(counts):
-    reasons = {name: dict(zip(OUTCOMES, counts[('reason', i)])) for i, name in enumerate(REASONS)}
+    reasons = {name: dict(zip(OUTCOMES, counts.get(('reason', i), (0, 0, 0, 0, 0)))) for i, name in enumerate(REASONS)}
     adaptive = sum(reasons[n]['decisions'] for n in REASONS[2:])
-    known = reasons['hot']['decisions'] + reasons['cold']['decisions']
+    classified = reasons['hot']['decisions'] + reasons['cold']['decisions']
+    known = classified + reasons['zero_interleave']['decisions']
     lookup = known + reasons['pfn_miss']['decisions']
     return dict(reasons=reasons, decisions=sum(r['decisions'] for r in reasons.values()),
-                adaptive_decisions=adaptive, known_decisions=known,
+                adaptive_decisions=adaptive, known_decisions=known, classified_decisions=classified,
+                positive_heat_coverage=(classified/adaptive if adaptive else None) if ('reason', 7) in counts else None,
                 adaptive_heat_coverage=known/adaptive if adaptive else None,
                 available_snapshot_pfn_hit_ratio=known/lookup if lookup else None,
                 pools={str(s)+'/'+TIERS[t]: dict(preferred=v[0], allocated=v[1])
@@ -136,14 +139,14 @@ def policy_summary(counts):
 
 def validate_settled(policy):
     c = policy['counters']
-    decisions = sum(c[('reason', r)][0] for r in range(7))
+    decisions = sum(c[('reason', r)][0] for r in range(7 if policy['header']['version'] == 1 else 8))
     allocated = sum(v[1] for k, v in c.items() if k[0] == 'pool')
-    post = sum(c[('reason', r)][1] + c[('reason', r)][2] for r in range(7))
+    post = sum(c[('reason', r)][1] + c[('reason', r)][2] for r in range(7 if policy['header']['version'] == 1 else 8))
     if (decisions != allocated + c[('allocation_error',)][0] or allocated != post or
             sum(v[0] for k, v in c.items() if k[0] == 'pool') != decisions or
             sum(c[('fallback', i)][0] for i in range(4)) != allocated):
         raise ValueError('Policy counters not settled/consistent')
-    for r in range(7):
+    for r in range(7 if policy['header']['version'] == 1 else 8):
         d, accepted, failed, ok, error = c[('reason', r)]
         if ok + error != accepted or accepted + failed > d:
             raise ValueError('Store outcomes not settled/consistent')

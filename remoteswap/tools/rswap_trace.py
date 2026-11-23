@@ -202,23 +202,50 @@ def read_decisions(lines, layout, summary=None):
         if "decision:" not in line:
             continue
         payload = line.split("decision:", 1)[1].split()
-        if len(payload) != len(fields) or any(not re.fullmatch(r"\w+=-?\d+", x) for x in payload):
+        extra = {'threshold_ppm', 'policy', 'threshold_source', 'threshold_generation', 'threshold_status'}
+        modern = any(x.startswith('threshold_ppm=') for x in payload)
+        expected_fields = fields | extra if modern else fields
+        if len(payload) != len(expected_fields) or any(not re.fullmatch(r"\w+=-?\d+", x) for x in payload):
             raise ValueError(f"line {number}: malformed decision")
         d = {k: int(v) for k, v in (x.split("=", 1) for x in payload)}
-        if (set(d) != fields or any(v < 0 for k, v in d.items()
-                if k not in ("heat_ppm", "mean_ppm", "alloc_ret")) or
+        if (set(d) != expected_fields or any(v < 0 for k, v in d.items()
+                if k not in ("heat_ppm", "mean_ppm", "threshold_ppm", "alloc_ret")) or
                 d["heat_ppm"] not in range(-1, 1000001) or
                 d["mean_ppm"] not in range(-1, 1000001) or d["alloc_ret"] > 0 or
                 not d["pfn"] or not d["decision_ns"] or
                 d["publish_ns"] > d["decision_ns"] or
                 bool(d["generation"]) != bool(d["publish_ns"])):
             raise ValueError(f"line {number}: invalid decision fields")
+        if modern:
+            if (d['threshold_ppm'] not in range(-1, 1000001) or d['policy'] not in (0, 1) or
+                    d['threshold_source'] not in range(4) or d['threshold_status'] not in range(4) or
+                    bool(d['threshold_generation']) != (d['threshold_ppm'] >= 0) or
+                    d['threshold_generation'] > d['generation']):
+                raise ValueError('invalid threshold metadata')
+            if d['generation'] and d['threshold_source'] in (0, 3):
+                if d['threshold_ppm'] != d['mean_ppm']:
+                    raise ValueError('global threshold differs from mean')
+            if d['generation']:
+                source, status, origin = d['threshold_source'], d['threshold_status'], d['threshold_generation']
+                expected_origin = d['generation'] if d['threshold_ppm'] >= 0 else 0
+                if d['policy'] == 0:
+                    valid_meta = source == 0 and status == 0 and origin == expected_origin
+                elif source == 1:
+                    valid_meta = status == 0 and d['threshold_ppm'] >= 0 and origin == d['generation']
+                elif source == 2:
+                    valid_meta = status != 0 and d['threshold_ppm'] >= 0 and 0 < origin < d['generation']
+                else:
+                    valid_meta = source == 3 and status != 0 and origin == expected_origin
+                if not valid_meta:
+                    raise ValueError('inconsistent threshold provenance')
+        threshold = d['threshold_ppm'] if modern else d['mean_ppm']
         state, reason = d["state"], d["reason"]
         if state not in (0, 1, 2) or bool(d["run"]) != (state != 0):
             raise ValueError("invalid policy state/run")
         if reason in (5, 6):
             if (state != 2 or not d["generation"] or d["heat_ppm"] < 0 or
-                    d["mean_ppm"] < 0 or (reason == 5) != (d["heat_ppm"] > d["mean_ppm"])):
+                    threshold < 0 or (modern and d["heat_ppm"] == 0) or
+                    (reason == 5) != (d["heat_ppm"] >= threshold if modern else d["heat_ppm"] > threshold)):
                 raise ValueError("hot/cold threshold mismatch")
             expected = (d["rr"] % len(layout), "dram" if reason == 5 else "pmem")
             ticket = (d["run"], expected[1], d["rr"])
@@ -229,9 +256,9 @@ def read_decisions(lines, layout, summary=None):
             valid = ((state == 0 and reason == 0 and not d["generation"]) or
                      (state == 1 and reason == 1) or
                      (state == 2 and reason == 2 and not d["generation"]) or
-                     (state == 2 and reason == 3 and d["generation"] and d["mean_ppm"] == -1) or
-                     (state == 2 and reason == 4 and d["generation"] and d["mean_ppm"] >= 0))
-            if not valid or d["heat_ppm"] != -1:
+                     (state == 2 and reason == 3 and d["generation"] and threshold == -1) or
+                     (state == 2 and reason in ((4, 7) if modern else (4,)) and d["generation"] and threshold >= 0))
+            if not valid or d["heat_ppm"] != (0 if modern and reason == 7 else -1):
                 raise ValueError("invalid interleave reason")
             expected = expected_location(layout, d["offset"])
         if (d["preferred_server"], d["preferred_tier"]) != (expected[0], TIERS.index(expected[1])):

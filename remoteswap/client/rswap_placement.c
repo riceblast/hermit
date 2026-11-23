@@ -16,6 +16,7 @@
 struct rswap_heat_snapshot {
 	u64 generation, publish_ns, count, known;
 	int mean;
+	struct rswap_threshold_metadata threshold;
 	struct rswap_heat_record records[];
 };
 
@@ -172,7 +173,7 @@ int rswap_placement_choose(u64 offset, u64 pfn, struct rswap_decision *d)
 	int ret;
 
 	memset(d, 0, sizeof(*d));
-	d->heat = d->mean = -1;
+	d->heat = d->mean = d->threshold = -1;
 	ret = rswap_map_page(&policy_layout, offset, &d->server, &d->tier, &ignored);
 	if (ret)
 		return ret;
@@ -192,6 +193,11 @@ int rswap_placement_choose(u64 offset, u64 pfn, struct rswap_decision *d)
 		d->generation = snap->generation;
 		d->publish_ns = snap->publish_ns;
 		d->mean = snap->mean;
+		d->threshold = snap->threshold.threshold_ppm;
+		d->policy = snap->threshold.policy;
+		d->threshold_source = snap->threshold.source;
+		d->threshold_status = snap->threshold.status;
+		d->threshold_generation = snap->threshold.generation;
 	}
 	if (d->state == RSWAP_WARMUP)
 		goto out;
@@ -199,7 +205,7 @@ int rswap_placement_choose(u64 offset, u64 pfn, struct rswap_decision *d)
 	if (!snap)
 		goto out;
 	d->reason = RSWAP_REASON_NO_MEAN;
-	if (snap->mean < 0)
+	if (d->threshold < 0)
 		goto out;
 	d->reason = RSWAP_REASON_UNKNOWN;
 	lo = 0;
@@ -214,8 +220,12 @@ int rswap_placement_choose(u64 offset, u64 pfn, struct rswap_decision *d)
 			hi = mid;
 		else {
 			d->heat = record->heat_ppm;
-			d->reason = d->heat > d->mean ? RSWAP_REASON_HOT : RSWAP_REASON_COLD;
-			d->tier = d->heat > d->mean ? RSWAP_TIER_DRAM : RSWAP_TIER_PMEM;
+			if (!d->heat) {
+				d->reason = RSWAP_REASON_ZERO;
+				break; /* Keep the original Interleave preference and RR untouched. */
+			}
+			d->reason = d->heat >= d->threshold ? RSWAP_REASON_HOT : RSWAP_REASON_COLD;
+			d->tier = d->heat >= d->threshold ? RSWAP_TIER_DRAM : RSWAP_TIER_PMEM;
 			d->rr = (u64)atomic64_inc_return(&run->rr[d->tier]) - 1;
 			d->server = d->rr % policy_layout.nr_servers;
 			break;
@@ -307,6 +317,38 @@ static int rswap_upload_start(struct rswap_uploader *u,
 	return 0;
 }
 
+/* Only policy metadata is new; publication/lifetime remains one RCU snapshot. */
+static bool rswap_threshold_valid(const struct rswap_threshold_metadata *m,
+		const struct rswap_upload_command *cmd, const struct rswap_heat_snapshot *old)
+{
+	if (m->reserved || m->min_coverage_ppm > RSWAP_HEAT_SCALE ||
+	    m->policy > RSWAP_THRESHOLD_CAPACITY || m->source > RSWAP_THRESHOLD_FALLBACK ||
+	    m->status > RSWAP_THRESHOLD_SMALL_SAMPLE || m->threshold_ppm < -1 ||
+	    m->threshold_ppm > RSWAP_HEAT_SCALE || m->sample_pages > m->population_pages ||
+	    m->sample_pages > cmd->value || m->candidate_pages > m->sample_pages ||
+	    m->generation > cmd->generation ||
+	    ((m->threshold_ppm >= 0) != (m->generation != 0)))
+		return false;
+	if (m->policy == RSWAP_THRESHOLD_GLOBAL)
+		return m->source == RSWAP_THRESHOLD_MEAN && m->status == RSWAP_THRESHOLD_OK &&
+			m->threshold_ppm == cmd->mean_ppm &&
+			m->generation == (cmd->mean_ppm >= 0 ? cmd->generation : 0);
+	if (!m->min_pages || m->sample_pages < cmd->count)
+		return false;
+	if (m->source == RSWAP_THRESHOLD_TRIMMED)
+		return m->status == RSWAP_THRESHOLD_OK && m->threshold_ppm >= 0 &&
+			m->generation == cmd->generation && m->candidate_pages &&
+			m->population_pages > m->local_pages;
+	if (m->source == RSWAP_THRESHOLD_RETAINED)
+		return m->status != RSWAP_THRESHOLD_OK && old &&
+			old->threshold.policy == m->policy && old->threshold.threshold_ppm >= 0 &&
+			old->threshold.threshold_ppm == m->threshold_ppm &&
+			old->threshold.generation == m->generation;
+	return m->source == RSWAP_THRESHOLD_FALLBACK && m->status != RSWAP_THRESHOLD_OK &&
+		m->threshold_ppm == cmd->mean_ppm &&
+		m->generation == (cmd->mean_ppm >= 0 ? cmd->generation : 0);
+}
+
 static int rswap_upload_command(struct rswap_uploader *u,
 		const struct rswap_upload_command *cmd, const char __user *data)
 {
@@ -322,6 +364,12 @@ static int rswap_upload_command(struct rswap_uploader *u,
 	if (!cmd->generation || (old && cmd->generation <= old->generation))
 		return -ESTALE;
 	if (cmd->op == RSWAP_UPLOAD_BEGIN) {
+		struct rswap_threshold_metadata metadata;
+
+		if (copy_from_user(&metadata, data, sizeof(metadata)))
+			return -EFAULT;
+		if (!rswap_threshold_valid(&metadata, cmd, old))
+			return -EINVAL;
 		if (u->staging)
 			return -EBUSY;
 		if (cmd->count > totalram_pages() || cmd->value < cmd->count ||
@@ -335,6 +383,7 @@ static int rswap_upload_command(struct rswap_uploader *u,
 		snap->count = cmd->count;
 		snap->known = cmd->value;
 		snap->mean = cmd->mean_ppm;
+		snap->threshold = metadata;
 		snap->generation = cmd->generation;
 		u->staging = snap;
 		u->received = 0;
@@ -374,7 +423,7 @@ static ssize_t rswap_upload_write(struct file *file, const char __user *buf,
 {
 	struct rswap_upload_command cmd;
 	struct rswap_uploader *u = file->private_data;
-	size_t records = 0;
+	size_t payload = 0;
 	int ret = -EINVAL;
 
 	if (len < sizeof(cmd))
@@ -389,9 +438,11 @@ static ssize_t rswap_upload_write(struct file *file, const char __user *buf,
 	if (cmd.op == RSWAP_UPLOAD_DATA) {
 		if (!cmd.count || cmd.count > RSWAP_UPLOAD_BATCH)
 			goto discard;
-		records = cmd.count;
+		payload = cmd.count * sizeof(struct rswap_heat_record);
 	}
-	if (len != sizeof(cmd) + records * sizeof(struct rswap_heat_record))
+	if (cmd.op == RSWAP_UPLOAD_BEGIN)
+		payload = sizeof(struct rswap_threshold_metadata);
+	if (len != sizeof(cmd) + payload)
 		goto discard;
 	mutex_lock(&policy_mutex);
 	ret = rswap_upload_command(u, &cmd, buf + sizeof(cmd));
@@ -478,6 +529,12 @@ static int rswap_policy_show(struct seq_file *m, void *unused)
 			snap ? sizeof(*snap) + snap->count * sizeof(snap->records[0]) : 0,
 			policy_owner && policy_owner->staging ? sizeof(*snap) +
 				policy_owner->staging->count * sizeof(snap->records[0]) : 0);
+		if (snap) {
+			const struct rswap_threshold_metadata *t = &snap->threshold;
+			seq_printf(m, "policy=%u threshold_ppm=%d threshold_source=%u threshold_generation=%llu threshold_status=%u population_pages=%llu threshold_sample_pages=%llu candidate_pages=%llu local_pages=%llu\n",
+				t->policy, t->threshold_ppm, t->source, t->generation, t->status,
+				t->population_pages, t->sample_pages, t->candidate_pages, t->local_pages);
+		}
 	}
 	mutex_unlock(&policy_mutex);
 	return 0;
@@ -499,7 +556,7 @@ static int rswap_policy_stats_show(struct seq_file *m, void *unused)
 {
 	unsigned int r, s, t;
 
-	seq_printf(m, "version=1 instance_ns=%llu sample_ns=%llu nr_servers=%u page_size=%lu\n",
+	seq_printf(m, "version=2 instance_ns=%llu sample_ns=%llu nr_servers=%u page_size=%lu\n",
 		policy_instance_ns, ktime_get_ns(), policy_layout.nr_servers, PAGE_SIZE);
 	for (r = 0; r < RSWAP_REASON_COUNT; r++)
 		seq_printf(m, "reason %u %lld %lld %lld %lld %lld\n", r,

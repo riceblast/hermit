@@ -22,6 +22,7 @@
 
 #include "rswap_hotness.h"
 #include "../rswap_placement_uapi.h"
+#include "rswap_threshold.h"
 
 #define PAGE_BYTES UINT64_C(4096)
 #define PM_PRESENT (UINT64_C(1) << 63)
@@ -55,7 +56,11 @@ struct config {
 	bool pages, placement, manual;
 	int upload_fd;
 	const char *upload_path;
-	FILE *placement_log;
+	FILE *placement_log, *distribution_log;
+	struct rswap_threshold_config threshold_config;
+	struct rswap_threshold_metadata threshold, previous_threshold;
+	const char *memory_cgroup;
+	uint64_t local_bytes, reserve_bytes;
 };
 
 static volatile sig_atomic_t interrupted;
@@ -451,6 +456,73 @@ static int heat_record_compare(const void *a, const void *b)
 	return (x->pfn > y->pfn) - (x->pfn < y->pfn);
 }
 
+/* Read the finite effective cgroup-v1 limit, including tighter ancestors.
+ * An explicit path avoids reading the launch wrapper's pre-exec/root cgroup.
+ */
+static int local_capacity(const struct config *c, uint64_t *pages)
+{
+	uint64_t limit = c->local_bytes;
+	if (!limit) {
+		char directory[PATH_MAX], file[PATH_MAX];
+		bool first = true;
+		if (!c->memory_cgroup || !realpath(c->memory_cgroup, directory)) return -1;
+		limit = UINT64_MAX;
+		for (;;) {
+			if (snprintf(file, sizeof(file), "%s/memory.limit_in_bytes", directory) >= (int)sizeof(file)) {
+				errno = ENAMETOOLONG; return -1;
+			}
+			FILE *f = fopen(file, "r");
+			if (!f) {
+				if (!first && errno == ENOENT) break;
+				return -1;
+			}
+			unsigned long long value;
+			int parsed = fscanf(f, "%llu", &value);
+			int error = ferror(f);
+			fclose(f);
+			if (parsed != 1 || error || !value) { errno = EINVAL; return -1; }
+			if (value < (UINT64_C(1) << 60) && value < limit) limit = value;
+			first = false;
+			char *slash = strrchr(directory, '/');
+			if (!slash || slash == directory) break;
+			*slash = 0;
+		}
+	}
+	if (limit == UINT64_MAX || limit <= c->reserve_bytes ||
+	    (limit - c->reserve_bytes) / PAGE_BYTES == 0) { errno = EINVAL; return -1; }
+	*pages = (limit - c->reserve_bytes) / PAGE_BYTES;
+	return 0;
+}
+
+static int prepare_threshold(struct config *c, const struct page_list *pages,
+		uint64_t generation, int mean)
+{
+	struct rswap_threshold_hist hist = {0};
+	struct rswap_heat_bin bins[RSWAP_THRESHOLD_BINS];
+	uint64_t local = 0;
+	for (size_t i = 0; i < pages->n; i++) {
+		const struct hot_page *p = &pages->v[i];
+		if (p->alias || (p->state != RESIDENT && p->state != SWAPPED)) continue;
+		hist.population++;
+		unsigned int valid = heat_valid(&p->heat), active = heat_active(&p->heat);
+		if (valid) { hist.known++; hist.counts[valid][active]++; }
+	}
+	size_t n = rswap_threshold_bins(&hist, bins);
+	if (c->threshold_config.policy == RSWAP_THRESHOLD_CAPACITY && local_capacity(c, &local)) return -1;
+	c->threshold = rswap_threshold_select(&c->threshold_config, &hist, bins, n, local,
+		generation + 1, mean, &c->previous_threshold);
+	if (c->distribution_log) {
+		for (size_t i = 0; i < n; i++)
+			fprintf(c->distribution_log, "1\t%" PRIu64 "\t%u\t%" PRIu64 "\n",
+				generation, bins[i].heat, bins[i].pages);
+		if (hist.population > hist.known)
+			fprintf(c->distribution_log, "1\t%" PRIu64 "\t-1\t%" PRIu64 "\n",
+				generation, hist.population - hist.known);
+		if (fflush(c->distribution_log) || ferror(c->distribution_log)) return -1;
+	}
+	return 0;
+}
+
 static int placement_snapshot(const struct config *c, const struct page_list *pages,
 		uint64_t generation, size_t known, int mean)
 {
@@ -484,7 +556,12 @@ static int placement_snapshot(const struct config *c, const struct page_list *pa
 	}
 	if (n > 1) qsort(records, n, sizeof(*records), heat_record_compare);
 	command.count = n;
-	if (upload_command(c->upload_fd, &command, NULL)) goto out;
+	struct { struct rswap_upload_command command; struct rswap_threshold_metadata metadata; } begin_packet = {
+		.command = command, .metadata = c->threshold};
+	ssize_t sent;
+	do { sent = write(c->upload_fd, &begin_packet, sizeof(begin_packet)); }
+	while (sent < 0 && errno == EINTR && !interrupted);
+	if (sent != (ssize_t)sizeof(begin_packet)) { if (sent >= 0) errno = EIO; goto out; }
 	for (size_t i = 0; i < n;) {
 		size_t count = n - i;
 		if (count > RSWAP_UPLOAD_BATCH) count = RSWAP_UPLOAD_BATCH;
@@ -502,10 +579,17 @@ static int placement_snapshot(const struct config *c, const struct page_list *pa
 		.op = RSWAP_UPLOAD_COMMIT, .generation = generation + 1};
 	if (upload_command(c->upload_fd, &command, &ack)) goto out;
 	if (ack.generation != generation + 1) { errno = EPROTO; goto out; }
-	fprintf(c->placement_log, "1\t%" PRIu64 "\t%llu\t%llu\t%llu\t%llu\t%zu\t%zu\t%d\t%.3f\n",
+	fprintf(c->placement_log, "2\t%" PRIu64 "\t%llu\t%llu\t%llu\t%llu\t%zu\t%zu\t%d\t%.3f",
 		generation, (unsigned long long)ack.run_id, (unsigned long long)ack.start_ns,
 		(unsigned long long)ack.generation, (unsigned long long)ack.publish_ns,
 		n, known, mean, (monotonic_ns() - begin) / 1e6);
+	const struct rswap_threshold_metadata *t = &c->threshold;
+	/* Extend the same row, preserving the original true mean. */
+	fprintf(c->placement_log, "\t%u\t%d\t%u\t%llu\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%u\n",
+		t->policy, t->threshold_ppm, t->source, (unsigned long long)t->generation, t->status,
+		(unsigned long long)t->population_pages, (unsigned long long)t->sample_pages,
+		(unsigned long long)t->candidate_pages, (unsigned long long)t->local_pages,
+		(unsigned long long)t->min_pages, t->min_coverage_ppm);
 	if (fflush(c->placement_log) || ferror(c->placement_log)) goto out;
 	ret = 0;
 out:
@@ -559,9 +643,11 @@ static int snapshot(struct config *c, FILE *summary, const struct page_list *pag
 	 * Equal fixed-point values are cold; no floating point in the Store path.
 	 */
 	if (c->placement && c->upload_fd >= 0) {
-		int uploaded = placement_snapshot(c, pages, generation, known,
-			known ? (int)(sum * RSWAP_HEAT_SCALE / known) : -1);
+		int mean_ppm = known ? (int)(sum * RSWAP_HEAT_SCALE / known) : -1;
+		if (prepare_threshold(c, pages, generation, mean_ppm)) return -1;
+		int uploaded = placement_snapshot(c, pages, generation, known, mean_ppm);
 		if (uploaded < 0) return -1;
+		if (!uploaded) c->previous_threshold = c->threshold;
 		if (uploaded > 0) {
 			close(c->upload_fd);
 			c->upload_fd = -1;
@@ -589,6 +675,10 @@ static void usage(FILE *f)
 		"DIR must not exist. --pages writes per-round TSVs for offline Store matching.\n"
 		"Requires 4-KiB pages, CAP_SYS_ADMIN/PFN visibility, and page_idle write access.\n"
 		"--placement starts Client policy before launch (active swap required); --manual waits for adaptive command.\n"
+		"--threshold-policy global-mean|capacity-mean (default global-mean).\n"
+		"capacity-mean requires --placement and --memory-cgroup DIR or --local-memory-gib GIB.\n"
+		"--reserve-gib GIB (default 1); --threshold-min-pages N (1024); --threshold-min-coverage FRACTION (0.05).\n"
+		"Known heat zero and unknown heat keep Interleave; positive heat >= threshold prefers DRAM.\n"
 		"Default is observation only. Ctrl-C stops; launched children receive the signal.\n");
 }
 
@@ -674,11 +764,16 @@ static pid_t launch(char **command, uint64_t *t0, const struct config *c)
 int main(int argc, char **argv)
 {
 	struct config c = {.interval = 1, .window = 20, .warmup = 20, .upload_fd = -1,
-		.upload_path = "/sys/kernel/debug/rswap/hotness"};
+		.upload_path = "/sys/kernel/debug/rswap/hotness",
+		.reserve_bytes = UINT64_C(1) << 30,
+		.threshold_config = {.min_pages = 1024, .min_coverage_ppm = 50000}};
 	const struct option options[] = {{"pid", 1, NULL, 'p'}, {"interval", 1, NULL, 'i'},
 		{"window", 1, NULL, 'w'}, {"warmup", 1, NULL, 't'}, {"out", 1, NULL, 'o'},
 		{"pages", 0, NULL, 'P'}, {"placement", 0, NULL, 'A'},
-		{"manual", 0, NULL, 'M'}, {"help", 0, NULL, 'h'}, {NULL, 0, NULL, 0}};
+		{"manual", 0, NULL, 'M'}, {"threshold-policy", 1, NULL, 'S'},
+		{"memory-cgroup", 1, NULL, 'C'}, {"local-memory-gib", 1, NULL, 'L'},
+		{"reserve-gib", 1, NULL, 'R'}, {"threshold-min-pages", 1, NULL, 'N'},
+		{"threshold-min-coverage", 1, NULL, 'V'}, {"help", 0, NULL, 'h'}, {NULL, 0, NULL, 0}};
 	struct page_list old = {0};
 	int option, flags_fd = -1, idle_fd = -1, status = 0, ret = 1, monitor_error;
 	pid_t child = -1;
@@ -696,11 +791,38 @@ int main(int argc, char **argv)
 		case 'P': c.pages = true; break;
 		case 'A': c.placement = true; break;
 		case 'M': c.manual = true; break;
+		case 'S':
+			if (!strcmp(optarg, "global-mean")) c.threshold_config.policy = RSWAP_THRESHOLD_GLOBAL;
+			else if (!strcmp(optarg, "capacity-mean")) c.threshold_config.policy = RSWAP_THRESHOLD_CAPACITY;
+			else goto bad;
+			break;
+		case 'C': c.memory_cgroup = optarg; break;
+		case 'L': case 'R': {
+			char *end; errno = 0; double value = strtod(optarg, &end);
+			if (errno || end == optarg || *end || !isfinite(value) || value < 0 ||
+			    value >= (double)UINT64_MAX / (1ULL << 30)) goto bad;
+			uint64_t bytes = (uint64_t)(value * (1ULL << 30));
+			if (option == 'L') { if (bytes < PAGE_BYTES) goto bad; c.local_bytes = bytes; }
+			else c.reserve_bytes = bytes;
+			break;
+		}
+		case 'N': n = integer_value(optarg, INT_MAX); if (n < 0) goto bad; c.threshold_config.min_pages = n; break;
+		case 'V': {
+			char *end; errno = 0; double value = strtod(optarg, &end);
+			if (errno || end == optarg || *end || !isfinite(value) || value < 0 || value > 1) goto bad;
+			c.threshold_config.min_coverage_ppm = (unsigned int)(value * RSWAP_HEAT_SCALE); break;
+		}
 		case 'h': usage(stdout); return 0;
 		default: goto bad;
 		}
 	}
 	if (!c.out || (!!c.pid == (optind < argc)) || (c.manual && !c.placement)) goto bad;
+	if (c.threshold_config.policy == RSWAP_THRESHOLD_CAPACITY &&
+	    (!c.placement || (!c.local_bytes && !c.memory_cgroup))) goto bad;
+	if (c.threshold_config.policy == RSWAP_THRESHOLD_CAPACITY) {
+		uint64_t local;
+		if (local_capacity(&c, &local)) { perror("capacity-mean requires a finite cgroup/local limit greater than reserve"); goto out; }
+	}
 	if (sysconf(_SC_PAGESIZE) != 4096) { fprintf(stderr, "4-KiB system pages required\n"); return 1; }
 	flags_fd = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
 	idle_fd = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
@@ -720,7 +842,12 @@ int main(int argc, char **argv)
 		}
 		c.placement_log = fopen(path, "wx");
 		if (!c.placement_log || fcntl(fileno(c.placement_log), F_SETFD, FD_CLOEXEC)) goto fail;
-		fputs("version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean_ppm\tupload_ms\n", c.placement_log);
+		fputs("version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean_ppm\tupload_ms\tpolicy\tthreshold_ppm\tthreshold_source\tthreshold_generation\tthreshold_status\tpopulation_pages\tthreshold_sample_pages\tcandidate_pages\tlocal_pages\tmin_pages\tmin_coverage_ppm\n", c.placement_log);
+
+		if (snprintf(path, sizeof(path), "%s/distribution.tsv", c.out) >= (int)sizeof(path)) { errno = ENAMETOOLONG; goto fail; }
+		c.distribution_log = fopen(path, "wx");
+		if (!c.distribution_log || fcntl(fileno(c.distribution_log), F_SETFD, FD_CLOEXEC)) goto fail;
+		fputs("version\tsample_generation\theat_ppm\tpages\n", c.distribution_log);
 	}
 	struct sigaction action = {.sa_handler = on_signal};
 	sigemptyset(&action.sa_mask);
@@ -776,6 +903,7 @@ out:
 	 */
 	if (c.upload_fd >= 0) close(c.upload_fd);
 	if (c.placement_log && fclose(c.placement_log)) ret = 1;
+	if (c.distribution_log && fclose(c.distribution_log)) ret = 1;
 	if (flags_fd >= 0) close(flags_fd);
 	if (idle_fd >= 0) close(idle_fd);
 	if (summary && fclose(summary)) ret = 1;

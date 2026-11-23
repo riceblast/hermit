@@ -77,9 +77,9 @@ class PolicyStatsTests(unittest.TestCase):
                 result=pool.parse_policy(output);pool.validate_settled(result)
                 summary=pool.policy_summary(result['counters'])
                 self.assertEqual(result['header']['instance_ns'],42)
-                self.assertEqual((summary['decisions'],summary['adaptive_decisions'],summary['known_decisions']),(7,5,2))
-                self.assertEqual(summary['adaptive_heat_coverage'],0.4)
-                self.assertEqual(sum(summary['snapshot_age_buckets'].values()),4)
+                self.assertEqual((summary['decisions'],summary['adaptive_decisions'],summary['known_decisions']),(8,6,3))
+                self.assertEqual(summary['adaptive_heat_coverage'],0.5)
+                self.assertEqual(sum(summary['snapshot_age_buckets'].values()),5)
 
     def test_actual_request_result_ordering(self):
         source=(ROOT/'client/rswap_placement.c').read_text()

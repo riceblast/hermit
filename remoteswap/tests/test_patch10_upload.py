@@ -61,7 +61,7 @@ int main(void) {
     assert(!snapshot(&c, summary, &pages, 0, start, start, start));
     struct rswap_decision d;
     assert(!rswap_placement_choose(1,65,&d) && d.reason==RSWAP_REASON_HOT && d.mean==333333);
-    assert(!rswap_placement_choose(1,66,&d) && d.reason==RSWAP_REASON_COLD);
+    assert(!rswap_placement_choose(1,66,&d) && d.reason==RSWAP_REASON_ZERO);
     assert(!rswap_placement_choose(1,77,&d) && d.reason==RSWAP_REASON_UNKNOWN);
     struct rswap_policy_run *run=rcu_dereference(policy_run);
     struct rswap_heat_snapshot *s=rcu_dereference(run->snapshot);
@@ -76,7 +76,7 @@ int main(void) {
         .state=RESIDENT,.pfn=pages.n-i,.heat={.active=1,.valid=1}};
     batches=0;
     assert(!snapshot(&c,summary,&pages,2,start,start,start) && batches==2);
-    assert(!rswap_placement_choose(1,65,&d) && d.reason==RSWAP_REASON_COLD && d.mean==1000000);
+    assert(!rswap_placement_choose(1,65,&d) && d.reason==RSWAP_REASON_HOT && d.mean==1000000);
     short_write=true;
     assert(placement_snapshot(&c,&pages,3,4097,1000000)<0 && errno==EIO);
     short_write=false;
