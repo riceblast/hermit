@@ -56,19 +56,23 @@ static void phases(void) {
     assert(choose(65).state == RSWAP_WARMUP);
     assert(rswap_control_write(NULL, "adaptive\n", 9, &position) == -EAGAIN);
     atomic_store(&mock_now, 1100);
-    assert(choose(65).reason == RSWAP_REASON_NO_SNAPSHOT);
+    d = choose(65); assert(d.reason == RSWAP_REASON_NO_SNAPSHOT && d.heat == -1);
+    assert(d.tier == 0 && d.server == 0 && d.rr == 0);
     publish(1, 900000, 500000);
-    d = choose(65); assert(d.reason == RSWAP_REASON_HOT && d.tier == 0 && d.server == 0 && d.rr == 0);
-    d = choose(65); assert(d.server == 1 && d.rr == 1);
-    assert(choose(66).reason == RSWAP_REASON_UNKNOWN);
+    d = choose(65); assert(d.reason == RSWAP_REASON_HOT && d.tier == 0 && d.server == 1 && d.rr == 1);
+    d = choose(65); assert(d.server == 0 && d.rr == 2);
+    d = choose(66); assert(d.reason == RSWAP_REASON_UNKNOWN && d.heat == -1);
+    assert(d.tier == 0 && d.server == 1 && d.rr == 3);
     publish(2, 500000, 500000);
-    d = choose(65); assert(d.reason == RSWAP_REASON_HOT && d.tier == 0 && d.rr == 2);
+    d = choose(65); assert(d.reason == RSWAP_REASON_HOT && d.tier == 0 && d.rr == 4);
     assert(command(&owner, 2, 3, 0, 0, -1) > 0);
     assert(command(&owner, 4, 3, 0, 0, 0) > 0);
-    assert(choose(65).reason == RSWAP_REASON_NO_MEAN);
+    d = choose(65); assert(d.reason == RSWAP_REASON_NO_MEAN && d.heat == -1);
+    assert(d.tier == 0 && d.server == 1 && d.rr == 5);
     assert(command(&owner, 2, 4, 0, 1, 0) > 0); /* known swapped history, no resident PFN */
     assert(command(&owner, 4, 4, 0, 0, 0) > 0);
-    assert(choose(65).reason == RSWAP_REASON_UNKNOWN);
+    d = choose(65); assert(d.reason == RSWAP_REASON_UNKNOWN && d.heat == -1);
+    assert(d.tier == 0 && d.server == 0 && d.rr == 6);
     assert(rswap_control_write(NULL, "stop\n", 5, &position) > 0);
     assert(choose(65).state == RSWAP_INACTIVE);
     assert(command(&owner, 4, 4, 0, 0, 0) == -ESTALE);
@@ -120,6 +124,47 @@ static void transactions(void) {
     assert(rswap_upload_read(&owner, (void *)&ack, sizeof(ack), &pos) == sizeof(ack));
     assert(ack.generation == 2 && ack.run_id && ack.publish_ns);
     finish();
+}
+static void unknown_defaults(void) {
+    for (unsigned int servers=1; servers<=2; servers++) {
+        layout.nr_servers=servers; layout.total_pages=16*servers;
+        open_owner();
+        assert(command(&owner,1,0,0,0,0)>0);
+        for (u64 offset=0; offset<layout.total_pages; offset++) {
+            struct rswap_decision d;
+            assert(!rswap_placement_choose(offset,99,&d));
+            assert(d.reason==RSWAP_REASON_NO_SNAPSHOT && d.tier==0 && d.heat==-1);
+            assert(d.rr==offset && d.server==offset%servers);
+        }
+        u64 next=layout.total_pages;
+        publish(1,0,0);
+        for (u64 offset=0; offset<layout.total_pages; offset++) {
+            struct rswap_decision d;
+            unsigned int s,t; u64 slot;
+            assert(!rswap_map_page(&layout,offset,&s,&t,&slot));
+            assert(!rswap_placement_choose(offset,65,&d));
+            assert(d.reason==RSWAP_REASON_ZERO && d.server==s && d.tier==t && d.rr==0);
+            assert(!rswap_placement_choose(offset,99,&d));
+            assert(d.reason==RSWAP_REASON_UNKNOWN && d.tier==0 && d.rr==next);
+            assert(d.server==next%servers); next++;
+        }
+        publish(2,1000000,500000);
+        struct rswap_decision d=choose(65);
+        assert(d.reason==RSWAP_REASON_HOT && d.rr==next && d.server==next%servers);
+        assert(d.tier==0); next++;
+        publish(3,100000,500000);
+        d=choose(65); assert(d.reason==RSWAP_REASON_COLD && d.tier==1 && d.rr==0);
+        assert(command(&owner,2,4,0,0,-1)>0 && command(&owner,4,4,0,0,0)>0);
+        d=choose(65); assert(d.reason==RSWAP_REASON_NO_MEAN && d.tier==0 && d.rr==next);
+        assert(d.server==next%servers);
+        assert(rswap_control_write(NULL,"stop",4,&position)>0);
+        assert(command(&owner,1,0,0,0,0)==-ESTALE);
+        finish();
+        /* A new run starts the shared DRAM RR at zero. */
+        open_owner(); assert(command(&owner,1,0,0,0,0)>0);
+        d=choose(99); assert(d.rr==0 && d.server==0 && d.tier==0);
+        finish();
+    }
 }
 static void ownership(void) {
     struct file other = {0};
@@ -173,6 +218,7 @@ int main(int argc, char **argv) {
     switch (atoi(argv[1])) {
     case 0: phases(); break; case 1: transactions(); break;
     case 2: ownership(); break; case 3: concurrent(); break;
+    case 4: unknown_defaults(); break;
     default: abort();
     }
     puts("PASS: production placement/upload checks"); return 0;
@@ -188,7 +234,7 @@ class PlacementTests(unittest.TestCase):
             subprocess.run(["gcc", "-std=gnu11", "-O1", "-g", "-pthread", "-Wall", "-Wextra",
                             "-Werror", "-Wno-unused-parameter", "-I", str(placement_harness.ROOT / "client"),
                             str(source), "-o", str(binary)], check=True)
-            for case in range(4):
+            for case in range(5):
                 with self.subTest(case=case):
                     subprocess.run([str(binary), str(case)], check=True, timeout=30)
 

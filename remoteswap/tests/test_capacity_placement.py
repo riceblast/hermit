@@ -115,8 +115,8 @@ int main(void) {
     assert(rswap_control_write(NULL,"adaptive",8,&pos)>0);
     struct rswap_decision d=choose(65);
     assert(d.reason==RSWAP_REASON_ZERO && d.server==1 && d.tier==0 && d.heat==0);
-    d=choose(99);assert(d.reason==RSWAP_REASON_UNKNOWN && d.server==1 && d.tier==0);
-    d=choose(66);assert(d.reason==RSWAP_REASON_HOT && d.tier==0 && d.server==0 && d.rr==0);
+    d=choose(99);assert(d.reason==RSWAP_REASON_UNKNOWN && d.server==0 && d.tier==0 && d.rr==0);
+    d=choose(66);assert(d.reason==RSWAP_REASON_HOT && d.tier==0 && d.server==1 && d.rr==1);
     assert(d.threshold==250000 && d.mean==500000 && d.threshold_generation==1);
     d=choose(67);assert(d.reason==RSWAP_REASON_COLD && d.tier==1 && d.rr==0);
     m.source=2;m.status=1;assert(begin(2,900000,m)>0);commit(2);
@@ -127,7 +127,7 @@ int main(void) {
     assert(rswap_upload_write(&owner,(void *)&old,sizeof(old),&pos)==-EINVAL);
     assert(choose(66).generation==2);
     rswap_upload_release(NULL,&owner);rswap_placement_exit();assert(!live_allocations);
-    puts("PASS: actual ABI2 staging, zero/unknown Interleave, positive equality, retained threshold and rejection");
+    puts("PASS: actual ABI2 staging, zero Interleave, unknown DRAM RR, equality, retained threshold and rejection");
 }
 '''
 
@@ -187,6 +187,7 @@ int main(void) {''')
                 line=decision(alloc_seq=seq,pfn=pfn,reason=reason,generation=gen,
                               run=int(pub['run_id']),mean_ppm=int(pub['mean_ppm']),
                               publish_ns=int(pub['publish_ns']),decision_ns=int(pub['publish_ns'])+1,
+                              placement_rule=1,rr=1 if reason==4 else 0,
                               heat_ppm=heat,preferred_server=0 if reason==5 else 1,
                               server=0 if reason==5 else 1).rstrip('\n')
                 return line+' '+ ' '.join(k+'='+pub[k] for k in

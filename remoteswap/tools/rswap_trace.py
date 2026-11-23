@@ -205,6 +205,9 @@ def read_decisions(lines, layout, summary=None):
         extra = {'threshold_ppm', 'policy', 'threshold_source', 'threshold_generation', 'threshold_status'}
         modern = any(x.startswith('threshold_ppm=') for x in payload)
         expected_fields = fields | extra if modern else fields
+        has_rule = any(x.startswith('placement_rule=') for x in payload)
+        if has_rule:
+            expected_fields = expected_fields | {'placement_rule'}
         if len(payload) != len(expected_fields) or any(not re.fullmatch(r"\w+=-?\d+", x) for x in payload):
             raise ValueError(f"line {number}: malformed decision")
         d = {k: int(v) for k, v in (x.split("=", 1) for x in payload)}
@@ -216,6 +219,9 @@ def read_decisions(lines, layout, summary=None):
                 d["publish_ns"] > d["decision_ns"] or
                 bool(d["generation"]) != bool(d["publish_ns"])):
             raise ValueError(f"line {number}: invalid decision fields")
+        rule = d.get('placement_rule', 0)
+        if rule not in (0, 1) or (has_rule and not modern):
+            raise ValueError('unsupported placement rule')
         if modern:
             if (d['threshold_ppm'] not in range(-1, 1000001) or d['policy'] not in (0, 1) or
                     d['threshold_source'] not in range(4) or d['threshold_status'] not in range(4) or
@@ -248,10 +254,7 @@ def read_decisions(lines, layout, summary=None):
                     (reason == 5) != (d["heat_ppm"] >= threshold if modern else d["heat_ppm"] > threshold)):
                 raise ValueError("hot/cold threshold mismatch")
             expected = (d["rr"] % len(layout), "dram" if reason == 5 else "pmem")
-            ticket = (d["run"], expected[1], d["rr"])
-            if ticket in tickets:
-                raise ValueError("duplicate RR ticket")
-            tickets.add(ticket)
+            uses_rr = True
         else:
             valid = ((state == 0 and reason == 0 and not d["generation"]) or
                      (state == 1 and reason == 1) or
@@ -259,8 +262,16 @@ def read_decisions(lines, layout, summary=None):
                      (state == 2 and reason == 3 and d["generation"] and threshold == -1) or
                      (state == 2 and reason in ((4, 7) if modern else (4,)) and d["generation"] and threshold >= 0))
             if not valid or d["heat_ppm"] != (0 if modern and reason == 7 else -1):
-                raise ValueError("invalid interleave reason")
-            expected = expected_location(layout, d["offset"])
+                raise ValueError("invalid default/zero reason")
+            uses_rr = rule == 1 and reason in (2, 3, 4)
+            expected = (d["rr"] % len(layout), "dram") if uses_rr else expected_location(layout, d["offset"])
+        if uses_rr:
+            ticket = (d["run"], expected[1], d["rr"])
+            if ticket in tickets:
+                raise ValueError("duplicate RR ticket")
+            tickets.add(ticket)
+        elif rule == 1 and d['rr']:
+            raise ValueError('interleave decision consumed an RR ticket')
         if (d["preferred_server"], d["preferred_tier"]) != (expected[0], TIERS.index(expected[1])):
             raise ValueError("wrong policy preference")
         expected_location(layout, d["offset"])

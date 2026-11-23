@@ -1,6 +1,6 @@
 # BFS：双节点冷热识别、页面放置与带宽观察
 
-适用当前 Client **1.12**、协议 v2，以及 optane 上已验证的 Hermit **#8 内核**。
+适用当前 Client **1.13**、协议 v2，以及 optane 上已验证的 Hermit **#8 内核**。
 下面按终端与操作顺序拆分，每个命令块可以单独复制；使用 Bash，不需要把整篇拼成一个脚本。
 本文件是手动实验指南，写入文档本身不会启动实验。
 
@@ -101,7 +101,7 @@ make -C remoteswap/tools
 modinfo -F version remoteswap/client/rswap-client.ko
 ```
 
-期望版本为 `1.12`。
+期望版本为 `1.13`。
 
 ## 2. 两个远端终端：分别启动 Server
 
@@ -427,7 +427,8 @@ sudo cat /sys/kernel/debug/rswap/policy_stats
 
 Reason：0 Inactive、1 Warmup、2 无快照、3 无有效阈值、4 PFN miss、5 正热度 DRAM 优先、6 正热度 PMem 优先、7 零热度 Interleave。
 Adaptive 中已知正热度 `heat_ppm >= threshold_ppm` 首选 DRAM，较低正热度首选 PMem；目标 Tier 内两 Server 轮转。
-未知和零热度继续 Interleave，首选池不足才尝试 Fallback。mean_ppm 是真实均值，不能代替 threshold_ppm。
+未知页（无快照、无可用阈值、PFN miss）首选 DRAM，与已知热页共用 DRAM 内 Server RR；
+零热度继续原 Interleave，首选池不足才尝试 Fallback。mean_ppm 是真实均值，不能代替 threshold_ppm。
 
 想看工具转换后的带拓扑、容量和覆盖率的 JSON：
 
@@ -495,9 +496,10 @@ echo 0 | sudo tee "$BFS_TRACE/events/rswap/decision/enable"
 head -n 10 "$BFS_RUN/decisions-short.log"
 ```
 
-关注 `reason=5/6/7`、`heat_ppm`、真实 `mean_ppm`、实际 `threshold_ppm`、`preferred_server/preferred_tier`、
+关注 `placement_rule=1`、`reason=2/3/4/5/6/7`、`heat_ppm`、真实 `mean_ppm`、实际 `threshold_ppm`、`preferred_server/preferred_tier`、
 实际 `server/tier/slot`、`fallback`、`alloc_ret`。`alloc_ret=0` 表示已分配位置，
 不单凭该事件认定后续 RDMA 成功；成功写入仍看 WC 统计。
+reason 2/3/4 保留各自未知原因，首选 `preferred_tier=0`，并消耗 DRAM RR ticket；reason 7 不消耗 ticket。
 `heat_ppm=-1` 是未查询到已知热度的标记，不是“极冷”；`alloc_seq` 区分分配生命周期。
 这段短 Trace 不含完整 mapping/post/WC 生命周期，也没有逐页快照，
 不能拿它运行完整的 `--require-empty --store-results --heat-dir` 正式验证。

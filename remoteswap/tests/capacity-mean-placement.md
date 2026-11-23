@@ -1,5 +1,8 @@
 # 容量裁剪均值放置：Client 1.12
 
+本文保留 1.12 的规则和验证记录。当前 1.13 已将 Adaptive 未知页默认改为 DRAM RR，
+零热度及阈值模型保持本文语义；详见 [1.13 修改及测试计划](unknown-dram-placement.md)。
+
 ## 范围与规则
 
 在现有页面热度上，新增 `capacity-mean` 阈值策略；保留 `global-mean` 作为对照。

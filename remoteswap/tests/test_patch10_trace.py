@@ -18,7 +18,76 @@ def decision(**changes):
     return "decision: " + " ".join(f"{k}={v}" for k, v in values.items()) + "\n"
 
 
+def current_decision(**changes):
+    values = dict(threshold_ppm=500000, policy=0, threshold_source=0,
+                  threshold_generation=1, threshold_status=0, placement_rule=1)
+    values.update(changes)
+    return decision(**values)
+
+
 class AdaptiveTraceTests(unittest.TestCase):
+    def test_unknown_dram_defaults_and_legacy_interleave(self):
+        layout = ((16, 32), (16, 32))
+        for reason in (2, 3, 4):
+            changes = dict(reason=reason, heat_ppm=-1, offset=2, rr=3,
+                           preferred_server=1, server=1)
+            if reason in (2, 3):
+                changes.update(mean_ppm=-1, threshold_ppm=-1, threshold_generation=0)
+            if reason == 2:
+                changes.update(generation=0, publish_ns=0)
+            with self.subTest(reason=reason):
+                line = current_decision(**changes)
+                self.assertEqual(trace.read_decisions([line], layout)[1]['reason'], reason)
+                for bad in (dict(preferred_tier=1, tier=1), dict(preferred_server=0),
+                            dict(heat_ppm=0), dict(placement_rule=2)):
+                    with self.assertRaises(ValueError):
+                        trace.read_decisions([current_decision(**(changes | bad))], layout)
+        # Historical 1.10/1.11 and 1.12 logs retain their original offset mapping.
+        for line in (decision(reason=4, heat_ppm=-1, offset=2, preferred_tier=1, tier=1),
+                     current_decision(reason=4, heat_ppm=-1, offset=2,
+                                      preferred_tier=1, tier=1, placement_rule=0)):
+            self.assertEqual(len(trace.read_decisions([line], layout)), 1)
+        # A single Server's unknowns still prefer DRAM regardless of offset.
+        trace.read_decisions([current_decision(reason=4, heat_ppm=-1, offset=1, rr=9)], ((16, 32),))
+
+    def test_shared_dram_rr_and_zero_interleave(self):
+        layout = ((16, 32), (16, 32))
+        zero = current_decision(alloc_seq=2, offset=2, reason=7, heat_ppm=0,
+                                preferred_tier=1, tier=1)
+        lines = [current_decision(reason=4, heat_ppm=-1), zero,
+                 current_decision(alloc_seq=3, rr=1, preferred_server=1, server=1)]
+        self.assertEqual(len(trace.read_decisions(reversed(lines), layout)), 3)
+        for duplicate in (current_decision(alloc_seq=3),
+                          current_decision(alloc_seq=0, alloc_ret=-28),
+                          current_decision(alloc_seq=3, reason=4, heat_ppm=-1)):
+            with self.assertRaisesRegex(ValueError, 'duplicate RR ticket'):
+                trace.read_decisions([lines[0], duplicate], layout)
+        with self.assertRaisesRegex(ValueError, 'RR ticket'):
+            trace.read_decisions([zero.replace('rr=0', 'rr=2')], layout)
+        # A newer snapshot does not reset the run's shared sequence.
+        with self.assertRaisesRegex(ValueError, 'duplicate RR ticket'):
+            trace.read_decisions([lines[0], current_decision(alloc_seq=3, generation=2,
+                                                           threshold_generation=2)], layout)
+
+    def test_unknown_capacity_fallback_and_reclaim(self):
+        lines, sequence = [], 0
+        for i, (s, t, fallback) in enumerate(((0, 'dram', 0), (1, 'dram', 0), (0, 'pmem', 2))):
+            sequence += 1
+            lines += [event(sequence, 'alloc', offset=i, server=s, tier=t, fallback=fallback),
+                      current_decision(alloc_seq=sequence, offset=i, reason=4, heat_ppm=-1,
+                                       rr=i, preferred_server=i%2, server=s,
+                                       tier=trace.TIERS.index(t), fallback=fallback)]
+            sequence += 1
+            lines.append(event(sequence, 'put', offset=i, server=s, tier=t, users=0))
+        for i, (s, t) in enumerate(((0, 'dram'), (1, 'dram'), (0, 'pmem'))):
+            sequence += 1
+            lines.append(event(sequence, 'invalidate', offset=i, server=s, tier=t, users=0, live=0))
+            sequence += 1
+            lines.append(event(sequence, 'free', offset=i, server=s, tier=t, users=0, live=0))
+        records = trace.read_decisions(lines, ((16, 32), (16, 32)))
+        result = trace.check_mapping_records(lines, ((1, 1), (1, 1)), True, records)
+        self.assertEqual(result['frees'], 3)
+
     def test_dynamic_join_and_cli(self):
         # Offset 1 normally prefers Server 1. Adaptive legitimately selects 0.
         lines = [event(1, "alloc", offset=1), decision(),

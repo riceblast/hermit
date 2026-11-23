@@ -1,6 +1,13 @@
 # Patch 11：累计策略统计与正式监控分析
 
-## 当前进展：Client 1.12
+## 当前进展：Client 1.13
+
+Adaptive 无快照、无可用阈值和 PFN miss 均改为首选 DRAM，与已知热页共享 Server RR；
+零热度继续原 Interleave，容量回退和 Slot/I/O 生命周期沿用原机制。
+新 decision 带 `placement_rule=1`，工具按数字标识兼容历史未知 Interleave 日志。
+本轮修改、验证及后续实机计划见 [未知页 DRAM 默认策略](unknown-dram-placement.md)。
+
+## 历史 1.12 阶段
 
 Patch 11 在累计策略统计、Store post/WC 关联和只读 pool CLI 基础上，新增：
 

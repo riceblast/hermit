@@ -203,10 +203,10 @@ int rswap_placement_choose(u64 offset, u64 pfn, struct rswap_decision *d)
 		goto out;
 	d->reason = RSWAP_REASON_NO_SNAPSHOT;
 	if (!snap)
-		goto out;
+		goto unknown_dram;
 	d->reason = RSWAP_REASON_NO_MEAN;
 	if (d->threshold < 0)
-		goto out;
+		goto unknown_dram;
 	d->reason = RSWAP_REASON_UNKNOWN;
 	lo = 0;
 	hi = snap->count;
@@ -222,15 +222,25 @@ int rswap_placement_choose(u64 offset, u64 pfn, struct rswap_decision *d)
 			d->heat = record->heat_ppm;
 			if (!d->heat) {
 				d->reason = RSWAP_REASON_ZERO;
-				break; /* Keep the original Interleave preference and RR untouched. */
+				goto out; /* Original Interleave preference; no RR ticket. */
 			}
 			d->reason = d->heat >= d->threshold ? RSWAP_REASON_HOT : RSWAP_REASON_COLD;
 			d->tier = d->heat >= d->threshold ? RSWAP_TIER_DRAM : RSWAP_TIER_PMEM;
-			d->rr = (u64)atomic64_inc_return(&run->rr[d->tier]) - 1;
-			d->server = d->rr % policy_layout.nr_servers;
-			break;
+			goto tier_rr;
 		}
 	}
+unknown_dram:
+	/* All Client Stores use this default, including PFNs outside the monitored
+	 * address space. Preserve heat=-1 and the specific unavailable/miss reason.
+	 * The allocator still tries every Server in this Tier before crossing Tier.
+	 */
+	d->tier = RSWAP_TIER_DRAM;
+tier_rr:
+	/* Unknown and known-hot Stores share the same DRAM sequence. Tickets count
+	 * preference attempts, including failed allocations, and reset on Start.
+	 */
+	d->rr = (u64)atomic64_inc_return(&run->rr[d->tier]) - 1;
+	d->server = d->rr % policy_layout.nr_servers;
 out:
 	rcu_read_unlock();
 	return 0;
@@ -515,8 +525,8 @@ static int rswap_policy_show(struct seq_file *m, void *unused)
 	run = rcu_dereference_protected(policy_run, 1);
 	/* Time must follow acquisition of a newly started run. */
 	now = ktime_get_ns();
-	seq_printf(m, "version=1 state=%s area_active=%u sample_ns=%llu\n",
-		states[rswap_policy_phase(run, now)], policy_area, now);
+	seq_printf(m, "version=1 state=%s area_active=%u sample_ns=%llu placement_rule=%u\n",
+		states[rswap_policy_phase(run, now)], policy_area, now, RSWAP_PLACEMENT_RULE);
 	if (run) {
 		snap = rcu_dereference_protected(run->snapshot, 1);
 		seq_printf(m, "run_id=%llu start_ns=%llu warmup_ns=%llu mode=%s forced=%u\n",

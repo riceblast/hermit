@@ -102,7 +102,7 @@ def check_heat(decisions, directory, detail=None):
     stream = Path(detail).open('x') if detail else None
     try:
         if stream:
-            fields = ['alloc_seq', 'run', 'generation', 'pfn', 'va', 'reason', 'heat_ppm', 'mean_ppm',
+            fields = ['alloc_seq', 'run', 'generation', 'placement_rule', 'pfn', 'va', 'reason', 'heat_ppm', 'mean_ppm',
                       'snapshot_age_ns', 'threshold_ppm', 'policy', 'threshold_source', 'threshold_generation', 'threshold_status', 'preferred_server', 'preferred_tier', 'server', 'tier', 'slot', 'fallback']
             writer = csv.DictWriter(stream, fieldnames=fields, delimiter='\t')
             writer.writeheader()

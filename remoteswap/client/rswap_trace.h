@@ -48,6 +48,7 @@ TRACE_EVENT(decision,
 		__field(unsigned int, preferred_server) __field(unsigned int, preferred_tier)
 		__field(unsigned int, server) __field(unsigned int, tier)
 		__field(u64, slot) __field(unsigned int, fallback) __field(int, ret)
+		__field(unsigned int, placement_rule)
 	),
 	TP_fast_assign(
 		__entry->offset = offset; __entry->pfn = pfn;
@@ -64,15 +65,16 @@ TRACE_EVENT(decision,
 		__entry->server = loc->server; __entry->tier = loc->tier; __entry->slot = loc->slot;
 		__entry->fallback = ret ? 0 : (loc->server ^ d->server) + 2 * (loc->tier ^ d->tier);
 		__entry->ret = ret;
+		__entry->placement_rule = RSWAP_PLACEMENT_RULE;
 	),
-	TP_printk("alloc_seq=%llu offset=%llu pfn=%llu run=%llu generation=%llu decision_ns=%llu publish_ns=%llu state=%u reason=%u heat_ppm=%d mean_ppm=%d preferred_server=%u preferred_tier=%u server=%u tier=%u slot=%llu fallback=%u rr=%llu alloc_ret=%d threshold_ppm=%d policy=%u threshold_source=%u threshold_generation=%llu threshold_status=%u",
+	TP_printk("alloc_seq=%llu offset=%llu pfn=%llu run=%llu generation=%llu decision_ns=%llu publish_ns=%llu state=%u reason=%u heat_ppm=%d mean_ppm=%d preferred_server=%u preferred_tier=%u server=%u tier=%u slot=%llu fallback=%u rr=%llu alloc_ret=%d threshold_ppm=%d policy=%u threshold_source=%u threshold_generation=%llu threshold_status=%u placement_rule=%u",
 		__entry->alloc_seq, __entry->offset, __entry->pfn, __entry->run,
 		__entry->generation, __entry->decision_ns, __entry->publish_ns,
 		__entry->state, __entry->reason, __entry->heat, __entry->mean,
 		__entry->preferred_server, __entry->preferred_tier, __entry->server,
 		__entry->tier, __entry->slot, __entry->fallback, __entry->rr, __entry->ret,
 		__entry->threshold, __entry->policy, __entry->threshold_source,
-		__entry->threshold_generation, __entry->threshold_status)
+		__entry->threshold_generation, __entry->threshold_status, __entry->placement_rule)
 );
 
 /* Serialized allocator lifecycle; users excludes index ownership. Numeric

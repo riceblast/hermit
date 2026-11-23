@@ -5,6 +5,11 @@
 #include "rswap_mapping.h"
 #include "../rswap_placement_uapi.h"
 
+/* Trace/status semantics: 1 = Adaptive unknowns prefer DRAM RR; 0/absent
+ * describes historical unknown Interleave. Independent of the upload ABI.
+ */
+#define RSWAP_PLACEMENT_RULE 1
+
 enum rswap_policy_state { RSWAP_INACTIVE, RSWAP_WARMUP, RSWAP_ADAPTIVE };
 enum rswap_policy_reason { RSWAP_REASON_INACTIVE, RSWAP_REASON_WARMUP,
 	RSWAP_REASON_NO_SNAPSHOT, RSWAP_REASON_NO_MEAN, RSWAP_REASON_UNKNOWN,

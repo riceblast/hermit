@@ -45,6 +45,38 @@ int main(void) {
     assert(!rswap_mapping_get(1,&loc) && loc.id==current); rswap_mapping_put(loc.id);
     assert(atomic_load(&old_read.uptodate) && atomic_load(&read.uptodate));
     rswap_invalidate_area(0); free(snap); rswap_mapping_destroy();
+    /* Real unknown policy -> allocator -> MR/QP, including DRAM exhaustion.
+     * A one-page DRAM pool on each Server makes fallback deterministic.
+     */
+    for (unsigned int servers=1; servers<=2; servers++) {
+        pool_layout=(struct rswap_pool_layout){.nr_servers=servers,.total_pages=2*servers,
+            .server_pages={2,2},.tier_pages={{1,1},{1,1}}};
+        assert(!rswap_mapping_init(&pool_layout));
+        area_active=true; active_servers=servers;
+        run=(struct rswap_policy_run){.id=2,.start_ns=1}; policy_run=&run;
+        struct page pages[4]={0};
+        for (unsigned int i=0; i<2*servers; i++) {
+            atomic_store(&pages[i].refs,1); atomic_store(&pages[i].locked,1);
+            assert(!prepare(0,i,&pages[i],0,&cookie)); req=cookie;
+            assert(req->policy_reason==RSWAP_REASON_NO_SNAPSHOT);
+            assert(req->rdma_queue==&queues[i%servers][QP_STORE]);
+            assert(req->tier==(i<servers ? RSWAP_TIER_DRAM : RSWAP_TIER_PMEM));
+            atomic_store(&pages[i].valid,1); rswap_store_commit(cookie);
+            complete_one(&cqs[i%servers][QP_STORE]);
+        }
+        policy_run=NULL;
+        struct page loaded={0};
+        atomic_store(&loaded.refs,1); atomic_store(&loaded.locked,1);
+        assert(!rswap_rdma_submit(0,servers,&loaded,QP_LOAD_SYNC,NULL));
+        assert(cqs[0][QP_LOAD_SYNC].queued->tier==RSWAP_TIER_PMEM);
+        complete_one(&cqs[0][QP_LOAD_SYNC]);
+        assert(atomic_load(&loaded.uptodate));
+        rswap_invalidate_area(0);
+        struct rswap_mapping_stats stats; rswap_mapping_snapshot(&stats);
+        for (unsigned int s=0;s<servers;s++) for (unsigned int t=0;t<2;t++)
+            assert(stats.pools[s][t].free==1 && !stats.pools[s][t].retired && !stats.pools[s][t].live);
+        rswap_mapping_destroy();
+    }
     puts("PASS: real policy/Store/Load, replacement, late old Read, and Stop with live mapping");
     return 0;
 }
