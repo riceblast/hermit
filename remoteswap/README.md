@@ -1,8 +1,8 @@
 # Remoteswap
 
-**Development stage: Patch 10 (opt-in snapshot-based adaptive placement; dual-node core acceptance passed).**
+**Development stage: Patch 11 (policy counters and formal monitoring/reporting; single/dual-node core hardware acceptance passed).**
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
-Client 1.10 discovers each Server's DRAM/PMem topology. Its default preferred pool
+Client 1.11 discovers each Server's DRAM/PMem topology. Its default preferred pool
 interleaves first across Servers, then across the selected Server's Tiers.
 Actual Slots are dynamically allocated and retained until invalidation and the
 last in-flight reference. Each interleave level stripes its common capacity and
@@ -31,13 +31,17 @@ Server round-robin. Unknown pages keep interleave; all choices use capacity fall
 Stop, uploader exit and swapoff clear policy without changing existing mappings.
 See the [Patch 10 design and interfaces](tests/patch10-placement.md) and
 [core acceptance plan](tests/patch10-core-smoke.md). No active migration is performed.
+Client 1.11 adds module-lifetime `policy_stats`, Store post/WC correlation, and
+`pool-status` / `pool-monitor` / `pool-report` commands. See the
+[Patch 11 guide](tests/patch11-monitoring.md) and
+[single/dual-node acceptance plan and results](tests/patch11-core-smoke.md).
 The dense mapping and free lists use 12 bytes per pool page (288 MiB for 96 GiB,
 10.5 GiB for 3.5 TiB), plus allocation/page-table overhead. They are allocated before
 Frontswap registration even when the swap area is smaller than the pool.
 See the [Patch 9 guide](tests/patch9-mapping.md) for design, local validation,
 the `mapping` command, dynamic trace replay and hardware acceptance plan.
 See the [Patch 8 guide](tests/patch8-monitor.md) for hotness semantics and prior hardware results.
-The Patch 8/9 core instructions target older Client versions; use the Patch 10
+The Patch 8/9/10 core instructions target older Client versions; use the Patch 11
 plan for this version.
 
 Use the matching Hermit kernel exporting `frontswap_register_managed_ops_v2`.

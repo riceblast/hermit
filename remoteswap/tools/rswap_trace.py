@@ -2,6 +2,7 @@
 """Check static WC placement or dynamic Slot lifecycle records."""
 import argparse
 from collections import Counter
+import json
 from pathlib import Path
 import re
 import sys
@@ -185,7 +186,7 @@ def check_dynamic_trace(lines, layout, require_empty=False, decisions=None):
                                  require_empty, decisions)
 
 
-def read_decisions(lines, layout):
+def read_decisions(lines, layout, summary=None):
     """Short-window policy checks; successful records join allocator sequence IDs.
 
     This validates the kernel's recorded inputs/choice, not PFN identity or
@@ -236,6 +237,12 @@ def read_decisions(lines, layout):
         if (d["preferred_server"], d["preferred_tier"]) != (expected[0], TIERS.index(expected[1])):
             raise ValueError("wrong policy preference")
         expected_location(layout, d["offset"])
+        if summary is not None:
+            summary['decisions'] += 1
+            summary['reason_' + str(reason)] += 1
+            summary['allocation_error' if d['alloc_ret'] else 'allocation_ok'] += 1
+            if not d['alloc_ret']:
+                summary['fallback_' + str(d['fallback'])] += 1
         if d["alloc_ret"]:
             if d["alloc_seq"]:
                 raise ValueError("failed allocation has a mapping identity")
@@ -256,21 +263,51 @@ def main():
     parser.add_argument("--dynamic", action="store_true", help="replay mapping lifecycle from an empty pool")
     parser.add_argument("--adaptive", action="store_true", help="join decision events instead of assuming interleave")
     parser.add_argument("--require-empty", action="store_true", help="require every captured Slot to be freed")
+    parser.add_argument("--heat-dir", type=Path, help="publication + per-page log directory for actual-generation validation")
+    parser.add_argument("--detail", type=Path, help="new TSV file; requires --heat-dir")
+    parser.add_argument("--store-results", action="store_true", help="require complete Store post/WC chains")
+    parser.add_argument("--buffer-stats", type=Path, help="zero-loss per-CPU ftrace statistics")
+    parser.add_argument("--json", action="store_true", help="machine-readable dynamic report")
     args = parser.parse_args()
     if args.require_empty and not args.dynamic:
         parser.error("--require-empty requires --dynamic")
     if args.adaptive and not args.dynamic:
         parser.error("--adaptive requires --dynamic")
+    if (args.heat_dir or args.store_results) and not args.adaptive:
+        parser.error("--heat-dir/--store-results require --dynamic --adaptive")
+    if args.detail and not args.heat_dir:
+        parser.error("--detail requires --heat-dir")
+    if args.json and not args.dynamic:
+        parser.error("--json requires --dynamic")
     try:
+        report = {'buffer_loss_checked': False}
+        if args.buffer_stats:
+            from rswap_hotness_check import check_buffer_stats
+            check_buffer_stats(args.buffer_stats)
+            report['buffer_loss_checked'] = True
         decisions = None
         if args.adaptive:
+            summary = Counter()
             with args.trace.open() as stream:
-                decisions = read_decisions(stream, args.layout)
+                decisions = read_decisions(stream, args.layout, summary)
+            report['decisions'] = dict(summary)
+            from rswap_analysis import check_heat, check_store_results, hotness_summary
+            if args.heat_dir:
+                report['heat'] = check_heat(decisions, args.heat_dir, args.detail)
+                report['sampling'] = hotness_summary(args.heat_dir)
+            if args.store_results:
+                with args.trace.open() as stream:
+                    report['store_results'] = check_store_results(stream, decisions)
         with args.trace.open() as stream:
             if args.dynamic:
                 result = check_dynamic_trace(stream, args.layout, args.require_empty, decisions)
-                print("PASS: dynamic Slot lifecycle", result)
-                print("Requires capture from an empty pool and zero buffer losses; verify data and WC stats separately.")
+                report['mapping'] = result
+                if args.json:
+                    print(json.dumps(report, indent=2))
+                else:
+                    print("PASS: dynamic Slot lifecycle", result)
+                    print(json.dumps(report, indent=2))
+                    print("Requires capture from an empty pool and zero buffer losses; verify data separately.")
                 return 0
             counts, errors = check_trace(stream, args.layout)
         print("server tier write_ok read_sync_ok read_async_ok")
@@ -282,7 +319,7 @@ def main():
         print(f"PASS: {sum(counts.values())} successful I/O records match static placement.")
         print("Counts describe the captured I/O window, not live page occupancy.")
         return 0
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, KeyError) as error:
         print(f"rswap trace: {error}", file=sys.stderr)
         return 1
 

@@ -42,6 +42,80 @@ static struct rswap_pool_layout policy_layout;
 static u64 policy_next_id;
 static bool policy_area;
 
+/* Module-lifetime counters, deliberately independent of run/snapshot storage.
+ * Stop may retire a run before an old Store WC arrives. Never retain its pointer.
+ * Readers see independently atomic counters; reconcile only after I/O drains.
+ */
+static u64 policy_instance_ns;
+static struct {
+	atomic64_t decisions, post_ok, post_error, wc_ok, wc_error;
+} policy_counts[RSWAP_REASON_COUNT];
+static atomic64_t policy_preferred[RSWAP_MAX_SERVERS][RSWAP_NR_TIERS];
+static atomic64_t policy_allocated[RSWAP_MAX_SERVERS][RSWAP_NR_TIERS];
+static atomic64_t policy_fallback[4], policy_age[4], policy_alloc_error;
+
+void rswap_policy_stats_init(u64 instance_ns)
+{
+	unsigned int r, s, t;
+
+	policy_instance_ns = instance_ns;
+	for (r = 0; r < RSWAP_REASON_COUNT; r++) {
+		atomic64_set(&policy_counts[r].decisions, 0);
+		atomic64_set(&policy_counts[r].post_ok, 0);
+		atomic64_set(&policy_counts[r].post_error, 0);
+		atomic64_set(&policy_counts[r].wc_ok, 0);
+		atomic64_set(&policy_counts[r].wc_error, 0);
+	}
+	for (s = 0; s < RSWAP_MAX_SERVERS; s++)
+		for (t = 0; t < RSWAP_NR_TIERS; t++) {
+			atomic64_set(&policy_preferred[s][t], 0);
+			atomic64_set(&policy_allocated[s][t], 0);
+		}
+	for (r = 0; r < 4; r++) {
+		atomic64_set(&policy_fallback[r], 0);
+		atomic64_set(&policy_age[r], 0);
+	}
+	atomic64_set(&policy_alloc_error, 0);
+}
+
+void rswap_policy_record_alloc(const struct rswap_decision *d,
+		const struct rswap_location *loc, int status)
+{
+	unsigned int bucket;
+	u64 age;
+
+	atomic64_inc(&policy_counts[d->reason].decisions);
+	atomic64_inc(&policy_preferred[d->server][d->tier]);
+	if (d->state == RSWAP_ADAPTIVE && d->generation) {
+		age = d->decision_ns - d->publish_ns;
+		bucket = age <= NSEC_PER_SEC ? 0 : age <= 5ULL * NSEC_PER_SEC ? 1 :
+			age <= 20ULL * NSEC_PER_SEC ? 2 : 3;
+		atomic64_inc(&policy_age[bucket]);
+	}
+	if (status) {
+		atomic64_inc(&policy_alloc_error);
+		return;
+	}
+	atomic64_inc(&policy_allocated[loc->server][loc->tier]);
+	atomic64_inc(&policy_fallback[(loc->server ^ d->server) + 2 * (loc->tier ^ d->tier)]);
+}
+
+void rswap_policy_record_submit(unsigned int reason, int status)
+{
+	if (status)
+		atomic64_inc(&policy_counts[reason].post_error);
+	else
+		atomic64_inc(&policy_counts[reason].post_ok);
+}
+
+void rswap_policy_record_wc(unsigned int reason, int status)
+{
+	if (status)
+		atomic64_inc(&policy_counts[reason].wc_error);
+	else
+		atomic64_inc(&policy_counts[reason].wc_ok);
+}
+
 static unsigned int rswap_policy_phase(const struct rswap_policy_run *run, u64 now)
 {
 	if (!run)
@@ -421,10 +495,51 @@ static const struct file_operations rswap_policy_fops = {
 	.llseek = seq_lseek, .release = single_release,
 };
 
+static int rswap_policy_stats_show(struct seq_file *m, void *unused)
+{
+	unsigned int r, s, t;
+
+	seq_printf(m, "version=1 instance_ns=%llu sample_ns=%llu nr_servers=%u page_size=%lu\n",
+		policy_instance_ns, ktime_get_ns(), policy_layout.nr_servers, PAGE_SIZE);
+	for (r = 0; r < RSWAP_REASON_COUNT; r++)
+		seq_printf(m, "reason %u %lld %lld %lld %lld %lld\n", r,
+			atomic64_read(&policy_counts[r].decisions),
+			atomic64_read(&policy_counts[r].post_ok),
+			atomic64_read(&policy_counts[r].post_error),
+			atomic64_read(&policy_counts[r].wc_ok),
+			atomic64_read(&policy_counts[r].wc_error));
+	for (s = 0; s < policy_layout.nr_servers; s++)
+		for (t = 0; t < RSWAP_NR_TIERS; t++)
+			seq_printf(m, "pool %u %u %lld %lld\n", s, t,
+				atomic64_read(&policy_preferred[s][t]),
+				atomic64_read(&policy_allocated[s][t]));
+	for (r = 0; r < 4; r++) {
+		seq_printf(m, "fallback %u %lld\n", r, atomic64_read(&policy_fallback[r]));
+		seq_printf(m, "age %u %lld\n", r, atomic64_read(&policy_age[r]));
+	}
+	seq_printf(m, "allocation_error %lld\n", atomic64_read(&policy_alloc_error));
+	return 0;
+}
+
+static int rswap_policy_stats_open(struct inode *inode, struct file *file)
+{
+	if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
+		return -ENODEV;
+	return single_open(file, rswap_policy_stats_show, NULL);
+}
+
+static const struct file_operations rswap_policy_stats_fops = {
+	.owner = THIS_MODULE, .open = rswap_policy_stats_open, .read = seq_read,
+	.llseek = seq_lseek, .release = single_release,
+};
+
 int rswap_placement_debugfs(struct dentry *root)
 {
 	struct dentry *file;
 
+	file = debugfs_create_file("policy_stats", 0400, root, NULL, &rswap_policy_stats_fops);
+	if (IS_ERR_OR_NULL(file))
+		return file ? PTR_ERR(file) : -ENOMEM;
 	file = debugfs_create_file("placement", 0400, root, NULL, &rswap_policy_fops);
 	if (IS_ERR_OR_NULL(file))
 		return file ? PTR_ERR(file) : -ENOMEM;

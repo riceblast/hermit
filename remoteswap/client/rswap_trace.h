@@ -8,6 +8,28 @@
 #include <linux/tracepoint.h>
 #include "rswap_placement.h"
 
+/* Store-only results. stage 0 = post accepted/pre-post error, stage 1 = WC.
+ * A fast WC can precede stage 0 in the log. Key by alloc_seq, never offset alone.
+ */
+TRACE_EVENT(store_result,
+	TP_PROTO(u64 alloc_seq, u64 offset, unsigned int server, unsigned int tier,
+		 unsigned int stage, int status),
+	TP_ARGS(alloc_seq, offset, server, tier, stage, status),
+	TP_STRUCT__entry(
+		__field(u64, alloc_seq) __field(u64, offset)
+		__field(unsigned int, server) __field(unsigned int, tier)
+		__field(unsigned int, stage) __field(int, status)
+	),
+	TP_fast_assign(
+		__entry->alloc_seq = alloc_seq; __entry->offset = offset;
+		__entry->server = server; __entry->tier = tier;
+		__entry->stage = stage; __entry->status = status;
+	),
+	TP_printk("alloc_seq=%llu offset=%llu server=%u tier=%u stage=%u status=%d",
+		__entry->alloc_seq, __entry->offset, __entry->server,
+		__entry->tier, __entry->stage, __entry->status)
+);
+
 /* Emitted immediately after the allocation attempt. alloc_seq joins the
  * serialized mapping event even if CPUs emit decision events out of order.
  */

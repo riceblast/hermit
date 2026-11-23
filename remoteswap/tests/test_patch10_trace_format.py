@@ -46,7 +46,7 @@ class TraceFormatTests(unittest.TestCase):
     def test_full_sequence_does_not_enter_string_verifier(self):
         header = (ROOT / 'client/rswap_trace.h').read_text()
         formats = {}
-        for name in ('mapping', 'placement', 'decision'):
+        for name in ('mapping', 'placement', 'decision', 'store_result'):
             block = header[header.index('TRACE_EVENT(' + name + ','):]
             value = re.search(r'TP_printk\(("(?:[^"\\]|\\.)*")', block).group(1)
             formats[name] = ast.literal_eval(value)

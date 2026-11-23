@@ -143,6 +143,9 @@ void fs_rdma_callback(struct ib_cq *cq, struct ib_wc *wc)
 		(unsigned long long)((ktime_get_ns() - req->start_ns) / 1000));
 
 	if (type == QP_STORE) {
+		rswap_policy_record_wc(req->policy_reason, status);
+		trace_store_result(req->alloc_seq, (u64)req->offset,
+			queue->rdma_session->server_id, req->tier, 1, status);
 		req->status = status;
 		smp_store_release(&req->io_done, true);
 		rswap_store_put(req);
@@ -297,6 +300,7 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 		if (!ret) {
 			ret = rswap_mapping_alloc_preferred(offset, decision.server,
 				decision.tier, &location);
+			rswap_policy_record_alloc(&decision, &location, ret);
 			/* Allocation decision, not post status or terminal WC success. */
 			trace_decision((u64)offset, page_to_pfn(page), &decision, &location, ret);
 		}
@@ -324,6 +328,8 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 	req->mapping_id = location.id;
 	req->swap_type = area_type;
 	if (type == QP_STORE) {
+		req->alloc_seq = location.alloc_seq;
+		req->policy_reason = decision.reason;
 		refcount_set(&req->store_refs, 2);
 	}
 	get_page(page);
@@ -340,15 +346,23 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 			atomic_dec(&queue->store_pending);
 		goto free_req;
 	}
-	if (type == QP_STORE)
+	if (type == QP_STORE) {
+		rswap_policy_record_submit(decision.reason, 0);
+		trace_store_result(location.alloc_seq, (u64)offset,
+			location.server, location.tier, 0, 0);
 		*store_req = req;
+	}
 	return 0;
 free_req:
 	put_page(page);
 	kmem_cache_free(queue->fs_rdma_req_cache, req);
 put_mapping:
-	if (type == QP_STORE)
+	if (type == QP_STORE) {
+		rswap_policy_record_submit(decision.reason, ret);
+		trace_store_result(location.alloc_seq, (u64)offset,
+			location.server, location.tier, 0, ret);
 		rswap_mapping_abort(offset, location.id);
+	}
 	rswap_mapping_put(location.id);
 submit_error:
 	rswap_stats_submit_error(session, tier, type);

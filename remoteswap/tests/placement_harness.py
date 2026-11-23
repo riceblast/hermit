@@ -22,6 +22,9 @@ typedef uint16_t u16;
 typedef atomic_llong atomic64_t;
 #define atomic64_inc_return(p) (atomic_fetch_add(p, 1) + 1)
 #define atomic64_set(p, v) atomic_store(p, v)
+#define atomic64_inc(p) ((void)atomic_fetch_add(p, 1))
+#define atomic64_read(p) atomic_load(p)
+#define PAGE_SIZE 4096UL
 #define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_ACQUIRE)
 #define WRITE_ONCE(x, v) __atomic_store_n(&(x), v, __ATOMIC_RELEASE)
 #define __rcu

@@ -119,6 +119,8 @@ struct fs_rdma_req {
 	unsigned int mapping_id; /* Request reference pins this pool-global Slot. */
 	pgoff_t offset;
 	u64 start_ns;
+	u64 alloc_seq; /* Store-only observation key, copied before post_send. */
+	unsigned int policy_reason;
 };
 
 struct two_sided_rdma_send {

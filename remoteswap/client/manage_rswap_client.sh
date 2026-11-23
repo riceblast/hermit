@@ -92,6 +92,14 @@ case "${1:-}" in
     monitor)
         run_as_root python3 "${script_dir}/../tools/rswap_stats.py" --interval "${2:-1}"
         ;;
+    pool-status|pool-monitor)
+        action=status
+        [[ $1 != pool-monitor ]] || action=monitor
+        run_as_root python3 "${script_dir}/../tools/rswap_pool.py" "$action" "${@:2}"
+        ;;
+    pool-report)
+        python3 "${script_dir}/../tools/rswap_pool.py" report "${@:2}"
+        ;;
     trace-check)
         [[ $# -ge 3 ]] || die 'Usage: trace-check TRACE_FILE DRAM_GiB:PMem_GiB[,DRAM_GiB:PMem_GiB] [--dynamic [--adaptive] [--require-empty]]'
         python3 "${script_dir}/../tools/rswap_trace.py" "$2" --layout "$3" "${@:4}"
@@ -111,7 +119,7 @@ case "${1:-}" in
         cat /proc/swaps
         ;;
     *)
-        echo "Usage: $0 {install|uninstall|status|stats|mapping|placement|adaptive|placement-stop|monitor [seconds]|trace-check FILE LAYOUT [--dynamic [--adaptive] [--require-empty]]}" >&2
+        echo "Usage: $0 {install|uninstall|status|stats|mapping|placement|adaptive|placement-stop|monitor [seconds]|pool-status|pool-monitor [--interval SEC --out DIR]|pool-report --samples FILE [--settled --heat-dir DIR]|trace-check FILE LAYOUT [options]}" >&2
         echo "Edit ${config_file} before install; environment overrides are not used." >&2
         exit 2
         ;;

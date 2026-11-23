@@ -126,6 +126,7 @@ int rswap_stats_init(unsigned int nr_servers)
 	/* Called once before Frontswap registration, never while data I/O runs. */
 	stats_nr_servers = nr_servers;
 	stats_instance_ns = ktime_get_ns();
+	rswap_policy_stats_init(stats_instance_ns);
 	atomic64_set(&unrouted_error, 0);
 	for (id = 0; id < nr_servers; id++) {
 		for (tier = 0; tier < RSWAP_NR_TIERS; tier++) {
