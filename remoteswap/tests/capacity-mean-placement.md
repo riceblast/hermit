@@ -147,3 +147,12 @@ decision Trace 继续使用全数字字段，新增实际阈值、policy/source/
 `/tmp/hermit-capacity-regression.log`、`/tmp/hermit-capacity-targeted.log`。
 最终增量构建可能只显示产物已最新；实现阶段已实际编译修改过的 Client 源文件。
 本地结果与产物 hash 另存 `artifacts/capacity-mean-local-20261123/`（Git 忽略）。
+
+
+### 2026-11-23 后续单次 BFS 观察
+
+按操作者要求跳过独立功能验收，仅执行一轮 BFS，不追加实验。
+Interleave 分布正常，Adaptive DRAM 合计 351.69 MiB/s、PMem 346.88 MiB/s，
+本轮 DRAM 高约 1.38%；所有 I/O 错误增量为 0，正常收尾。
+此结果不等同于完整逐页功能验收或稳定性能提升。
+详细配置、口径、热度及原始证据见 [单次 BFS 结果](capacity-mean-bfs-result.md)。

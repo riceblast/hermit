@@ -1,6 +1,6 @@
 # Remoteswap
 
-**Development stage: Client 1.12 capacity-mean placement (compiled/local validation; new policy hardware acceptance pending).**
+**Development stage: Client 1.12 capacity-mean placement (local validation and one BFS bandwidth observation completed).**
 The new [capacity-mean policy](tests/capacity-mean-placement.md) uses an estimated
 remote-candidate mean, keeps unknown/zero-heat Stores on Interleave, and separates
 observed means from placement thresholds. Local upload ABI v2 requires matching
