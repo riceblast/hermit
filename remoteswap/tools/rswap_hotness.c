@@ -671,7 +671,7 @@ static void usage(FILE *f)
 {
 	fprintf(f, "Usage: rswap_hotness --out DIR [--interval SEC] [--window N] [--warmup SEC]\n"
 		"                     [--pages] [--placement [--manual]] (--pid PID | -- COMMAND [ARGS...])\n"
-		"Defaults: interval=1, window=20 (1..64 rounds), warmup=20.\n"
+		"Defaults: interval=20, window=4 (1..64 rounds), warmup=90.\n"
 		"DIR must not exist. --pages writes per-round TSVs for offline Store matching.\n"
 		"Requires 4-KiB pages, CAP_SYS_ADMIN/PFN visibility, and page_idle write access.\n"
 		"--placement starts Client policy before launch (active swap required); --manual waits for adaptive command.\n"
@@ -763,7 +763,7 @@ static pid_t launch(char **command, uint64_t *t0, const struct config *c)
 
 int main(int argc, char **argv)
 {
-	struct config c = {.interval = 1, .window = 20, .warmup = 20, .upload_fd = -1,
+	struct config c = {.interval = 20, .window = 4, .warmup = 90, .upload_fd = -1,
 		.upload_path = "/sys/kernel/debug/rswap/hotness",
 		.reserve_bytes = UINT64_C(1) << 30,
 		.threshold_config = {.min_pages = 1024, .min_coverage_ppm = 50000}};
