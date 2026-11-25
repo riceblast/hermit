@@ -305,3 +305,22 @@ echo 0 | sudo tee "$TRACE/tracing_on"
 echo 0 | sudo tee "$TRACE/events/rswap/decision/enable"
 sudo rmdir "$TRACE"
 ```
+
+### client E：查看 RDMA 请求延迟
+
+内存池启动、Client 模块加载后，在应用运行期间读取全局 tracing。延迟由 `trace_printk` 输出，使用以下命令实时查看：
+
+```bash
+TRACE=/sys/kernel/debug/tracing
+echo 1 | sudo tee "$TRACE/options/trace_printk"
+echo 1 | sudo tee "$TRACE/tracing_on"
+sudo cat "$TRACE/trace_pipe" | grep --line-buffered 'server: .* type: .* lat:'
+```
+
+输出中的 `server` 是远端节点编号（从 0 开始）；`type` 为 `0`（Store）、`1`（同步 Load）或 `2`（异步 Load）；`lat` 的单位为微秒（μs），从提交 RDMA 前计时，到完成回调中打印时结束，包含完成处理开销。当前延迟输出不区分 DRAM／PMem。
+
+Ctrl-C 退出查看；结束采集后执行：
+
+```bash
+echo 0 | sudo tee "$TRACE/tracing_on"
+```
