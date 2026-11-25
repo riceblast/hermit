@@ -78,7 +78,54 @@ static const struct file_operations rswap_stats_fops = {
 	.release = single_release,
 };
 
+/* Display binary capacities using the requested KB..GB labels. Choose units
+ * before rounding: exactly 1024 stays in the current unit; GB is the ceiling.
+ * Integer arithmetic avoids floating point and rounding the input twice.
+ */
+static void rswap_seq_capacity(struct seq_file *m, u64 bytes)
+{
+	static const char * const units[] = { "KB", "MB", "GB" };
+	unsigned int shift = 10;
+	u64 tenths;
+
+	while (shift < 30 && bytes > (1ULL << (shift + 10)))
+		shift += 10;
+	tenths = (bytes >> shift) * 10 +
+		(((bytes & ((1ULL << shift) - 1)) * 10 + (1ULL << (shift - 1))) >> shift);
+	seq_printf(m, "%llu.%u%s", (unsigned long long)(tenths / 10),
+		(unsigned int)(tenths % 10), units[shift / 10 - 1]);
+}
+
 static int rswap_mapping_show(struct seq_file *m, void *unused)
+{
+	struct rswap_mapping_stats stats;
+	unsigned int s, t;
+
+	rswap_mapping_snapshot(&stats);
+	seq_puts(m, "version=2 capacity=");
+	rswap_seq_capacity(m, stats.pages << PAGE_SHIFT);
+	seq_puts(m, " metadata=");
+	rswap_seq_capacity(m, stats.metadata_bytes);
+	seq_printf(m, " sequence=%llu\n", (unsigned long long)stats.sequence);
+	seq_puts(m, "server tier capacity used free\n");
+	for (s = 0; s < stats.nr_servers; s++) {
+		for (t = 0; t < RSWAP_NR_TIERS; t++) {
+			const struct rswap_mapping_pool_stats *p = &stats.pools[s][t];
+
+			seq_printf(m, "%u %s ", s, stats_tier_names[t]);
+			rswap_seq_capacity(m, p->capacity << PAGE_SHIFT);
+			seq_puts(m, " ");
+			rswap_seq_capacity(m, (p->live + p->retired) << PAGE_SHIFT);
+			seq_puts(m, " ");
+			rswap_seq_capacity(m, p->free << PAGE_SHIFT);
+			seq_puts(m, "\n");
+		}
+	}
+	return 0;
+}
+
+/* Preserve exact page/byte counts for collectors and archived-log parsers. */
+static int rswap_mapping_raw_show(struct seq_file *m, void *unused)
 {
 	struct rswap_mapping_stats stats;
 	unsigned int s, t;
@@ -112,6 +159,21 @@ static int rswap_mapping_open(struct inode *inode, struct file *file)
 static const struct file_operations rswap_mapping_fops = {
 	.owner = THIS_MODULE,
 	.open = rswap_mapping_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int rswap_mapping_raw_open(struct inode *inode, struct file *file)
+{
+	if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
+		return -ENODEV;
+	return single_open(file, rswap_mapping_raw_show, NULL);
+}
+
+static const struct file_operations rswap_mapping_raw_fops = {
+	.owner = THIS_MODULE,
+	.open = rswap_mapping_raw_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
@@ -208,6 +270,12 @@ int rswap_stats_init(unsigned int nr_servers)
 		return ret;
 	}
 	file = debugfs_create_file("mapping", 0444, stats_root, NULL, &rswap_mapping_fops);
+	if (IS_ERR_OR_NULL(file)) {
+		ret = file ? PTR_ERR(file) : -ENOMEM;
+		rswap_stats_exit();
+		return ret;
+	}
+	file = debugfs_create_file("mapping_raw", 0444, stats_root, NULL, &rswap_mapping_raw_fops);
 	if (IS_ERR_OR_NULL(file)) {
 		ret = file ? PTR_ERR(file) : -ENOMEM;
 		rswap_stats_exit();

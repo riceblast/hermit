@@ -100,7 +100,13 @@ def parse_bundle(raw):
 def collect(root):
     begin = time.monotonic_ns()
     # Each file is closed immediately. No open module reference while sleeping.
-    raw = {name: (root / name).read_text() for name in ('stats', 'mapping', 'placement', 'policy_stats')}
+    raw = {name: (root / name).read_text() for name in ('stats', 'placement', 'policy_stats')}
+    # Human-readable mapping rounds capacities; collectors need exact counts.
+    # Old Clients only expose the original integer mapping file.
+    try:
+        raw['mapping'] = (root / 'mapping_raw').read_text()
+    except FileNotFoundError:
+        raw['mapping'] = (root / 'mapping').read_text()
     raw.update(version=1, begin_ns=begin, end_ns=time.monotonic_ns())
     parse_bundle(raw)
     return raw

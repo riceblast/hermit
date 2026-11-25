@@ -87,7 +87,8 @@ bash remoteswap/client/manage_rswap_client.sh address-map
 | --- | --- |
 | `status` | 实际节点数量、总池容量、各节点 IP／端口 |
 | `pool-status` | JSON 格式；`server_count`、总 `capacity_bytes`；`topology` 中每节点容量及 `dram_fraction`／`pmem_fraction`；`pools` 中每节点／Tier 的容量与占用 |
-| `mapping` | 简明表格，分别列出 `0/1 × dram/pmem` 的 Slot 总数、占用和空闲 |
+| `mapping` | 简明表格，分别列出 `0/1 × dram/pmem` 的容量、占用和空闲，使用一位小数的 KB／MB／GB |
+| `mapping --raw` | 精确整数：各池的 Slot 数及 Client 主体元数据字节数，供程序读取／核对 |
 | `address-map` | 按 DRAM／PMem、memory pool（Server 编号）列出远端 MR 地址范围、Chunk 编号及容量 |
 
 本文双节点配置应显示每台 48 GiB，其中 DRAM 16 GiB、PMem 32 GiB，总池 96 GiB。单节点则只有 server 0 的两个 Tier。
@@ -220,16 +221,19 @@ sudo watch -n 2 cat /sys/kernel/debug/rswap/mapping
 每两秒显示：
 
 ```text
-server tier capacity live retired free
-0 dram ... ... ... ...
-0 pmem ... ... ... ...
-1 dram ... ... ... ...
-1 pmem ... ... ... ...
+server tier capacity used free
+0 dram 16.0GB 0.0KB 16.0GB
+0 pmem 32.0GB 0.0KB 32.0GB
+1 dram 16.0GB 0.0KB 16.0GB
+1 pmem 32.0GB 0.0KB 32.0GB
 ```
 
 - `capacity`：该节点／Tier 的 Slot 总容量；`free`：剩余可分配容量。
-- 已占容量为 `live+retired`，其中 `retired` 是等待在途引用释放的位置。
-- 数值单位均为 **4 KiB 页**；**GiB＝页数÷262144**。同一 server 的 DRAM、PMem 相加即该节点总量。例如节点剩余 GiB＝`(dram.free+pmem.free)/262144`。
+- `used`：当前已占容量，按内部 `live+retired` 计算，包含等待在途引用释放的位置；默认输出不再单列 live／retired。
+- 容量字段按 **1024 进制**显示一位小数，后缀为 KB／MB／GB；从 KB 开始，超过 1024 才换下一个单位，最大到 GB。例如 `16.0GB`、`512.0MB`、`0.0KB`，3.5 TiB 显示 `3584.0GB`。
+- 第一行 `version=2 capacity=... metadata=... sequence=...` 中，`capacity` 是全池容量，`metadata` 是 Client 映射主体元数据占用；序号保持整数。
+- 如需原始精确数值，执行 `bash remoteswap/client/manage_rswap_client.sh mapping --raw` 或读取 `/sys/kernel/debug/rswap/mapping_raw`，仍为 v1 格式、4 KiB Slot 计数及元数据字节数。监控工具已改为读取原始接口，并兼容旧 Client。
+- 显示值存在舍入误差，精确核对 `capacity=used+free` 时使用原始接口（其中 used=live+retired）。同一 server 的 DRAM、PMem 相加即该节点容量。
 
 运行中应能看到各节点占用增加、剩余减少。BFS 释放页后占用可回落，最终 swapoff 后应全部归还。Server 已预分配整个池，不能用 Server 主机的 `free -h` 代替池内剩余 Slot。
 

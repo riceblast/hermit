@@ -36,6 +36,12 @@ bandwidth. The optional `rswap:placement` event is disabled by default; see the
 Use the updated Python tools; old stats v1 snapshots are not supported.
 Current configuration expects two 48-GiB Servers (96 GiB total).
 
+`mapping` now displays capacity/used/free with one decimal and KB/MB/GB suffixes
+(binary units, switching only above 1024, capped at GB). Used combines the internal
+live and retired counts. `mapping --raw`, or debugfs
+`mapping_raw`, preserves the exact version-1 page/byte counts. Updated pool
+collectors use the raw interface and retain compatibility with older Clients.
+
 After connecting, `bash client/manage_rswap_client.sh address-map` (from this
 directory), or `sudo cat /sys/kernel/debug/rswap/address_map`, lists the registered
 remote virtual address ranges grouped by DRAM/PMem and Server. Each MR retains its
