@@ -147,7 +147,7 @@ class CapacityTests(unittest.TestCase):
     def test_real_sampler_upload_and_threshold_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory=Path(tmp);out=directory/'heat';out.mkdir()
-            bridge=BRIDGE.replace('.placement=true', '.placement=true, .pages=true').replace('.placement_log=tmpfile()',
+            bridge=BRIDGE.replace('.placement=true', '.placement=true, .pages=true, .raw_logs=true').replace('.placement_log=tmpfile()',
                 '.window=4, .out=OUT_DIR, .local_bytes=8192, '
                 '.threshold_config={.policy=1,.min_pages=1}, '
                 '.placement_log=fopen(OUT_DIR "/placement.tsv","w"), '
@@ -157,15 +157,17 @@ class CapacityTests(unittest.TestCase):
                 'for (size_t i=0;i<5;i++) { rows[i].va=(i+1)*4096; } struct page_list pages={.v=rows,.n=5};')
             bridge=bridge.replace('.state=RESIDENT,.pfn=pages.n-i', '.state=RESIDENT,.va=(i+1)*4096,.pfn=pages.n-i')
             bridge=bridge.replace('uint64_t start;', r'''
+    assert(!open_raw_logs(&c));
     fputs(summary_header,summary);
-    fputs("version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean_ppm\tupload_ms\tpolicy\tthreshold_ppm\tthreshold_source\tthreshold_generation\tthreshold_status\tpopulation_pages\tthreshold_sample_pages\tcandidate_pages\tlocal_pages\tmin_pages\tmin_coverage_ppm\n",c.placement_log);
-    fputs("version\tsample_generation\theat_ppm\tpages\n",c.distribution_log);
+    fputs(placement_header,c.placement_log);
+    fputs("version\tsample_generation\theat\tpages\n",c.distribution_log);
     uint64_t start;''')
             bridge=bridge.replace('d.reason==RSWAP_REASON_NO_MEAN && d.generation==2',
                                   'd.reason==RSWAP_REASON_UNKNOWN && d.generation==2')
             bridge=bridge.replace('fclose(summary); fclose(c.placement_log);',
                 'assert(!run_metadata(&c,1,start,monotonic_ns(),0,0,0)); '
-                'fclose(summary); fclose(c.placement_log); fclose(c.distribution_log);')
+                'fclose(summary); fclose(c.placement_log); fclose(c.distribution_log); '
+                'fclose(c.raw_summary); fclose(c.raw_placement_log); fclose(c.raw_distribution_log); free(c.raw_out);')
             bridge=bridge.replace('int main(void) {', r'''
 static int logged_snapshot(struct config *c,FILE *f,const struct page_list *p,
         uint64_t gen,uint64_t begin,uint64_t end,uint64_t start) {
@@ -179,7 +181,7 @@ int main(void) {''')
             subprocess.run([str(binary)],check=True,timeout=10)
             r=hotness_summary(out)
             self.assertEqual(r['publications'],3)
-            with (out/'placement.tsv').open() as f:rows=list(csv.DictReader(f,delimiter='\t'))
+            with (out/'raw/placement.tsv').open() as f:rows=list(csv.DictReader(f,delimiter='\t'))
             self.assertEqual([int(r['threshold_source']) for r in rows],[1,2,1])
             self.assertEqual([int(r['threshold_ppm']) for r in rows],[0,0,1000000])
             def logged(seq,pfn,reason,gen=1,heat=1000000):
@@ -198,7 +200,7 @@ int main(void) {''')
             self.assertEqual(checked['known_pfn_consistent'],2)
             self.assertEqual(checked['zero_interleave_consistent'],1)
             self.assertEqual(checked['pfn_miss_consistent'],1)
-            path=out/'placement.tsv';original=path.read_text()
+            path=out/'raw/placement.tsv';original=path.read_text()
             rows[0]['threshold_ppm']='1'
             with path.open('w') as f:
                 w=csv.DictWriter(f,fieldnames=list(rows[0]),delimiter='\t');w.writeheader();w.writerows(rows)

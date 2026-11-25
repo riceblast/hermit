@@ -30,10 +30,46 @@ TRACE_EVENT(store_result,
 		__entry->tier, __entry->stage, __entry->status)
 );
 
+/* Formatting is done into event-owned storage before trace_seq sees it. A
+ * single leading %s avoids this kernel's full-seq mixed-va_list verifier bug.
+ */
+#ifndef _RSWAP_DECISION_FORMAT
+#define _RSWAP_DECISION_FORMAT
+static inline void rswap_format_decision(char *buf, size_t size, u64 pfn,
+		const struct rswap_decision *d, const struct rswap_location *loc)
+{
+	const char *policy = "interleave", *reason = "interleave";
+	const char *tier = loc->tier == RSWAP_TIER_DRAM ? "dram" : "pmem";
+
+	if (d->state == RSWAP_WARMUP) {
+		policy = "adaptive(warmup)";
+		reason = "interleave(warmup)";
+	} else if (d->state == RSWAP_ADAPTIVE) {
+		policy = "adaptive";
+		reason = loc->tier == RSWAP_TIER_DRAM ? "hot" : "cold";
+	}
+	scnprintf(buf, size,
+		"req_type: store, pfn: 0x%llx, placement_policy: %s, reason: %s, server: %u, target_mem: %s,",
+		(unsigned long long)pfn, policy, reason, loc->server, tier);
+}
+#endif
+
+/* Display only: successful Store allocation, not post/WC success. Never Load.
+ * Original numeric evidence is available independently as decision_raw.
+ */
+TRACE_EVENT(decision,
+	TP_PROTO(u64 offset, u64 pfn, const struct rswap_decision *d,
+		 const struct rswap_location *loc, int ret),
+	TP_ARGS(offset, pfn, d, loc, ret),
+	TP_STRUCT__entry(__array(char, text, 192)),
+	TP_fast_assign(rswap_format_decision(__entry->text, sizeof(__entry->text), pfn, d, loc);),
+	TP_printk("%s", __entry->text)
+);
+
 /* Emitted immediately after the allocation attempt. alloc_seq joins the
  * serialized mapping event even if CPUs emit decision events out of order.
  */
-TRACE_EVENT(decision,
+TRACE_EVENT(decision_raw,
 	TP_PROTO(u64 offset, u64 pfn, const struct rswap_decision *d,
 		 const struct rswap_location *loc, int ret),
 	TP_ARGS(offset, pfn, d, loc, ret),

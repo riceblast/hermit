@@ -46,11 +46,14 @@ class TraceFormatTests(unittest.TestCase):
     def test_full_sequence_does_not_enter_string_verifier(self):
         header = (ROOT / 'client/rswap_trace.h').read_text()
         formats = {}
-        for name in ('mapping', 'placement', 'decision', 'store_result'):
+        for name in ('mapping', 'placement', 'decision', 'decision_raw', 'store_result'):
             block = header[header.index('TRACE_EVENT(' + name + ','):]
             value = re.search(r'TP_printk\(("(?:[^"\\]|\\.)*")', block).group(1)
             formats[name] = ast.literal_eval(value)
-            self.assertNotIn('%s', formats[name])
+            if name == 'decision':
+                self.assertEqual(formats[name], '%s')
+            else:
+                self.assertNotIn('%s', formats[name])
         kernel = (ROOT.parent / 'linux-5.14-rc5/kernel/trace/trace.c').read_text()
         cases = r'''
 static int check(const char *fmt, ...) {
@@ -64,7 +67,8 @@ int main(void) {
     assert(check("seq=%llu action=%s",7ULL,safe)>0);
     assert(check(MAPPING,7ULL,0U,1ULL,0U,0U,0ULL,1U,1U,0U)==0);
     assert(check(PLACEMENT,0U,1ULL,0U,0U,0,0)==0);
-    puts("PASS: actual 5.14 verifier reproduces legacy warning; numeric trace formats avoid it");
+    assert(check(DECISION,safe)==0);
+    puts("PASS: actual 5.14 verifier accepts numeric fields and a single leading event-owned string");
     return 0;
 }
 '''

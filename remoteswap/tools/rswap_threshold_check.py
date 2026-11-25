@@ -11,6 +11,8 @@ HEATS = {a * 1000000 // v for v in range(1, 65) for a in range(v + 1)}
 
 
 def distribution(directory):
+    from rswap_hotness_check import raw_log_directory
+    directory = raw_log_directory(directory)
     result = defaultdict(dict)
     previous = -1
     with (Path(directory) / 'distribution.tsv').open() as src:

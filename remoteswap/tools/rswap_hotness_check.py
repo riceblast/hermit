@@ -39,8 +39,16 @@ class Snapshot:
     run_end_ns: int
 
 
+def raw_log_directory(directory):
+    """Prefer optional exact sidecars; never certify rounded display records."""
+    directory = Path(directory)
+    raw = directory / 'raw'
+    return raw if (raw / 'summary.tsv').is_file() else directory
+
+
 def read_summary(path):
     path = Path(path)
+    path = raw_log_directory(path.parent) / path.name
     snapshots = []
     identity = None
     with (path.parent / "run.tsv").open() as stream:
@@ -57,6 +65,8 @@ def read_summary(path):
         raise ValueError("invalid or unsuccessful monitor run")
     with path.open() as stream:
         for row in csv.DictReader(stream, delimiter="\t"):
+            if row.get('version') != '1':
+                raise ValueError('Full heat validation requires --raw-logs; use the precise raw/ logs')
             version, pid, generation, start, begin, end, ready, known = (
                 int(row[key]) for key in ("version", "pid", "generation", "start_ns",
                                          "begin_ns", "end_ns", "ready_ns", "known"))

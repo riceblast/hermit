@@ -514,7 +514,19 @@ static const struct file_operations rswap_control_fops = {
 	.owner = THIS_MODULE, .write = rswap_control_write, .llseek = no_llseek,
 };
 
-static int rswap_policy_show(struct seq_file *m, void *unused)
+static void rswap_seq_heat(struct seq_file *m, int ppm)
+{
+	unsigned int value;
+
+	if (ppm < 0) {
+		seq_puts(m, "-");
+		return;
+	}
+	value = ((unsigned int)ppm + 5000) / 10000;
+	seq_printf(m, "%u.%02u", value / 100, value % 100);
+}
+
+static int rswap_policy_show_common(struct seq_file *m, void *unused, bool raw)
 {
 	struct rswap_policy_run *run;
 	struct rswap_heat_snapshot *snap;
@@ -525,29 +537,53 @@ static int rswap_policy_show(struct seq_file *m, void *unused)
 	run = rcu_dereference_protected(policy_run, 1);
 	/* Time must follow acquisition of a newly started run. */
 	now = ktime_get_ns();
-	seq_printf(m, "version=1 state=%s area_active=%u sample_ns=%llu placement_rule=%u\n",
-		states[rswap_policy_phase(run, now)], policy_area, now, RSWAP_PLACEMENT_RULE);
+	seq_printf(m, "version=%u state=%s area_active=%u sample_ns=%llu placement_rule=%u\n",
+		raw ? 1 : 2, states[rswap_policy_phase(run, now)], policy_area, now, RSWAP_PLACEMENT_RULE);
 	if (run) {
 		snap = rcu_dereference_protected(run->snapshot, 1);
 		seq_printf(m, "run_id=%llu start_ns=%llu warmup_ns=%llu mode=%s forced=%u\n",
 			run->id, run->start_ns, run->warmup_ns,
 			run->manual ? "manual" : "auto", run->forced);
-		seq_printf(m, "generation=%llu publish_ns=%llu age_ns=%llu records=%llu known=%llu mean_ppm=%d metadata_bytes=%llu staging_bytes=%llu\n",
+		seq_printf(m, "generation=%llu publish_ns=%llu age_ns=%llu records=%llu known=%llu ",
 			snap ? snap->generation : 0, snap ? snap->publish_ns : 0,
 			snap ? now - snap->publish_ns : 0, snap ? snap->count : 0,
-			snap ? snap->known : 0, snap ? snap->mean : -1,
+			snap ? snap->known : 0);
+		if (raw)
+			seq_printf(m, "mean_ppm=%d", snap ? snap->mean : -1);
+		else {
+			seq_puts(m, "mean=");
+			rswap_seq_heat(m, snap ? snap->mean : -1);
+		}
+		seq_printf(m, " metadata_bytes=%llu staging_bytes=%llu\n",
 			snap ? sizeof(*snap) + snap->count * sizeof(snap->records[0]) : 0,
 			policy_owner && policy_owner->staging ? sizeof(*snap) +
 				policy_owner->staging->count * sizeof(snap->records[0]) : 0);
 		if (snap) {
 			const struct rswap_threshold_metadata *t = &snap->threshold;
-			seq_printf(m, "policy=%u threshold_ppm=%d threshold_source=%u threshold_generation=%llu threshold_status=%u population_pages=%llu threshold_sample_pages=%llu candidate_pages=%llu local_pages=%llu\n",
-				t->policy, t->threshold_ppm, t->source, t->generation, t->status,
+			seq_printf(m, "policy=%u ", t->policy);
+			if (raw)
+				seq_printf(m, "threshold_ppm=%d", t->threshold_ppm);
+			else {
+				seq_puts(m, "threshold=");
+				rswap_seq_heat(m, t->threshold_ppm);
+			}
+			seq_printf(m, " threshold_source=%u threshold_generation=%llu threshold_status=%u population_pages=%llu threshold_sample_pages=%llu candidate_pages=%llu local_pages=%llu\n",
+				t->source, t->generation, t->status,
 				t->population_pages, t->sample_pages, t->candidate_pages, t->local_pages);
 		}
 	}
 	mutex_unlock(&policy_mutex);
 	return 0;
+}
+
+static int rswap_policy_show(struct seq_file *m, void *unused)
+{
+	return rswap_policy_show_common(m, unused, false);
+}
+
+static int rswap_policy_raw_show(struct seq_file *m, void *unused)
+{
+	return rswap_policy_show_common(m, unused, true);
 }
 
 static int rswap_policy_open(struct inode *inode, struct file *file)
@@ -559,6 +595,18 @@ static int rswap_policy_open(struct inode *inode, struct file *file)
 
 static const struct file_operations rswap_policy_fops = {
 	.owner = THIS_MODULE, .open = rswap_policy_open, .read = seq_read,
+	.llseek = seq_lseek, .release = single_release,
+};
+
+static int rswap_policy_raw_open(struct inode *inode, struct file *file)
+{
+	if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
+		return -ENODEV;
+	return single_open(file, rswap_policy_raw_show, NULL);
+}
+
+static const struct file_operations rswap_policy_raw_fops = {
+	.owner = THIS_MODULE, .open = rswap_policy_raw_open, .read = seq_read,
 	.llseek = seq_lseek, .release = single_release,
 };
 
@@ -608,6 +656,9 @@ int rswap_placement_debugfs(struct dentry *root)
 	if (IS_ERR_OR_NULL(file))
 		return file ? PTR_ERR(file) : -ENOMEM;
 	file = debugfs_create_file("placement", 0400, root, NULL, &rswap_policy_fops);
+	if (IS_ERR_OR_NULL(file))
+		return file ? PTR_ERR(file) : -ENOMEM;
+	file = debugfs_create_file("placement_raw", 0400, root, NULL, &rswap_policy_raw_fops);
 	if (IS_ERR_OR_NULL(file))
 		return file ? PTR_ERR(file) : -ENOMEM;
 	file = debugfs_create_file("hotness", 0600, root, NULL, &rswap_upload_fops);

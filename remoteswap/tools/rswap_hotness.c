@@ -53,10 +53,12 @@ struct config {
 	double interval, warmup;
 	unsigned int window;
 	const char *out;
-	bool pages, placement, manual;
+	bool pages, placement, manual, raw_logs;
 	int upload_fd;
 	const char *upload_path;
 	FILE *placement_log, *distribution_log;
+	char *raw_out;
+	FILE *raw_summary, *raw_placement_log, *raw_distribution_log;
 	struct rswap_threshold_config threshold_config;
 	struct rswap_threshold_metadata threshold, previous_threshold;
 	const char *memory_cgroup;
@@ -65,7 +67,24 @@ struct config {
 
 static volatile sig_atomic_t interrupted;
 static const char summary_header[] =
+	"version\tpid\tgeneration\tpages\tpresent\tswapped\tothers\tmean\tscan_ms\tpages_file\n";
+static const char raw_summary_header[] =
 	"version\tpid\tgeneration\tstart_ns\tbegin_ns\tend_ns\tready_ns\tphase\tpages\tpresent\tswapped\tactive\tidle\tinvalid\tknown\tmean\tscan_ms\toverrun\tpages_file\n";
+static const char placement_header[] =
+	"version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean\tupload_ms\tpolicy\tthreshold\tthreshold_source\tthreshold_generation\tthreshold_status\tpopulation_pages\tthreshold_sample_pages\tcandidate_pages\tlocal_pages\tmin_pages\tmin_coverage\n";
+static const char raw_placement_header[] =
+	"version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean_ppm\tupload_ms\tpolicy\tthreshold_ppm\tthreshold_source\tthreshold_generation\tthreshold_status\tpopulation_pages\tthreshold_sample_pages\tcandidate_pages\tlocal_pages\tmin_pages\tmin_coverage_ppm\n";
+
+/* Display rounding only. Sampling histories, means and upload ABI stay exact. */
+static const char *heat_text(int ppm, char text[16])
+{
+	if (ppm < 0) snprintf(text, 16, "-");
+	else {
+		unsigned int value = ((unsigned int)ppm + 5000) / 10000;
+		snprintf(text, 16, "%u.%02u", value / 100, value % 100);
+	}
+	return text;
+}
 
 static void on_signal(int sig) { interrupted = sig; }
 
@@ -512,13 +531,27 @@ static int prepare_threshold(struct config *c, const struct page_list *pages,
 	c->threshold = rswap_threshold_select(&c->threshold_config, &hist, bins, n, local,
 		generation + 1, mean, &c->previous_threshold);
 	if (c->distribution_log) {
+		uint64_t rounded[101] = {0};
+		char text[16];
+
 		for (size_t i = 0; i < n; i++)
-			fprintf(c->distribution_log, "1\t%" PRIu64 "\t%u\t%" PRIu64 "\n",
-				generation, bins[i].heat, bins[i].pages);
+			rounded[(bins[i].heat + 5000) / 10000] += bins[i].pages;
+		for (unsigned int i = 0; i <= 100; i++)
+			if (rounded[i]) fprintf(c->distribution_log, "2\t%" PRIu64 "\t%s\t%" PRIu64 "\n",
+				generation, heat_text(i * 10000, text), rounded[i]);
 		if (hist.population > hist.known)
-			fprintf(c->distribution_log, "1\t%" PRIu64 "\t-1\t%" PRIu64 "\n",
+			fprintf(c->distribution_log, "2\t%" PRIu64 "\t-\t%" PRIu64 "\n",
 				generation, hist.population - hist.known);
 		if (fflush(c->distribution_log) || ferror(c->distribution_log)) return -1;
+	}
+	if (c->raw_distribution_log) {
+		for (size_t i = 0; i < n; i++)
+			fprintf(c->raw_distribution_log, "1\t%" PRIu64 "\t%u\t%" PRIu64 "\n",
+				generation, bins[i].heat, bins[i].pages);
+		if (hist.population > hist.known)
+			fprintf(c->raw_distribution_log, "1\t%" PRIu64 "\t-1\t%" PRIu64 "\n",
+				generation, hist.population - hist.known);
+		if (fflush(c->raw_distribution_log) || ferror(c->raw_distribution_log)) return -1;
 	}
 	return 0;
 }
@@ -579,18 +612,33 @@ static int placement_snapshot(const struct config *c, const struct page_list *pa
 		.op = RSWAP_UPLOAD_COMMIT, .generation = generation + 1};
 	if (upload_command(c->upload_fd, &command, &ack)) goto out;
 	if (ack.generation != generation + 1) { errno = EPROTO; goto out; }
-	fprintf(c->placement_log, "2\t%" PRIu64 "\t%llu\t%llu\t%llu\t%llu\t%zu\t%zu\t%d\t%.3f",
-		generation, (unsigned long long)ack.run_id, (unsigned long long)ack.start_ns,
-		(unsigned long long)ack.generation, (unsigned long long)ack.publish_ns,
-		n, known, mean, (monotonic_ns() - begin) / 1e6);
 	const struct rswap_threshold_metadata *t = &c->threshold;
-	/* Extend the same row, preserving the original true mean. */
-	fprintf(c->placement_log, "\t%u\t%d\t%u\t%llu\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%u\n",
-		t->policy, t->threshold_ppm, t->source, (unsigned long long)t->generation, t->status,
-		(unsigned long long)t->population_pages, (unsigned long long)t->sample_pages,
-		(unsigned long long)t->candidate_pages, (unsigned long long)t->local_pages,
-		(unsigned long long)t->min_pages, t->min_coverage_ppm);
-	if (fflush(c->placement_log) || ferror(c->placement_log)) goto out;
+	double upload_ms = (monotonic_ns() - begin) / 1e6;
+	for (unsigned int raw = 0; raw < 2; raw++) {
+		FILE *log = raw ? c->raw_placement_log : c->placement_log;
+		char mean_text[16], threshold_text[16], coverage_text[16];
+
+		if (!log) continue;
+		if (raw) {
+			snprintf(mean_text, sizeof(mean_text), "%d", mean);
+			snprintf(threshold_text, sizeof(threshold_text), "%d", t->threshold_ppm);
+			snprintf(coverage_text, sizeof(coverage_text), "%u", t->min_coverage_ppm);
+		} else {
+			heat_text(mean, mean_text);
+			heat_text(t->threshold_ppm, threshold_text);
+			heat_text(t->min_coverage_ppm, coverage_text);
+		}
+		fprintf(log, "%u\t%" PRIu64 "\t%llu\t%llu\t%llu\t%llu\t%zu\t%zu\t%s\t%.3f",
+			raw ? 2 : 3, generation, (unsigned long long)ack.run_id, (unsigned long long)ack.start_ns,
+			(unsigned long long)ack.generation, (unsigned long long)ack.publish_ns,
+			n, known, mean_text, upload_ms);
+		fprintf(log, "\t%u\t%s\t%u\t%llu\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",
+			t->policy, threshold_text, t->source, (unsigned long long)t->generation, t->status,
+			(unsigned long long)t->population_pages, (unsigned long long)t->sample_pages,
+			(unsigned long long)t->candidate_pages, (unsigned long long)t->local_pages,
+			(unsigned long long)t->min_pages, coverage_text);
+		if (fflush(log) || ferror(log)) goto out;
+	}
 	ret = 0;
 out:
 	free(records);
@@ -607,14 +655,21 @@ static int snapshot(struct config *c, FILE *summary, const struct page_list *pag
 	size_t known = 0, active = 0, idle = 0, present = 0, swapped = 0;
 	long double sum = 0;
 	char name[80] = "-", *path = NULL;
-	FILE *detail = NULL;
+	FILE *detail = NULL, *raw_detail = NULL;
 	if (c->pages) {
 		snprintf(name, sizeof(name), "pages-%06" PRIu64 ".tsv", generation);
 		if (asprintf(&path, "%s/%s", c->out, name) < 0) return -1;
 		detail = fopen(path, "wx");
 		free(path);
 		if (!detail) return -1;
-		fprintf(detail, "va\tpfn\tlast_pfn\tstate\tactive\tvalid\theat_ppm\talias\tswap_type\tswap_offset\n");
+		fprintf(detail, "va\tpfn\tlast_pfn\tstate\theat\n");
+		if (c->raw_out) {
+			if (asprintf(&path, "%s/%s", c->raw_out, name) < 0) goto fail;
+			raw_detail = fopen(path, "wx");
+			free(path);
+			if (!raw_detail) goto fail;
+			fprintf(raw_detail, "va\tpfn\tlast_pfn\tstate\tactive\tvalid\theat_ppm\talias\tswap_type\tswap_offset\n");
+		}
 	}
 	for (size_t i = 0; i < pages->n; i++) {
 		const struct hot_page *p = &pages->v[i];
@@ -624,26 +679,37 @@ static int snapshot(struct config *c, FILE *summary, const struct page_list *pag
 		active += p->sample == 1;
 		idle += p->sample == 0;
 		if (valid && !p->alias) { known++; sum += (long double)heat_active(&p->heat) / valid; }
-		if (detail) fprintf(detail, "0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%u\t%u\t%d\t%u\t%d\t%" PRIu64 "\n",
+		if (detail) {
+			char text[16];
+			fprintf(detail, "0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%s\n",
+				p->va, p->pfn, p->pfn ? p->pfn : p->previous_pfn, state_names[p->state],
+				heat_text(heat_ppm(&p->heat), text));
+		}
+		if (raw_detail) fprintf(raw_detail, "0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%u\t%u\t%d\t%u\t%d\t%" PRIu64 "\n",
 			p->va, p->pfn, p->pfn ? p->pfn : p->previous_pfn, state_names[p->state],
 			heat_active(&p->heat), valid, heat_ppm(&p->heat), p->alias,
 			p->state == SWAPPED ? (int)(p->swap & 31) : -1,
 			p->state == SWAPPED ? p->swap >> 5 : 0);
 	}
-	if (detail) {
-		bool error = ferror(detail);
-		if (fclose(detail)) error = true;
-		if (error) { errno = EIO; return -1; }
+	bool error = false;
+	if (raw_detail) {
+		error = ferror(raw_detail);
+		if (fclose(raw_detail)) error = true;
+		raw_detail = NULL;
 	}
+	if (detail) {
+		if (ferror(detail)) error = true;
+		if (fclose(detail)) error = true;
+		detail = NULL;
+	}
+	if (error) { errno = EIO; return -1; }
 	/* A row commits a fully written snapshot. Only ready_ns <= Store time may
  	 * be used by the offline checker; end_ns alone would permit future data.
 	 */
 	double mean = known ? (double)(sum / known) : -1;
-	/* Kernel uses integer ppm: floor both the page heat and the original mean.
-	 * Equal fixed-point values are cold; no floating point in the Store path.
-	 */
+	/* Display rounding never feeds back into the threshold or upload. */
+	int mean_ppm = known ? (int)(sum * RSWAP_HEAT_SCALE / known) : -1;
 	if (c->placement && c->upload_fd >= 0) {
-		int mean_ppm = known ? (int)(sum * RSWAP_HEAT_SCALE / known) : -1;
 		if (prepare_threshold(c, pages, generation, mean_ppm)) return -1;
 		int uploaded = placement_snapshot(c, pages, generation, known, mean_ppm);
 		if (uploaded < 0) return -1;
@@ -656,46 +722,83 @@ static int snapshot(struct config *c, FILE *summary, const struct page_list *pag
 	}
 	uint64_t ready = monotonic_ns();
 	const char *phase = ready - t0 < c->warmup * 1e9 ? "warmup" : "observe";
-	fprintf(summary, "1\t%ld\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%.9f\t%.3f\t%d\t%s\n",
-		(long)c->pid, generation, t0, begin, end, ready, phase, pages->n, present, swapped,
-		active, idle, pages->n - active - idle, known, mean, (end - begin) / 1e6,
-		ready - begin > c->interval * 1e9, name);
+	if (c->raw_summary) {
+		fprintf(c->raw_summary, "1\t%ld\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%.9f\t%.3f\t%d\t%s\n",
+			(long)c->pid, generation, t0, begin, end, ready, phase, pages->n, present, swapped,
+			active, idle, pages->n - active - idle, known, mean, (end - begin) / 1e6,
+			ready - begin > c->interval * 1e9, name);
+		if (fflush(c->raw_summary) || ferror(c->raw_summary)) return -1;
+	}
+	char mean_text[16];
+	fprintf(summary, "2\t%ld\t%" PRIu64 "\t%zu\t%zu\t%zu\t%zu\t%s\t%.3f\t%s\n",
+		(long)c->pid, generation, pages->n, present, swapped, pages->n - present - swapped,
+		heat_text(mean_ppm, mean_text), (end - begin) / 1e6, name);
 	if (fflush(summary) || ferror(summary)) return -1;
-	printf("generation=%" PRIu64 " elapsed=%.3f phase=%s pages=%zu known=%zu mean=%.6f active=%zu idle=%zu invalid=%zu scan_ms=%.3f\n",
-		generation, (ready - t0) / 1e9, phase, pages->n, known, mean, active, idle,
-		pages->n - active - idle, (end - begin) / 1e6);
+	printf("generation=%" PRIu64 " elapsed=%.3f pages=%zu present=%zu swapped=%zu others=%zu mean=%s scan_ms=%.3f\n",
+		generation, (ready - t0) / 1e9, pages->n, present, swapped, pages->n - present - swapped,
+		mean_text, (end - begin) / 1e6);
 	return fflush(stdout);
+fail:
+	if (raw_detail) fclose(raw_detail);
+	if (detail) fclose(detail);
+	return -1;
 }
 
 static void usage(FILE *f)
 {
 	fprintf(f, "Usage: rswap_hotness --out DIR [--interval SEC] [--window N] [--warmup SEC]\n"
-		"                     [--pages] [--placement [--manual]] (--pid PID | -- COMMAND [ARGS...])\n"
+		"                     [--pages] [--raw-logs] [--placement [--manual]] (--pid PID | -- COMMAND [ARGS...])\n"
 		"Defaults: interval=20, window=4 (1..64 rounds), warmup=90.\n"
 		"DIR must not exist. --pages writes per-round TSVs for offline Store matching.\n"
+		"Default TSVs show two-decimal heat in [0,1], unknown='-'.\n"
+		"--raw-logs additionally saves original precise logs under DIR/raw for full validation.\n"
 		"Requires 4-KiB pages, CAP_SYS_ADMIN/PFN visibility, and page_idle write access.\n"
 		"--placement starts Client policy before launch (active swap required); --manual waits for adaptive command.\n"
 		"--threshold-policy global-mean|capacity-mean (default global-mean).\n"
 		"capacity-mean requires --placement and --memory-cgroup DIR or --local-memory-gib GIB.\n"
 		"--reserve-gib GIB (default 1); --threshold-min-pages N (1024); --threshold-min-coverage FRACTION (0.05).\n"
-		"Known heat zero and unknown heat keep Interleave; positive heat >= threshold prefers DRAM.\n"
+		"Known heat zero keeps Interleave; Adaptive unknowns prefer DRAM. Positive heat >= threshold prefers DRAM.\n"
 		"Default is observation only. Ctrl-C stops; launched children receive the signal.\n");
+}
+
+static int open_raw_logs(struct config *c)
+{
+	if (!c->raw_logs) return 0;
+	if (asprintf(&c->raw_out, "%s/raw", c->out) < 0) return -1;
+	if (mkdir(c->raw_out, 0700)) return -1;
+	const char *names[] = { "summary.tsv", "placement.tsv", "distribution.tsv" };
+	const char *headers[] = { raw_summary_header, raw_placement_header,
+		"version\tsample_generation\theat_ppm\tpages\n" };
+	FILE **files[] = { &c->raw_summary, &c->raw_placement_log, &c->raw_distribution_log };
+	for (unsigned int i = 0; i < (c->placement ? 3U : 1U); i++) {
+		char *path;
+		if (asprintf(&path, "%s/%s", c->raw_out, names[i]) < 0) return -1;
+		*files[i] = fopen(path, "wx");
+		free(path);
+		if (!*files[i] || fcntl(fileno(*files[i]), F_SETFD, FD_CLOEXEC)) return -1;
+		fputs(headers[i], *files[i]);
+	}
+	return 0;
 }
 
 static int run_metadata(const struct config *c, uint64_t token, uint64_t start,
 			uint64_t end, int status, int error, int stop_signal)
 {
-	char *path;
-	if (asprintf(&path, "%s/run.tsv", c->out) < 0) return -1;
-	FILE *run = fopen(path, "wx");
-	free(path);
-	if (!run) return -1;
-	fprintf(run, "version\tpid\tstart_ticks\tstart_ns\tend_ns\twindow\tinterval\twarmup\texit_status\tmonitor_error\tstop_signal\n"
-		"1\t%ld\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%.9f\t%.9f\t%d\t%d\t%d\n",
-		(long)c->pid, token, start, end, c->window, c->interval, c->warmup, status, error, stop_signal);
-	bool failed = ferror(run);
-	if (fclose(run)) failed = true;
-	if (failed) { errno = EIO; return -1; }
+	const char *directories[] = { c->out, c->raw_out };
+	for (unsigned int i = 0; i < 2; i++) {
+		char *path;
+		if (!directories[i]) continue;
+		if (asprintf(&path, "%s/run.tsv", directories[i]) < 0) return -1;
+		FILE *run = fopen(path, "wx");
+		free(path);
+		if (!run) return -1;
+		fprintf(run, "version\tpid\tstart_ticks\tstart_ns\tend_ns\twindow\tinterval\twarmup\texit_status\tmonitor_error\tstop_signal\n"
+			"1\t%ld\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%.9f\t%.9f\t%d\t%d\t%d\n",
+			(long)c->pid, token, start, end, c->window, c->interval, c->warmup, status, error, stop_signal);
+		bool failed = ferror(run);
+		if (fclose(run)) failed = true;
+		if (failed) { errno = EIO; return -1; }
+	}
 	return 0;
 }
 
@@ -770,6 +873,7 @@ int main(int argc, char **argv)
 	const struct option options[] = {{"pid", 1, NULL, 'p'}, {"interval", 1, NULL, 'i'},
 		{"window", 1, NULL, 'w'}, {"warmup", 1, NULL, 't'}, {"out", 1, NULL, 'o'},
 		{"pages", 0, NULL, 'P'}, {"placement", 0, NULL, 'A'},
+		{"raw-logs", 0, NULL, 'D'},
 		{"manual", 0, NULL, 'M'}, {"threshold-policy", 1, NULL, 'S'},
 		{"memory-cgroup", 1, NULL, 'C'}, {"local-memory-gib", 1, NULL, 'L'},
 		{"reserve-gib", 1, NULL, 'R'}, {"threshold-min-pages", 1, NULL, 'N'},
@@ -789,6 +893,7 @@ int main(int argc, char **argv)
 		case 't': c.warmup = seconds_value(optarg, true); if (c.warmup < 0) goto bad; break;
 		case 'o': c.out = optarg; break;
 		case 'P': c.pages = true; break;
+		case 'D': c.raw_logs = true; break;
 		case 'A': c.placement = true; break;
 		case 'M': c.manual = true; break;
 		case 'S':
@@ -842,13 +947,14 @@ int main(int argc, char **argv)
 		}
 		c.placement_log = fopen(path, "wx");
 		if (!c.placement_log || fcntl(fileno(c.placement_log), F_SETFD, FD_CLOEXEC)) goto fail;
-		fputs("version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean_ppm\tupload_ms\tpolicy\tthreshold_ppm\tthreshold_source\tthreshold_generation\tthreshold_status\tpopulation_pages\tthreshold_sample_pages\tcandidate_pages\tlocal_pages\tmin_pages\tmin_coverage_ppm\n", c.placement_log);
+		fputs(placement_header, c.placement_log);
 
 		if (snprintf(path, sizeof(path), "%s/distribution.tsv", c.out) >= (int)sizeof(path)) { errno = ENAMETOOLONG; goto fail; }
 		c.distribution_log = fopen(path, "wx");
 		if (!c.distribution_log || fcntl(fileno(c.distribution_log), F_SETFD, FD_CLOEXEC)) goto fail;
-		fputs("version\tsample_generation\theat_ppm\tpages\n", c.distribution_log);
+		fputs("version\tsample_generation\theat\tpages\n", c.distribution_log);
 	}
+	if (open_raw_logs(&c)) goto fail;
 	struct sigaction action = {.sa_handler = on_signal};
 	sigemptyset(&action.sa_mask);
 	sigaction(SIGINT, &action, NULL); sigaction(SIGTERM, &action, NULL);
@@ -904,6 +1010,9 @@ out:
 	if (c.upload_fd >= 0) close(c.upload_fd);
 	if (c.placement_log && fclose(c.placement_log)) ret = 1;
 	if (c.distribution_log && fclose(c.distribution_log)) ret = 1;
+	if (c.raw_summary && fclose(c.raw_summary)) ret = 1;
+	if (c.raw_placement_log && fclose(c.raw_placement_log)) ret = 1;
+	if (c.raw_distribution_log && fclose(c.raw_distribution_log)) ret = 1;
 	if (flags_fd >= 0) close(flags_fd);
 	if (idle_fd >= 0) close(idle_fd);
 	if (summary && fclose(summary)) ret = 1;
@@ -921,5 +1030,6 @@ out:
 		perror("write run metadata");
 		ret = 1;
 	}
+	free(c.raw_out);
 	return ret;
 }

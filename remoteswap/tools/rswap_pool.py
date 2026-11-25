@@ -100,13 +100,14 @@ def parse_bundle(raw):
 def collect(root):
     begin = time.monotonic_ns()
     # Each file is closed immediately. No open module reference while sleeping.
-    raw = {name: (root / name).read_text() for name in ('stats', 'placement', 'policy_stats')}
+    raw = {name: (root / name).read_text() for name in ('stats', 'policy_stats')}
     # Human-readable mapping rounds capacities; collectors need exact counts.
     # Old Clients only expose the original integer mapping file.
-    try:
-        raw['mapping'] = (root / 'mapping_raw').read_text()
-    except FileNotFoundError:
-        raw['mapping'] = (root / 'mapping').read_text()
+    for name in ('mapping', 'placement'):
+        try:
+            raw[name] = (root / (name + '_raw')).read_text()
+        except FileNotFoundError:
+            raw[name] = (root / name).read_text()
     raw.update(version=1, begin_ns=begin, end_ns=time.monotonic_ns())
     parse_bundle(raw)
     return raw
@@ -158,6 +159,17 @@ def validate_settled(policy):
             raise ValueError('Store outcomes not settled/consistent')
 
 
+def display_state(state):
+    result = dict(state)
+    for name in ('mean', 'threshold'):
+        if name + '_ppm' in result:
+            ppm = int(result.pop(name + '_ppm'))
+            value = (ppm + 5000) // 10000
+            result[name] = '-' if ppm < 0 else f'{value // 100}.{value % 100:02d}'
+            result['version'] = '2'
+    return result
+
+
 def status(raw):
     b = parse_bundle(raw)
     topology = {}
@@ -168,7 +180,7 @@ def status(raw):
                                 dram_fraction=dram/(dram+pmem), pmem_fraction=pmem/(dram+pmem))
     return dict(instance_ns=b['stats'].instance_ns, collection_begin_ns=raw['begin_ns'], collection_end_ns=raw['end_ns'],
                 server_count=len(topology), topology=topology,
-                state=b['state'], pools={str(s)+'/'+t: p for (s, t), p in b['pools'].items()},
+                state=display_state(b['state']), pools={str(s)+'/'+t: p for (s, t), p in b['pools'].items()},
                 capacity_bytes=sum(p['capacity'] for p in b['pools'].values()) * b['stats'].page_size,
                 io_counts={str(s)+'/'+t+'/'+op: dict(zip(('ok','wc_error','submit_error'), v))
                            for (s,t,op),v in b['stats'].rows.items()},

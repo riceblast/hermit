@@ -5,7 +5,7 @@ import csv
 import math
 from pathlib import Path
 
-from rswap_hotness_check import read_pages, read_summary
+from rswap_hotness_check import read_pages, read_summary, raw_log_directory
 
 
 def tsv(path):
@@ -17,7 +17,7 @@ def tsv(path):
 
 
 def publications(directory):
-    directory = Path(directory)
+    directory = raw_log_directory(directory)
     runs = tsv(directory / 'run.tsv')
     if len(runs) != 1:
         raise ValueError('One completed monitor run required')
@@ -30,6 +30,8 @@ def publications(directory):
     if not 0 < start <= end or not 1 <= int(run['window']) <= 64:
         raise ValueError('Invalid run metadata')
     summaries = tsv(directory / 'summary.tsv')
+    if summaries[0].get('version') != '1':
+        raise ValueError('Full publication analysis requires --raw-logs; use the precise raw/ logs')
     for generation, row in enumerate(summaries):
         if (int(row['version']) != 1 or int(row['pid']) != int(run['pid']) or
                 int(row['generation']) != generation or int(row['start_ns']) != start or
@@ -65,6 +67,18 @@ def publications(directory):
     return run, summaries, result
 
 
+def display_threshold(row):
+    if int(row['version']) != 2:
+        return None
+    result = {key: int(row[key]) for key in
+              ('policy', 'threshold_source', 'threshold_generation', 'population_pages',
+               'threshold_sample_pages', 'candidate_pages', 'local_pages')}
+    ppm = int(row['threshold_ppm'])
+    value = (ppm + 5000) // 10000
+    result['threshold'] = '-' if ppm < 0 else f'{value // 100}.{value % 100:02d}'
+    return result
+
+
 def hotness_summary(directory):
     run, summaries, pubs = publications(directory)
     return dict(rounds=len(summaries), publications=len(pubs), run_id=int(next(iter(pubs.values()))['run_id']),
@@ -75,10 +89,7 @@ def hotness_summary(directory):
                 max_upload_ms=max(float(r['upload_ms']) for r in pubs.values()),
                 max_known=max(int(r['known']) for r in summaries),
                 max_resident_records=max(int(r['records']) for r in pubs.values()),
-                threshold=({key: int(list(pubs.values())[-1][key]) for key in
-                            ('policy', 'threshold_ppm', 'threshold_source', 'threshold_generation',
-                             'population_pages', 'threshold_sample_pages', 'candidate_pages', 'local_pages')}
-                           if int(next(iter(pubs.values()))['version']) == 2 else None),
+                threshold=display_threshold(list(pubs.values())[-1]),
                 note='Known history pages differ from uploaded resident PFNs; neither is a kernel Store hit rate.')
 
 
@@ -88,7 +99,7 @@ def check_heat(decisions, directory, detail=None):
     Only one PFN dictionary at a time; all detailed analysis is for short traces.
     A matched PFN remains an approximate identity, not proof of page ownership.
     """
-    directory = Path(directory)
+    directory = raw_log_directory(directory)
     run, summaries, pubs = publications(directory)
     snapshots = {s.generation: s for s in read_summary(directory / 'summary.tsv')}
     groups = defaultdict(list)

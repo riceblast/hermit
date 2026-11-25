@@ -302,7 +302,9 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 				decision.tier, &location);
 			rswap_policy_record_alloc(&decision, &location, ret);
 			/* Allocation decision, not post status or terminal WC success. */
-			trace_decision((u64)offset, page_to_pfn(page), &decision, &location, ret);
+			trace_decision_raw((u64)offset, page_to_pfn(page), &decision, &location, ret);
+			if (!ret)
+				trace_decision((u64)offset, page_to_pfn(page), &decision, &location, ret);
 		}
 	} else {
 		ret = rswap_mapping_get(offset, &location);

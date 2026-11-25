@@ -199,9 +199,14 @@ def read_decisions(lines, layout, summary=None):
     for number, line in enumerate(lines, 1):
         if "LOST" in line and "EVENT" in line:
             raise ValueError("ftrace reports lost events")
-        if "decision:" not in line:
+        if "decision_raw:" in line:
+            payload = line.split("decision_raw:", 1)[1].split()
+        elif "decision:" in line:
+            payload = line.split("decision:", 1)[1].split()
+            if payload and payload[0] == 'req_type:':
+                continue  # Human display cannot certify the full decision chain.
+        else:
             continue
-        payload = line.split("decision:", 1)[1].split()
         extra = {'threshold_ppm', 'policy', 'threshold_source', 'threshold_generation', 'threshold_status'}
         modern = any(x.startswith('threshold_ppm=') for x in payload)
         expected_fields = fields | extra if modern else fields
@@ -289,7 +294,7 @@ def read_decisions(lines, layout, summary=None):
             raise ValueError("missing/duplicate decision identity")
         result[d["alloc_seq"]] = d
     if not result:
-        raise ValueError("no successful allocation decisions")
+        raise ValueError("no detailed allocation decisions; enable rswap:decision_raw for full validation")
     return result
 
 

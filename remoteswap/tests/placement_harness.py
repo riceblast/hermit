@@ -100,6 +100,7 @@ static ssize_t seq_read(struct file *f, char *p, size_t n, loff_t *pos) { return
 static void seq_printf(struct seq_file *m, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
 }
+static void seq_puts(struct seq_file *m, const char *text) { fputs(text, stdout); }
 static bool sysfs_streq(const char *a, const char *b) {
     size_t n = strlen(b); return !strncmp(a, b, n) && (!a[n] || (a[n] == '\n' && !a[n+1]));
 }

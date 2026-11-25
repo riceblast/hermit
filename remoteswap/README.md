@@ -1,6 +1,11 @@
 # Remoteswap
 
-**Development stage: Client 1.13 Adaptive unknown-page DRAM default (single/dual-Server BFS observations completed; dedicated functional validation pending).**
+**Development stage: Client 1.14 compact heat/Store-decision output (build, 88 local checks, and one 32G BFS / 4-GiB core workload validation passed).**
+Human heat output now uses two decimals in [0,1], with `-` for unknown. The
+sampler's `--raw-logs` option additionally preserves exact original logs under
+`OUT/raw/`. `rswap:decision` shows six Store-only fields; detailed original
+events are independently enabled as `rswap:decision_raw`. See the
+[output formats and core validation](tests/compact-output.md).
 The new [capacity-mean policy](tests/capacity-mean-placement.md) uses an estimated
 remote-candidate mean and separates
 observed means from placement thresholds. Local upload ABI v2 requires matching
@@ -17,7 +22,7 @@ The later requested [32/32-GiB single-Server run](tests/unknown-dram-single32-bf
 had balanced Interleave traffic and Adaptive bandwidth of 536.08/224.57 MiB/s, with no capacity fallback.
 Its short decision trace lost events; the cumulative WC bandwidth results remain available, while complete trace validation is uncertified.
 The Server now requires the named arguments in the [Patch 5 Server guide](tests/patch5-server.md).
-Client 1.13 discovers each Server's DRAM/PMem topology. Its Inactive/Warmup preferred pool
+Client 1.14 discovers each Server's DRAM/PMem topology. Its Inactive/Warmup preferred pool
 interleaves first across Servers, then across the selected Server's Tiers.
 Actual Slots are dynamically allocated and retained until invalidation and the
 last in-flight reference. Each interleave level stripes its common capacity and

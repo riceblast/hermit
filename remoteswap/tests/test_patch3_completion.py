@@ -184,6 +184,8 @@ static void trace_store_result(u64 seq, u64 offset, unsigned int s, unsigned int
                                unsigned int stage, int status) {}
 static void trace_decision(u64 offset, u64 pfn, const struct rswap_decision *d,
                           const struct rswap_location *loc, int ret) {}
+static void trace_decision_raw(u64 offset, u64 pfn, const struct rswap_decision *d,
+                              const struct rswap_location *loc, int ret) {}
 static unsigned int active_servers = 2, area_type;
 static bool area_active = true;
 static pthread_mutex_t area_lock = PTHREAD_MUTEX_INITIALIZER;

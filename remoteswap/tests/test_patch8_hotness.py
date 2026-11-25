@@ -134,12 +134,14 @@ int main(int argc, char **argv) {
     round_from(map, pm, flags, idle, &old, &next, 3); replace(&old, &next);
     round_from(map, pm, flags, idle, &old, &next, 3); replace(&old, &next);
     assert(old.n == 2 && old.v[0].alias + old.v[1].alias == 1);
-    struct config config = {.pid = getpid(), .out = argv[1], .pages = true, .interval = 1, .window = 3};
+    struct config config = {.pid = getpid(), .out = argv[1], .pages = true, .interval = 1, .window = 3, .raw_logs = true};
+    assert(!open_raw_logs(&config));
     char *summary_path; assert(asprintf(&summary_path, "%s/summary.tsv", argv[1]) >= 0);
     FILE *summary = fopen(summary_path, "wx"); free(summary_path); assert(summary);
     fputs(summary_header, summary); uint64_t now = monotonic_ns();
     assert(!snapshot(&config, summary, &old, 0, now, now, now)); fclose(summary);
     assert(!run_metadata(&config, 1, now, monotonic_ns(), 0, 0, 0));
+    assert(!fclose(config.raw_summary)); free(config.raw_out);
     /* exec wrapper regression: an old-mm pagemap returns EOF. Reopen and
      * retry once, invalidating the old baseline rather than declaring cold.
      */
@@ -217,7 +219,7 @@ class SamplerTests(unittest.TestCase):
         result = subprocess.run([str(binary), str(self.path)], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS: production sampler", result.stdout)
-        with (self.path / "summary.tsv").open() as stream:
+        with (self.path / "raw/summary.tsv").open() as stream:
             row = next(csv.DictReader(stream, delimiter="\t"))
         trace = self.path / "stores.log"
         trace.write_text(f"store_sample: start_ns={row['ready_ns']} pfn=66 swap_type=0 offset=17 submit_ret=0\n")

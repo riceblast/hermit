@@ -42,7 +42,7 @@ make -C remoteswap/client KDIR="$PWD/linux-5.14-rc5" -j12
 modinfo -F version remoteswap/client/rswap-client.ko
 ```
 
-产物是 `remoteswap/client/rswap-client.ko`，当前版本应为 `1.13`，默认是 RDMA 后端。若此前编译过 `BACKEND=DRAM`，先用相同 `KDIR` 执行 `make -C remoteswap/client KDIR="$PWD/linux-5.14-rc5" clean`，再构建。构建完成后执行第 1 节连接。
+产物是 `remoteswap/client/rswap-client.ko`，当前版本应为 `1.14`，默认是 RDMA 后端。若此前编译过 `BACKEND=DRAM`，先用相同 `KDIR` 执行 `make -C remoteswap/client KDIR="$PWD/linux-5.14-rc5" clean`，再构建。构建完成后执行第 1 节连接。
 
 **client A：连接成功后启用 swap。** 双节点沿用已初始化的 64 GiB swap 文件：
 
@@ -256,7 +256,7 @@ bash remoteswap/client/manage_rswap_client.sh monitor 2
 sudo watch -n 1 cat /sys/kernel/debug/rswap/placement
 ```
 
-重点看 `state=adaptive`、实际阈值 `threshold_ppm`、快照代次 `generation` 和年龄 `age_ns`。`mean_ppm` 是原始均值，不能代替 capacity-mean 的实际阈值；ppm 除以 1000000 得到热度比例。
+重点看 `state=adaptive`、实际阈值 `threshold`、快照代次 `generation` 和年龄 `age_ns`。`mean` 是原始均值的显示值，不能代替 capacity-mean 的实际阈值；热度显示为 0～1、两位小数，未知显示 `-`。计算及上传保留原精度，精确值可用 `placement --raw` 或 debugfs `placement_raw` 查看。
 
 当前规则：已知正热度 `heat_ppm >= threshold_ppm` 首选 DRAM，较低的正热度首选 PMem；已知零热度走 Interleave，未知页首选 DRAM。
 
@@ -294,7 +294,9 @@ echo 1 | sudo tee "$TRACE/tracing_on"
 sudo watch -n 1 'tail -n 10 /sys/kernel/debug/tracing/instances/rswap_demo/trace'
 ```
 
-查看 `pfn/offset`（页面／swap offset）、`reason`（分类）、`heat_ppm/threshold_ppm`（该次热度／实际阈值）、`preferred_server/preferred_tier`（首选位置）、`server/tier/slot`（实际位置）、`fallback`（容量回退）和 `alloc_ret`（0 表示分配成功）。Tier 0=DRAM、1=PMem；首选位置可能因容量不足而改变，分配成功不等于 RDMA 写完成。普通 Interleave 也会产生这些事件。
+新 `decision` 只显示 Store 成功分配后的六项：`req_type`、十六进制 `pfn`、`placement_policy`、`reason`、`server`、`target_mem`，每项后带逗号。Interleave／Warmup 分别标记 `interleave`／`interleave(warmup)`；Adaptive 的 hot/cold 按实际 DRAM／PMem 目标标记，包含未知页和容量回退，不是原始热度分类。分配成功不等于 RDMA 写完成，Load 不输出 decision。
+
+如需原来的热度、阈值、offset、alloc_seq、RR 和 fallback 等精确证据，独立开启 `events/rswap/decision_raw/enable`。详细格式及采样器 `--raw-logs` 选项见 [输出说明](../tests/compact-output.md)。
 
 Ctrl-C 只退出查看，采集仍继续。观察结束后关闭并删除本 instance：
 
