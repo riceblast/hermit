@@ -44,10 +44,10 @@ modinfo -F version remoteswap/client/rswap-client.ko
 
 产物是 `remoteswap/client/rswap-client.ko`，当前版本应为 `1.13`，默认是 RDMA 后端。若此前编译过 `BACKEND=DRAM`，先用相同 `KDIR` 执行 `make -C remoteswap/client KDIR="$PWD/linux-5.14-rc5" clean`，再构建。构建完成后执行第 1 节连接。
 
-**client A：连接成功后启用 swap。** 双节点沿用已初始化的 80 GiB swap 文件：
+**client A：连接成功后启用 swap。** 双节点沿用已初始化的 64 GiB swap 文件：
 
 ```bash
-sudo swapon /mnt/sdb4/yxr/projects/swapfile/swap_80g.img
+sudo swapon /mnt/sdb4/yxr/swapfile/swap_64g.img
 swapon --show
 ```
 
@@ -58,7 +58,7 @@ swapon --show
 **client A：负载结束后关闭并卸载。** 两台 Server 始终保持在线：
 
 ```bash
-sudo swapoff /mnt/sdb4/yxr/projects/swapfile/swap_80g.img
+sudo swapoff /mnt/sdb4/yxr/swapfile/swap_64g.img
 cat /proc/swaps
 bash remoteswap/client/manage_rswap_client.sh mapping
 ```
@@ -135,6 +135,52 @@ echo "BFS exit=$?"
 ```
 
 包装器只将 BFS 及其线程放入受限组，监控工具留在组外。使用 40 线程、对称图、1 次计时轮次，保留程序自带预热；命令返回后检查退出码为 0 且有 `Running time` 输出。这里不启动冷热采样器，普通 BFS 即可验证内存池使用。
+
+### client A：32GB 图、4GiB 本地限制，180 秒后自动切换 Adaptive
+
+本段替代上面的 24GiB cgroup 创建和普通 BFS 启动命令。先完成双节点连接、启用第 2 节的 64GiB swap，并沿用上面的 4KiB 测试环境设置。配置为 **128 轮、40 线程、capacity-mean、20 秒采样间隔、4 轮窗口**。
+
+创建本轮专用 cgroup；cgroup 和输出目录均须使用新名称，重复运行时更换后缀：
+
+```bash
+cd /mnt/sdb3/data/yxr/projects/hermit
+make -C remoteswap/tools
+export BFS_CGROUP=/sys/fs/cgroup/memory/hermit-bfs32-4g-auto180-01
+export BFS_OUT=/tmp/hermit-bfs32-4g-auto180-01
+sudo mkdir "$BFS_CGROUP"
+echo -1 | sudo tee "$BFS_CGROUP/memory.memsw.limit_in_bytes"
+echo 4294967296 | sudo tee "$BFS_CGROUP/memory.limit_in_bytes"
+echo 100 | sudo tee "$BFS_CGROUP/memory.swappiness"
+```
+
+先启动下述 B/C/D 监控，再运行原始 Ligra BFS：
+
+```bash
+sudo env OMP_NUM_THREADS=40 remoteswap/tools/rswap_hotness \
+  --out "$BFS_OUT" \
+  --placement --interval 20 --window 4 --warmup 180 \
+  --threshold-policy capacity-mean --memory-cgroup "$BFS_CGROUP" \
+  --reserve-gib 1 -- \
+  bash -ec 'echo "$$" > "$1/cgroup.procs"; exec "$2" -s -rounds 128 "$3"' \
+  bfs "$BFS_CGROUP" \
+  /mnt/sdb2/yxr/K_R_benchmarks/ligra/apps/BFS \
+  /mnt/sdb2/yxr/K_R_benchmarks/ligra/inputs/generated/rMat_sym_32G.adj \
+  2>&1 | tee "$BFS_OUT.console.log"
+echo "sampler exit=${PIPESTATUS[0]}"
+sudo cat "$BFS_OUT/run.tsv"
+```
+
+`--placement` 启用策略，省略 `--manual` 后按 `--warmup 180` 自动切换：从**策略启动时刻**开始计时，前 180 秒用 Interleave 并持续采样，满 180 秒后的新换出使用 Adaptive。计时包含读图、初始化和首次预热，不固定在某一轮切换。使用上面的原始 BFS，无需第 64 轮暂停或手动写入 `adaptive`。
+
+本地物理内存上限为 4GiB；`--reserve-gib 1` 仅让 capacity-mean 按 3GiB 有效本地容量估计阈值，不改变 cgroup 上限。BFS 自带一次不计入轮数的预热，之后输出 128 条 `Running time`。
+
+运行期间在 D 查看 `placement`：切换后应为 `state=adaptive`、`mode=auto`、`warmup_ns=180000000000`；B/C 查看容量和各节点／Tier 带宽。结束后 `run.tsv` 的 `exit_status`、`monitor_error`、`stop_signal` 均应为 0；`placement.tsv` 保留阈值记录，`$BFS_OUT.console.log` 保留逐轮输出。跨越切换点的遍历单独归类，带宽的跨状态采样窗口也单列。
+
+结束后按第 2 节关闭 swap、卸载 Client，再删除空 cgroup：
+
+```bash
+sudo rmdir "$BFS_CGROUP"
+```
 
 ### client B：持续查看每节点／Tier 的容量和剩余容量
 
