@@ -117,6 +117,62 @@ static const struct file_operations rswap_mapping_fops = {
 	.release = single_release,
 };
 
+/* Validated MR descriptors are immutable for the Session lifetime. The open
+ * file pins the module; stats_exit removes this interface before Session
+ * storage is released. These are Server virtual addresses, not local pointers.
+ */
+static int rswap_address_map_show(struct seq_file *m, void *unused)
+{
+	static const char * const tier_names[] = { "DRAM", "PMem" };
+	unsigned int tier, id, i;
+
+	seq_printf(m, "version=1 instance_ns=%llu nr_servers=%u address_space=remote_virtual range_format=[start,end)\n",
+		(unsigned long long)stats_instance_ns, stats_nr_servers);
+	for (tier = 0; tier < RSWAP_NR_TIERS; tier++) {
+		seq_printf(m, "\n%s\n", tier_names[tier]);
+		for (id = 0; id < stats_nr_servers; id++) {
+			const struct rdma_session_context *session = &rdma_sessions[id];
+			const struct chunk_list *pool = &session->remote_mem_pool;
+			unsigned int first = tier == RSWAP_TIER_DRAM ? 0 : pool->dram_chunks;
+			unsigned int count = tier == RSWAP_TIER_DRAM ?
+				pool->dram_chunks : pool->pmem_chunks;
+
+			seq_printf(m, "  memory pool %u: server=%u endpoint=%pI4:%u chunks=%u capacity_gib=%llu\n",
+				id, session->server_id, session->addr,
+				(unsigned int)ntohs(session->port), count,
+				(unsigned long long)count * REGION_SIZE_GB);
+			for (i = first; i < first + count; i++) {
+				const struct remote_chunk *chunk = &pool->chunks[i];
+
+				if (chunk->chunk_state != MAPPED)
+					continue;
+				/* Discovery checked the complete range for overflow. */
+				seq_printf(m, "    chunk=%u start=0x%016llx end=0x%016llx size=%llu GiB bytes=%llu\n",
+					i, (unsigned long long)chunk->remote_addr,
+					(unsigned long long)(chunk->remote_addr + chunk->mapped_size),
+					(unsigned long long)(chunk->mapped_size >> GB_SHIFT),
+					(unsigned long long)chunk->mapped_size);
+			}
+		}
+	}
+	return 0;
+}
+
+static int rswap_address_map_open(struct inode *inode, struct file *file)
+{
+	if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
+		return -ENODEV;
+	return single_open(file, rswap_address_map_show, NULL);
+}
+
+static const struct file_operations rswap_address_map_fops = {
+	.owner = THIS_MODULE,
+	.open = rswap_address_map_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 int rswap_stats_init(unsigned int nr_servers)
 {
 	struct dentry *file;
@@ -152,6 +208,12 @@ int rswap_stats_init(unsigned int nr_servers)
 		return ret;
 	}
 	file = debugfs_create_file("mapping", 0444, stats_root, NULL, &rswap_mapping_fops);
+	if (IS_ERR_OR_NULL(file)) {
+		ret = file ? PTR_ERR(file) : -ENOMEM;
+		rswap_stats_exit();
+		return ret;
+	}
+	file = debugfs_create_file("address_map", 0400, stats_root, NULL, &rswap_address_map_fops);
 	if (IS_ERR_OR_NULL(file)) {
 		ret = file ? PTR_ERR(file) : -ENOMEM;
 		rswap_stats_exit();

@@ -80,6 +80,7 @@ bash remoteswap/client/manage_rswap_client.sh status
 bash remoteswap/client/manage_rswap_client.sh status
 bash remoteswap/client/manage_rswap_client.sh pool-status
 bash remoteswap/client/manage_rswap_client.sh mapping
+bash remoteswap/client/manage_rswap_client.sh address-map
 ```
 
 | 命令 | 功能／重点字段 |
@@ -87,8 +88,36 @@ bash remoteswap/client/manage_rswap_client.sh mapping
 | `status` | 实际节点数量、总池容量、各节点 IP／端口 |
 | `pool-status` | JSON 格式；`server_count`、总 `capacity_bytes`；`topology` 中每节点容量及 `dram_fraction`／`pmem_fraction`；`pools` 中每节点／Tier 的容量与占用 |
 | `mapping` | 简明表格，分别列出 `0/1 × dram/pmem` 的 Slot 总数、占用和空闲 |
+| `address-map` | 按 DRAM／PMem、memory pool（Server 编号）列出远端 MR 地址范围、Chunk 编号及容量 |
 
 本文双节点配置应显示每台 48 GiB，其中 DRAM 16 GiB、PMem 32 GiB，总池 96 GiB。单节点则只有 server 0 的两个 Tier。
+
+### 查看各介质的远端地址空间
+
+Client 连接成功后即可读取，不要求先启用 swap。脚本与直接读取 debugfs 等价：
+
+```bash
+bash remoteswap/client/manage_rswap_client.sh address-map
+sudo cat /sys/kernel/debug/rswap/address_map
+```
+
+输出先列 DRAM，再列 PMem；每种介质下依 endpoint 顺序列 `memory pool 0/1`，
+包含实际 Server IP／端口、该 Tier 的 Chunk 数和 GiB 容量，每个 MR 单独一行。
+`chunk` 沿用 Server 原始描述符编号：DRAM 从 0 开始，PMem 接在 DRAM 后面。
+`start`／`end` 为十六进制的 **Server 进程虚拟地址**，范围是左闭右开 `[start,end)`；
+`bytes` 是精确长度，当前每个 MR 为 8 GiB（8589934592 字节）。
+这些地址不代表 Server 物理地址或 Client 本地地址；不同 Server 可以出现相同范围。
+地址列表保留独立 MR 边界，不假定不同 MR 或不同介质的地址连续。
+
+接口只读、权限为 root 读取，展示当前 Session 发现的整个已注册池，不显示逐页
+swap offset 映射或空闲区间。Slot 占用使用原 `mapping` 命令查看。
+换页和策略切换期间 MR 范围保持不变，重启 Server／重新连接后地址可能变化。
+
+核心验收只需一次双节点连接（不启用 swap）：检查两个介质下均有 pool 0/1，
+对照各 Server 的 `MR registered` 日志核对 Chunk 编号、起点和长度。
+在本文每台 16/32 GiB 配置下，每个 Server 应分别输出 2 个 DRAM MR 和 4 个 PMem MR，
+每行 `end-start=bytes=8589934592`，两台共 12 行 MR。
+重复读取结果应一致，脚本输出与直接 cat 一致；正常卸载 Client 后接口应消失。
 
 **server02 B、node04 B**：查询各自物理 NUMA 拓扑：
 

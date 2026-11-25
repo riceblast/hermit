@@ -36,6 +36,13 @@ bandwidth. The optional `rswap:placement` event is disabled by default; see the
 Use the updated Python tools; old stats v1 snapshots are not supported.
 Current configuration expects two 48-GiB Servers (96 GiB total).
 
+After connecting, `bash client/manage_rswap_client.sh address-map` (from this
+directory), or `sudo cat /sys/kernel/debug/rswap/address_map`, lists the registered
+remote virtual address ranges grouped by DRAM/PMem and Server. Each MR retains its
+original Chunk number and reports its `[start,end)` range and byte length. This
+read-only view is available before swapon; see the [pool guide](operation_doc/create_pool.md)
+for interpretation and a minimal connection-only check.
+
 The independent `tools/rswap_hotness` sampler observes a PID or launches a command,
 tracks activity over a configurable window, and exports per-page heat and means.
 The disabled-by-default `rswap:store_sample` event and offline checker correlate

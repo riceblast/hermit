@@ -81,6 +81,9 @@ case "${1:-}" in
     mapping)
         run_as_root cat /sys/kernel/debug/rswap/mapping
         ;;
+    address-map)
+        run_as_root cat /sys/kernel/debug/rswap/address_map
+        ;;
     placement)
         run_as_root cat /sys/kernel/debug/rswap/placement
         ;;
@@ -119,7 +122,7 @@ case "${1:-}" in
         cat /proc/swaps
         ;;
     *)
-        echo "Usage: $0 {install|uninstall|status|stats|mapping|placement|adaptive|placement-stop|monitor [seconds]|pool-status|pool-monitor [--interval SEC --out DIR]|pool-report --samples FILE [--settled --heat-dir DIR]|trace-check FILE LAYOUT [options]}" >&2
+        echo "Usage: $0 {install|uninstall|status|stats|mapping|address-map|placement|adaptive|placement-stop|monitor [seconds]|pool-status|pool-monitor [--interval SEC --out DIR]|pool-report --samples FILE [--settled --heat-dir DIR]|trace-check FILE LAYOUT [options]}" >&2
         echo "Edit ${config_file} before install; environment overrides are not used." >&2
         exit 2
         ;;
