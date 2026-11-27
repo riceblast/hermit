@@ -5,7 +5,7 @@ CFLAGS += -std=gnu11 -Wall -Wextra -Werror
 .PHONY: all clean
 all: rswap_hotness
 
-rswap_hotness: rswap_hotness.c rswap_hotness.h rswap_threshold.h ../rswap_placement_uapi.h
+rswap_hotness: rswap_hotness.c rswap_hotness.h ../rswap_vpn_heat_uapi.h
 	$(CC) $(CFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
 clean:

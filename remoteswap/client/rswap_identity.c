@@ -142,6 +142,26 @@ out:
 	return ret;
 }
 
+/* Compare pointers only under RCU: the context pins mm_count, and pid_task is
+ * RCU-protected. No mm_users pin, sleeping operation, or task pointer escapes.
+ * An exec changes mm even if PID/start time and executable path stay equal.
+ */
+bool rswap_identity_binding_valid(u64 binding_id)
+{
+	struct rswap_identity_context *c;
+	struct task_struct *task;
+	bool valid = false;
+
+	rcu_read_lock();
+	c = rcu_dereference(identity_target);
+	if (c && c->id == binding_id && READ_ONCE(identity_active)) {
+		task = pid_task(c->task_pid, PIDTYPE_PID);
+		valid = task && READ_ONCE(task->mm) == c->mm;
+	}
+	rcu_read_unlock();
+	return valid;
+}
+
 /* identity_mutex held. Stop publishing first; free only after every probe and
  * lookup has copied its result. No mmap_lock is held during the RCU wait.
  */
@@ -332,7 +352,7 @@ static ssize_t rswap_identity_read(struct file *file, char __user *buf,
 {
 	struct rswap_identity_context *c = file->private_data;
 	struct rswap_identity_result result;
-	char text[256];
+	char text[512];
 	int bytes, found = 0;
 	bool attached;
 
@@ -341,8 +361,8 @@ static ssize_t rswap_identity_read(struct file *file, char __user *buf,
 	if (attached && c->queried)
 		found = !rswap_identity_lookup(c->type, c->query_offset, &result);
 	bytes = scnprintf(text, sizeof(text),
-		"version=1 binding_id=%llu pid=%u attached=%u queried=%u found=%u type=%u offset=%llu vpn=%llu va=0x%llx aliases=%llu\n",
-		c->id, c->pid, attached, c->queried, found, c->type,
+		"version=1 binding_id=%llu pid=%u attached=%u mm_current=%u queried=%u found=%u type=%u offset=%llu vpn=%llu va=0x%llx aliases=%llu\n",
+		c->id, c->pid, attached, attached && rswap_identity_binding_valid(c->id), c->queried, found, c->type,
 		c->query_offset, found ? result.vpn : 0,
 		found ? result.vpn << PAGE_SHIFT : 0, found ? result.aliases : 0);
 	mutex_unlock(&identity_mutex);

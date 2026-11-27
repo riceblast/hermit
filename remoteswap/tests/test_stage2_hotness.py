@@ -1,0 +1,218 @@
+"""Exercise the current VPN sampler with pagemap, kpageflags and idle fixtures."""
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+from rswap_hotness_check import read_vpn_summary
+from rswap_analysis import hotness_summary, publications
+
+HARNESS = r'''
+#define main sampler_program_main
+#include "rswap_hotness.c"
+#undef main
+#include <assert.h>
+static FILE *maps, *pm, *flags, *idle;
+static void word(FILE *f, uint64_t index, uint64_t value) {
+    assert(!exact_io(fileno(f), &value, 8, index*8, true));
+}
+static void map_text(const char *s) {
+    assert(!ftruncate(fileno(maps),0)); rewind(maps); fputs(s,maps); fflush(maps);
+}
+static void setup(void) {
+    maps=tmpfile(); pm=tmpfile(); flags=tmpfile(); idle=tmpfile();
+    assert(maps && pm && flags && idle);
+    assert(!ftruncate(fileno(pm),4096*8)); assert(!ftruncate(fileno(flags),4096*8));
+    assert(!ftruncate(fileno(idle),4096));
+    map_text("00001000-00008000 rw-p 00000000 00:00 0 [heap]\n"
+             "00008000-00009000 rw-s 00000000 00:00 0 /dev/shm/shared\n");
+    word(pm,1,PM_PRESENT|65); word(pm,2,PM_PRESENT|65); word(pm,3,PM_SWAPPED|(99<<5)|2);
+    word(pm,5,PM_PRESENT|67); word(pm,6,PM_PRESENT|PM_FILE|68); word(pm,7,PM_PRESENT|69);
+    word(pm,8,PM_PRESENT|65);
+    uint64_t anon=FLAG(5)|FLAG(12)|FLAG(14);
+    word(flags,65,anon); word(flags,66,anon); word(flags,67,anon|FLAG(22));
+    word(flags,68,FLAG(5)); word(flags,69,FLAG(5)|FLAG(14));
+}
+static void teardown(void) { fclose(maps); fclose(pm); fclose(flags); fclose(idle); }
+static void round_next(struct page_list *old, unsigned round, unsigned group) {
+    /* Fixture page_idle regular-file writes do not emulate OR semantics. Write
+     * a clean observed bitmap explicitly to emulate accesses to every frame. */
+    word(idle,1,0);
+    struct page_list next={0};
+    assert(!collect_round(maps,fileno(pm),fileno(flags),fileno(idle),old,&next));
+    free(old->v); *old=next;
+    if(round) finish_round(old,group,round%group==0);
+}
+static void history_case(void) {
+    setup(); struct page_list p={0}; struct totals t;
+    round_next(&p,0,4);
+    assert(p.n==3 && p.v[0].heat==0 && p.v[0].sample==0);
+    assert(!count_pages(&p,&t) && t.pages==3 && t.sum==0);
+    for(unsigned i=1;i<=4;i++) round_next(&p,i,4);
+    uint64_t hot=heat_update(0,4,4);
+    assert(p.v[0].heat==hot && p.v[1].heat==hot && p.v[2].heat==0);
+    assert(!count_pages(&p,&t) && t.pages==3 && t.bins[1]==2 && t.bins[0]==1);
+    /* MADV_DONTNEED at VPN1; VPN2 swaps out. Both keep and decay history. */
+    word(pm,1,0); word(pm,2,PM_SWAPPED|(123<<5)|2);
+    for(unsigned i=1;i<=4;i++) round_next(&p,i,4);
+    uint64_t decayed=heat_update(hot,0,4);
+    assert(p.n==3 && !p.v[0].flags && p.v[0].heat==decayed && p.v[1].heat==decayed);
+    assert(!count_pages(&p,&t) && t.pages==2 && t.sum==decayed);
+    /* Return at a different PFN and with different VMA metadata. No reset. */
+    map_text("00001000-00008000 rw-p 00002000 00:00 0 [different]\n");
+    word(pm,1,PM_PRESENT|66);
+    for(unsigned i=1;i<=4;i++) round_next(&p,i,4);
+    assert(p.v[0].heat==heat_update(decayed,3,4));
+    assert(!count_pages(&p,&t) && t.pages==3);
+    /* munmap all old addresses, while another empty VMA remains. */
+    map_text("00010000-00011000 rw-p 00000000 00:00 0\n");
+    uint64_t before=p.v[0].heat;
+    for(unsigned i=1;i<=4;i++) round_next(&p,i,4);
+    assert(p.n==3 && p.v[0].heat==heat_update(before,0,4));
+    assert(!count_pages(&p,&t) && t.pages==0 && t.sum==0);
+    /* Same-address remap resumes the decayed VPN, first sample zero. */
+    map_text("00001000-00002000 rw-p 00000000 00:00 0\n");
+    before=p.v[0].heat; round_next(&p,1,4);
+    assert(p.n==3 && p.v[0].heat==before && p.v[0].sample==0);
+    assert(!count_pages(&p,&t) && t.pages==1);
+    free(p.v); teardown();
+}
+static void race_case(void) {
+    setup(); struct page_list p={0}; round_next(&p,0,4);
+    p.v[0].sample=1; word(pm,1,0);
+    p.v[1].sample=1; word(pm,2,PM_PRESENT|66);
+    word(pm,3,0);
+    assert(!verify_pages(&p,fileno(pm),fileno(flags)));
+    assert(!p.v[0].flags && !p.v[0].sample);
+    assert((p.v[1].flags&IN_SCOPE) && p.v[1].pfn==66 && !p.v[1].sample);
+    assert(!p.v[2].flags);
+    /* No write based on the stale PFN ref after verify changed the frame. */
+    struct pfn_ref ref={65,1}; word(idle,1,0);
+    assert(!arm_pages(&p,&ref,1,fileno(idle)));
+    uint64_t value; assert(!exact_io(fileno(idle),&value,8,8,false) && !value);
+    free(p.v); teardown();
+}
+static void denominator_case(void) {
+    setup(); struct page_list p={0}; round_next(&p,0,4);
+    round_next(&p,1,4); round_next(&p,2,4);
+    word(pm,4,PM_PRESENT|66); round_next(&p,3,4); round_next(&p,4,4);
+    assert(p.n==4 && p.v[3].vpn==4 && p.v[3].heat==heat_update(0,1,4));
+    free(p.v); teardown();
+}
+static void output_case(const char *dir) {
+    char path[PATH_MAX]; snprintf(path,sizeof(path),"%s/summary.tsv",dir);
+    FILE *f=fopen(path,"wx"); assert(f); fputs(summary_header,f);
+    struct hot_page v[6]={0}; struct page_list p={.v=v,.n=6}; struct totals t;
+    for(int i=0;i<6;i++) v[i].flags=IN_SCOPE;
+    assert(!count_pages(&p,&t)); assert(!snapshot(f,42,0,0,&t));
+    for(int i=0;i<6;i++) v[i].heat=((uint64_t)i*RSWAP_VPN_HEAT_SCALE+2)/5;
+    assert(!count_pages(&p,&t));
+    assert(t.bins[0]==1 && t.bins[1]==1 && t.bins[2]==1 && t.bins[3]==1 && t.bins[4]==2);
+    assert(!snapshot(f,42,1,84012345678ULL,&t));
+    memset(&t,0,sizeof(t)); assert(!snapshot(f,42,2,168000000000ULL,&t)); fclose(f);
+}
+static void math_case(void) {
+    uint64_t h=0; h=heat_update(h,4,4);
+    assert(h==858993459ULL && heat_bin(h)==1 && heat_bin(h-1)==0);
+    h=heat_update(h,4,4); assert(h==1546188226ULL);
+    assert(heat_update(RSWAP_VPN_HEAT_SCALE,64,64)==RSWAP_VPN_HEAT_SCALE);
+    assert(heat_bin(RSWAP_VPN_HEAT_SCALE)==4);
+    uint64_t x=heat_update(0,1,64); assert(x>0 && heat_bin(x)==0);
+}
+static void launch_case(void) {
+    char *good[]={"/bin/sh","-c","exit 7",NULL}; pid_t pid=launch(good); assert(pid>0);
+    int status; assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==7);
+    char *bad[]={"/hermit/nonexistent",NULL}; assert(launch(bad)<0 && errno==ENOENT);
+}
+int main(int argc,char **argv) {
+    assert(argc>=2);
+    switch(atoi(argv[1])) {
+    case 0: history_case(); break; case 1: race_case(); break;
+    case 2: denominator_case(); break; case 3: assert(argc==3); output_case(argv[2]); break;
+    case 4: math_case(); break; case 5: launch_case(); break; default: abort();
+    }
+    return 0;
+}
+'''
+
+
+class HotnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix='hermit-stage2-')
+        cls.path = Path(cls.tmp.name)
+        source = cls.path / 'sampler.c'
+        source.write_text(HARNESS)
+        cls.binary = cls.path / 'sampler'
+        cls.tool = cls.path / 'tool'
+        for c, binary, extra in ((source, cls.binary, ['-fsanitize=undefined']),
+                                 (ROOT / 'tools/rswap_hotness.c', cls.tool, [])):
+            subprocess.run(['gcc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
+                            '-I', str(ROOT / 'tools'), str(c), *extra, '-o', str(binary)], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def run_case(self, case, *args):
+        subprocess.run([str(self.binary), str(case), *map(str, args)], check=True, timeout=15)
+
+    def test_vpn_alias_swap_dontneed_unmap_remap_history(self):
+        self.run_case(0)
+
+    def test_scan_race_discards_access_and_stale_baseline(self):
+        self.run_case(1)
+
+    def test_new_page_uses_whole_group_denominator(self):
+        self.run_case(2)
+
+    def test_single_summary_boundaries_actual_elapsed_and_zero_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_case(3, tmp)
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ['summary.tsv'])
+            rows = read_vpn_summary(Path(tmp) / 'summary.tsv')
+            self.assertEqual(rows[1]['EWMA_window'], '1(84.012s)')
+            self.assertEqual(rows[1]['mean_hotness'], '0.50')
+            self.assertEqual(rows[1]['dist[0.8 - 1.0]'], '2(33.3%)')
+            self.assertEqual(rows[2]['pages'], '0')
+            self.assertEqual(hotness_summary(tmp)['completed_ewma_windows'], 2)
+            with self.assertRaisesRegex(ValueError, 'VPN observation'):
+                publications(tmp)
+            result = subprocess.run([sys.executable, str(ROOT/'tools/rswap_hotness_check.py'),
+                                     str(Path(tmp)/'summary.tsv')], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ewma_fixed_precision_and_bin_boundaries(self):
+        self.run_case(4)
+
+    def test_launcher_waits_for_exec_and_propagates_exec_failure(self):
+        self.run_case(5)
+
+    def test_cli_defaults_and_invalid_legacy_policy_options(self):
+        result = subprocess.run([str(self.tool), '--help'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('wait 5 seconds AFTER', result.stdout)
+        for args in (('--ewma-window', '0'), ('--window', '65'), ('--a-bit-window', 'nan'),
+                     ('--interval', '0'), ('--placement',), ('--pages',), ('--pid', '0'),
+                     ('--pid','1','--out','/tmp/unused','--','/bin/true')):
+            with self.subTest(args=args):
+                self.assertEqual(subprocess.run([str(self.tool), *args], capture_output=True).returncode, 2)
+
+    def test_summary_checker_rejects_bad_population_and_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_case(3, tmp)
+            p = Path(tmp)/'summary.tsv'
+            original = p.read_text()
+            for text in (original.replace('2(33.3%)', '3(33.3%)'),
+                         original.replace('1(84.012s)', '3(84.012s)'),
+                         original.replace('2(168.000s)', '2(1.000s)')):
+                p.write_text(text)
+                with self.assertRaises(ValueError):
+                    read_vpn_summary(p)
+
+
+if __name__ == '__main__':
+    unittest.main()

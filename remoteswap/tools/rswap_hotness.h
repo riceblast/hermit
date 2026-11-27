@@ -1,41 +1,22 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef RSWAP_HOTNESS_H
 #define RSWAP_HOTNESS_H
-
 #include <stdint.h>
+#include "../rswap_vpn_heat_uapi.h"
 
-/* One bit per sampling round, including rounds that cannot be observed.
- * The CLI bounds the window to 1..64. No per-page timer or TTL is needed.
- */
-struct heat_window {
-	uint64_t active;
-	uint64_t valid;
-};
-
-static inline void heat_push(struct heat_window *h, int sample, unsigned int n)
+/* Q32, round to nearest after each nonoverlapping group. No kernel FP. */
+static inline uint64_t heat_update(uint64_t old, unsigned int hits, unsigned int rounds)
 {
-	uint64_t mask = n == 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1;
-
-	h->active = ((h->active << 1) | (sample == 1)) & mask;
-	h->valid = ((h->valid << 1) | (sample >= 0)) & mask;
+	uint64_t denominator = 5ULL * rounds;
+	return (4ULL * old * rounds + (uint64_t)hits * RSWAP_VPN_HEAT_SCALE +
+		denominator / 2) / denominator;
 }
 
-static inline unsigned int heat_valid(const struct heat_window *h)
+static inline unsigned int heat_bin(uint64_t heat)
 {
-	return __builtin_popcountll(h->valid);
+	/* Compare to the nearest Q32 representation of each exact fifth.
+	 * In particular H=0.2 after an all-active first group belongs to bin 1. */
+	unsigned int bin = (heat * 5 + 2) / RSWAP_VPN_HEAT_SCALE;
+	return bin > 4 ? 4 : bin;
 }
-
-static inline unsigned int heat_active(const struct heat_window *h)
-{
-	return __builtin_popcountll(h->active);
-}
-
-/* -1 is unknown; zero is an observed cold page. Fixed point, parts per million. */
-static inline int heat_ppm(const struct heat_window *h)
-{
-	unsigned int n = heat_valid(h);
-
-	return n ? (int)(heat_active(h) * UINT64_C(1000000) / n) : -1;
-}
-
 #endif

@@ -35,6 +35,7 @@ static struct pid *find_get_pid(int nr) {
 static struct task_struct *get_pid_task(struct pid *p,int type) {
     if(!p || !p->task) return NULL; p->task->refs++; return p->task;
 }
+static struct task_struct *pid_task(struct pid *p,int type) { return p ? p->task : NULL; }
 static void put_pid(struct pid *p) { if(p) { assert(p->refs>0); p->refs--; } }
 static void put_task_struct(struct task_struct *p) { assert(p->refs>0); p->refs--; }
 static struct mm_struct *get_task_mm(struct task_struct *t) {

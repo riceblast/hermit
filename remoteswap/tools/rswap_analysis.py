@@ -5,7 +5,12 @@ import csv
 import math
 from pathlib import Path
 
-from rswap_hotness_check import read_pages, read_summary, raw_log_directory
+from rswap_hotness_check import read_pages, read_summary, raw_log_directory, read_vpn_summary, VPN_HEADER
+
+
+def vpn_format(directory):
+    with (Path(directory) / 'summary.tsv').open() as stream:
+        return stream.readline().rstrip('\n').split('\t') == VPN_HEADER
 
 
 def tsv(path):
@@ -17,6 +22,8 @@ def tsv(path):
 
 
 def publications(directory):
+    if vpn_format(directory):
+        raise ValueError('VPN observation summary has no PFN placement publications; use summary-only analysis')
     directory = raw_log_directory(directory)
     runs = tsv(directory / 'run.tsv')
     if len(runs) != 1:
@@ -80,6 +87,11 @@ def display_threshold(row):
 
 
 def hotness_summary(directory):
+    if vpn_format(directory):
+        rows = read_vpn_summary(Path(directory) / 'summary.tsv')
+        return dict(format='vpn-ewma-v1', snapshots=len(rows), completed_ewma_windows=len(rows)-1,
+                    pid=int(rows[-1]['pid']), last=rows[-1],
+                    note='VPN observation only; no Store placement or PFN-match validation.')
     run, summaries, pubs = publications(directory)
     return dict(rounds=len(summaries), publications=len(pubs), run_id=int(next(iter(pubs.values()))['run_id']),
                 phases=dict(Counter(r['phase'] for r in summaries)),

@@ -11,6 +11,7 @@
 #include "rswap_placement.h"
 #include "rswap_app.h"
 #include "rswap_identity.h"
+#include "rswap_vpn_heat.h"
 
 #define CREATE_TRACE_POINTS
 #include "rswap_trace.h"
@@ -551,6 +552,7 @@ static void rswap_invalidate_area(unsigned int type)
 	area_active = false;
 	spin_unlock_irqrestore(&area_lock, flags);
 	rswap_identity_area(false, type);
+	rswap_vpn_heat_area(false);
 	rswap_placement_area(false);
 	rswap_app_area(false);
 	/* No submitter can reserve a WR after the drain has passed its queue. */
@@ -566,6 +568,7 @@ static void rswap_frontswap_init(unsigned int type)
 	unsigned long flags;
 
 	rswap_identity_area(true, type);
+	rswap_vpn_heat_area(true);
 	rswap_placement_area(true);
 	rswap_app_area(true);
 	spin_lock_irqsave(&area_lock, flags);
@@ -691,6 +694,7 @@ void rswap_client_exit(void)
 
 	/* Remove the interface before any Session storage is released. */
 	rswap_stats_exit();
+	rswap_vpn_heat_area(false);
 	rswap_identity_exit();
 	rswap_placement_exit();
 	rswap_app_area(false);

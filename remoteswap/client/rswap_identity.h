@@ -21,5 +21,6 @@ void rswap_identity_area(bool active, unsigned int type);
 int rswap_identity_debugfs(struct dentry *root);
 int rswap_identity_lookup(unsigned int type, u64 offset,
 			  struct rswap_identity_result *result);
+bool rswap_identity_binding_valid(u64 binding_id);
 
 #endif

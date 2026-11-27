@@ -12,6 +12,7 @@ else
 	rswap-client-y += rswap_placement.o
 	rswap-client-y += rswap_app.o
 	rswap-client-y += rswap_identity.o
+	rswap-client-y += rswap_vpn_heat.o
 endif
 
 OFA_DIR ?= /usr/src/ofa_kernel/default

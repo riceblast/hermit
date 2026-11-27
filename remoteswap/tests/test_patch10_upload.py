@@ -34,7 +34,7 @@ static int bridge_close(int fd) {
 #define pread bridge_pread
 #define close bridge_close
 #define main sampler_unused_main
-#include "rswap_hotness.c"
+#include "../tests/fixtures/rswap_hotness_v1.c"
 #undef main
 #undef close
 #undef pread

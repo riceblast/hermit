@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Process observation plus target page_idle writes. Optional --placement
- * publishes snapshots to the Client; never configures swap or cgroups.
+/* VPN histories for one fixed mm. Observation only unless --publish is set.
+ * No swap/cgroup configuration or placement-policy changes are performed.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -19,82 +19,45 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-
 #include "rswap_hotness.h"
-#include "../rswap_placement_uapi.h"
-#include "rswap_threshold.h"
 
 #define PAGE_BYTES UINT64_C(4096)
 #define PM_PRESENT (UINT64_C(1) << 63)
 #define PM_SWAPPED (UINT64_C(1) << 62)
+#define PM_FILE (UINT64_C(1) << 61)
 #define PM_PFN ((UINT64_C(1) << 55) - 1)
 #define FLAG(n) (UINT64_C(1) << (n))
 #define IO_WORDS 512
+/* This repository's CONFIG_MIGRATION + CONFIG_MEMORY_FAILURE kernel reserves
+ * types 29..31 for migration/hwpoison; CONFIG_DEVICE_PRIVATE is disabled. */
+#define NORMAL_SWAP_TYPES 29
+#define RESIDENT 1
+#define IN_SCOPE 2
+#define ELIGIBLE 4
+#define ARMED 8
+#define WAS_ARMED 16
 
-enum page_state { RESIDENT, SWAPPED, CHANGED, SKIP };
-static const char *const state_names[] = {"resident", "swapped", "changed", "skip"};
-
+/* A missing/empty PTE leaves the record in the history with flags=0. */
 struct hot_page {
-	uint64_t va, pfn, tag, previous_pfn;
-	struct heat_window heat;
-	uint64_t swap;
-	unsigned char state, was_armed, armed, eligible, alias;
-	signed char sample;
+	uint64_t vpn, heat, pfn;
+	unsigned int hits;
+	unsigned char flags, sample;
 };
-
-struct page_list {
-	struct hot_page *v;
-	size_t n, capacity;
-};
-
+struct page_list { struct hot_page *v; size_t n, capacity; };
 struct pfn_ref { uint64_t pfn; size_t index; };
-struct config {
-	pid_t pid;
-	double interval, warmup;
-	unsigned int window;
-	const char *out;
-	bool pages, placement, manual, raw_logs;
-	int upload_fd;
-	const char *upload_path;
-	FILE *placement_log, *distribution_log;
-	char *raw_out;
-	FILE *raw_summary, *raw_placement_log, *raw_distribution_log;
-	struct rswap_threshold_config threshold_config;
-	struct rswap_threshold_metadata threshold, previous_threshold;
-	const char *memory_cgroup;
-	uint64_t local_bytes, reserve_bytes;
-};
-
+struct totals { uint64_t pages, sum, bins[5]; };
+struct publisher { int identity_fd, heat_fd; uint64_t binding; };
+struct config { pid_t pid; double interval; unsigned int window; const char *out; bool publish; };
 static volatile sig_atomic_t interrupted;
 static const char summary_header[] =
-	"version\tpid\tgeneration\tpages\tpresent\tswapped\tothers\tmean\tscan_ms\tpages_file\n";
-static const char raw_summary_header[] =
-	"version\tpid\tgeneration\tstart_ns\tbegin_ns\tend_ns\tready_ns\tphase\tpages\tpresent\tswapped\tactive\tidle\tinvalid\tknown\tmean\tscan_ms\toverrun\tpages_file\n";
-static const char placement_header[] =
-	"version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean\tupload_ms\tpolicy\tthreshold\tthreshold_source\tthreshold_generation\tthreshold_status\tpopulation_pages\tthreshold_sample_pages\tcandidate_pages\tlocal_pages\tmin_pages\tmin_coverage\n";
-static const char raw_placement_header[] =
-	"version\tsample_generation\trun_id\tstart_ns\tgeneration\tpublish_ns\trecords\tknown\tmean_ppm\tupload_ms\tpolicy\tthreshold_ppm\tthreshold_source\tthreshold_generation\tthreshold_status\tpopulation_pages\tthreshold_sample_pages\tcandidate_pages\tlocal_pages\tmin_pages\tmin_coverage_ppm\n";
-
-/* Display rounding only. Sampling histories, means and upload ABI stay exact. */
-static const char *heat_text(int ppm, char text[16])
-{
-	if (ppm < 0) snprintf(text, 16, "-");
-	else {
-		unsigned int value = ((unsigned int)ppm + 5000) / 10000;
-		snprintf(text, 16, "%u.%02u", value / 100, value % 100);
-	}
-	return text;
-}
+	"pid\tEWMA_window\tmean_hotness\tpages\tdist[0 - 0.2]\tdist[0.2 - 0.4]\t"
+	"dist[0.4 - 0.6]\tdist[0.6 - 0.8]\tdist[0.8 - 1.0]\n";
 
 static void on_signal(int sig) { interrupted = sig; }
-
 static uint64_t monotonic_ns(void)
 {
 	struct timespec t;
-	if (clock_gettime(CLOCK_MONOTONIC, &t)) {
-		perror("clock_gettime");
-		exit(1);
-	}
+	if (clock_gettime(CLOCK_MONOTONIC, &t)) { perror("clock_gettime"); exit(1); }
 	return (uint64_t)t.tv_sec * UINT64_C(1000000000) + t.tv_nsec;
 }
 
@@ -102,118 +65,79 @@ static int exact_io(int fd, void *buf, size_t size, uint64_t offset, bool write_
 {
 	size_t done = 0;
 	if (offset > INT64_MAX || size > (uint64_t)INT64_MAX - offset) {
-		errno = EOVERFLOW;
-		return -1;
+		errno = EOVERFLOW; return -1;
 	}
 	while (done < size) {
 		ssize_t n = write_it ? pwrite(fd, (char *)buf + done, size - done, offset + done) :
 			pread(fd, (char *)buf + done, size - done, offset + done);
-		if (n < 0 && errno == EINTR && !interrupted)
-			continue;
-		if (n <= 0) {
-			if (!n) errno = EIO;
-			return -1;
-		}
+		if (n < 0 && errno == EINTR && !interrupted) continue;
+		if (n <= 0) { if (!n) errno = EIO; return -1; }
 		done += n;
 	}
 	return 0;
 }
 
-static int append_page(struct page_list *list, const struct hot_page *page)
+static int append_page(struct page_list *list, struct hot_page page)
 {
 	if (list->n == list->capacity) {
 		size_t next = list->capacity ? list->capacity * 2 : 1024;
-		void *p;
-		if (next < list->capacity || next > SIZE_MAX / sizeof(*list->v)) {
-			errno = ENOMEM;
-			return -1;
-		}
-		p = realloc(list->v, next * sizeof(*list->v));
+		if (next < list->capacity || next > SIZE_MAX / sizeof(page)) { errno = ENOMEM; return -1; }
+		void *p = realloc(list->v, next * sizeof(page));
 		if (!p) return -1;
-		list->v = p;
-		list->capacity = next;
+		list->v = p; list->capacity = next;
 	}
-	list->v[list->n++] = *page;
+	list->v[list->n++] = page;
 	return 0;
 }
 
-static uint64_t map_tag(const char *line)
-{
-	uint64_t h = UINT64_C(14695981039346656037);
-	while (*line && *line != '\n') {
-		h ^= (unsigned char)*line++;
-		h *= UINT64_C(1099511628211);
-	}
-	return h;
-}
-
-/* Maps are ascending by VA. Histories survive PFN changes, but not detected
- * VMA descriptor changes or a nonpresent, nonswapped PTE. Same-address ABA
- * between scans cannot be detected and is an accepted association error.
+/* Private mappings only: resident COW pages must additionally have KPF_ANON.
+ * Ordinary swapped PTEs in private mappings are anonymous, including file COW.
+ * Empty PTEs, shmem, PFNMAP and huge/compound pages are outside the population.
  */
-static int scan_maps(FILE *maps, int pm, const struct page_list *old,
-		     struct page_list *next)
+static int scan_maps(FILE *maps, int pm, struct page_list *pages)
 {
 	char *line = NULL;
-	size_t length = 0, old_i = 0;
-	uint64_t entries[IO_WORDS];
-	bool present = false, visible_pfn = false;
+	size_t length = 0, vmas = 0;
+	uint64_t entries[IO_WORDS] = {0};
+	bool present = false, visible = false;
 	int ret = -1;
-
+	clearerr(maps);
+	if (fseek(maps, 0, SEEK_SET)) return -1;
 	while (getline(&line, &length, maps) >= 0) {
-		uint64_t begin, end, tag;
+		uint64_t begin, end;
 		char perms[5];
 		if (sscanf(line, "%" SCNx64 "-%" SCNx64 " %4s", &begin, &end, perms) != 3 ||
-		    begin >= end || begin % PAGE_BYTES || end % PAGE_BYTES) {
-			errno = EINVAL;
-			goto out;
-		}
-		if (perms[0] != 'r' || strstr(line, "[vsyscall]")) continue;
-		tag = map_tag(line);
+		    begin >= end || begin % PAGE_BYTES || end % PAGE_BYTES) { errno = EPROTO; goto out; }
+		vmas++;
+		if (perms[3] != 'p' || strstr(line, "[vsyscall]")) continue;
 		for (uint64_t va = begin; va < end;) {
 			size_t count = (end - va) / PAGE_BYTES;
 			if (count > IO_WORDS) count = IO_WORDS;
-			if (exact_io(pm, entries, count * 8, (va / PAGE_BYTES) * 8, false))
-				goto out;
+			if (exact_io(pm, entries, count * 8, (va / PAGE_BYTES) * 8, false)) goto out;
 			for (size_t i = 0; i < count; i++, va += PAGE_BYTES) {
-				uint64_t entry = entries[i];
-				struct hot_page p = {.va = va, .tag = tag, .sample = -1};
-				while (old_i < old->n && old->v[old_i].va < va) old_i++;
-				if (!(entry & (PM_PRESENT | PM_SWAPPED))) continue;
-				if ((entry & (PM_PRESENT | PM_SWAPPED)) == (PM_PRESENT | PM_SWAPPED)) {
-					errno = EPROTO;
-					goto out;
-				}
-				if (old_i < old->n && old->v[old_i].va == va && old->v[old_i].tag == tag) {
-					const struct hot_page *prior = &old->v[old_i];
-					p.heat = prior->heat;
-					p.previous_pfn = prior->pfn ? prior->pfn : prior->previous_pfn;
-					p.was_armed = prior->armed;
-				}
-				if (entry & PM_PRESENT) {
+				uint64_t e = entries[i], state = e & (PM_PRESENT | PM_SWAPPED);
+				struct hot_page p = {.vpn = va / PAGE_BYTES, .flags = IN_SCOPE};
+				if (!state) continue;
+				if (state == (PM_PRESENT | PM_SWAPPED)) { errno = EPROTO; goto out; }
+				if ((e & PM_FILE) || (state == PM_SWAPPED && (e & 31) >= NORMAL_SWAP_TYPES)) continue;
+				if (state == PM_PRESENT) {
 					present = true;
-					p.pfn = entry & PM_PFN;
-					visible_pfn |= p.pfn != 0;
-					p.state = RESIDENT;
-				} else {
-					p.state = SWAPPED;
-					p.swap = entry & PM_PFN;
+					p.pfn = e & PM_PFN;
+					visible |= p.pfn != 0;
+					p.flags |= RESIDENT;
 				}
-				if (append_page(next, &p)) goto out;
+				if (append_page(pages, p)) goto out;
 			}
 			if (interrupted) { errno = EINTR; goto out; }
 		}
 	}
 	if (ferror(maps)) goto out;
-	if (present && !visible_pfn) {
-		fprintf(stderr, "PFNs are hidden or unavailable; CAP_SYS_ADMIN is required.\n");
-		errno = EACCES;
-		goto out;
-	}
+	/* Proc fds pin mm_count, not mm_users. EOF after exec is never a new run. */
+	if (!vmas) { errno = ESTALE; goto out; }
+	if (present && !visible) { errno = EACCES; goto out; }
 	ret = 0;
 out:
-	free(line);
-	return ret;
+	free(line); return ret;
 }
 
 static int ref_compare(const void *a, const void *b)
@@ -222,814 +146,440 @@ static int ref_compare(const void *a, const void *b)
 	if (x->pfn != y->pfn) return (x->pfn > y->pfn) - (x->pfn < y->pfn);
 	return (x->index > y->index) - (x->index < y->index);
 }
-
 static struct pfn_ref *make_refs(const struct page_list *pages, size_t *n)
 {
+	if (pages->n > SIZE_MAX / sizeof(struct pfn_ref)) { errno = ENOMEM; return NULL; }
 	struct pfn_ref *refs = malloc((pages->n ? pages->n : 1) * sizeof(*refs));
 	*n = 0;
 	if (!refs) return NULL;
 	for (size_t i = 0; i < pages->n; i++)
-		if (pages->v[i].state == RESIDENT && pages->v[i].pfn)
+		if ((pages->v[i].flags & (IN_SCOPE | RESIDENT)) == (IN_SCOPE | RESIDENT) && pages->v[i].pfn)
 			refs[(*n)++] = (struct pfn_ref){pages->v[i].pfn, i};
 	qsort(refs, *n, sizeof(*refs), ref_compare);
 	return refs;
 }
-
-static bool target_flags(uint64_t flags)
+static bool target_flags(uint64_t f)
 {
 	const uint64_t excluded = FLAG(15) | FLAG(16) | FLAG(17) | FLAG(18) |
 		FLAG(19) | FLAG(20) | FLAG(22) | FLAG(23) | FLAG(24);
-	/* SWAPBACKED includes ordinary anonymous and shmem/tmpfs pages. */
-	return (flags & FLAG(14)) && !(flags & excluded);
+	return (f & FLAG(12)) && (f & FLAG(14)) && !(f & excluded);
 }
-
 static int classify_pages(struct page_list *pages, int flags_fd)
 {
-	size_t n;
+	size_t n, keep = 0;
 	struct pfn_ref *refs = make_refs(pages, &n);
 	uint64_t block[IO_WORDS], previous = UINT64_MAX;
-	int ret = -1;
 	if (!refs) return -1;
 	for (size_t i = 0; i < n; i++) {
-		uint64_t base = refs[i].pfn & ~(uint64_t)(IO_WORDS - 1);
 		struct hot_page *p = &pages->v[refs[i].index];
+		uint64_t base = p->pfn & ~(uint64_t)(IO_WORDS - 1);
 		if (base != previous) {
-			if (exact_io(flags_fd, block, sizeof(block), base * 8, false)) goto out;
+			if (exact_io(flags_fd, block, sizeof(block), base * 8, false)) { free(refs); return -1; }
 			previous = base;
 		}
-		uint64_t flags = block[p->pfn - base];
-		if (!target_flags(flags)) p->state = SKIP;
-		else p->eligible = !!(flags & FLAG(5)); /* Only LRU pages can be armed. */
+		uint64_t f = block[p->pfn - base];
+		if (!target_flags(f)) p->flags = 0;
+		else if (f & FLAG(5)) p->flags |= ELIGIBLE;
 	}
-	/* A zero PFN is never used as an idle target (e.g. the shared zero page). */
-	size_t keep = 0;
+	free(refs);
 	for (size_t i = 0; i < pages->n; i++) {
-		struct hot_page *p = &pages->v[i];
-		if (p->state != SKIP && (p->state != RESIDENT || p->pfn))
-			pages->v[keep++] = *p;
+		struct hot_page p = pages->v[i];
+		if ((p.flags & IN_SCOPE) && (!(p.flags & RESIDENT) || p.pfn)) pages->v[keep++] = p;
 	}
 	pages->n = keep;
-	ret = 0;
-out:
-	free(refs);
-	return ret;
+	return 0;
 }
 
-static int read_idle(struct page_list *pages, const struct pfn_ref *refs,
-		     size_t n, int idle_fd)
+/* Both inputs sorted by VPN. Never key history by PFN, VMA text or swap entry. */
+static int merge_history(const struct page_list *old, const struct page_list *current,
+		struct page_list *next)
+{
+	size_t i = 0, j = 0;
+	while (i < old->n || j < current->n) {
+		struct hot_page p;
+		if (j == current->n || (i < old->n && old->v[i].vpn < current->v[j].vpn)) {
+			p = old->v[i++]; p.flags = 0; p.pfn = 0; p.sample = 0;
+		} else {
+			p = current->v[j++];
+			if (i < old->n && old->v[i].vpn == p.vpn) {
+				const struct hot_page *prior = &old->v[i++];
+				p.heat = prior->heat; p.hits = prior->hits;
+				if ((p.flags & RESIDENT) && (prior->flags & ARMED) && prior->pfn == p.pfn)
+					p.flags |= WAS_ARMED;
+			}
+		}
+		if (append_page(next, p)) return -1;
+	}
+	return 0;
+}
+static int read_idle(struct page_list *pages, const struct pfn_ref *refs, size_t n, int fd)
 {
 	uint64_t previous = UINT64_MAX, bits = 0;
+	if (n && !pages->v) { errno = EINVAL; return -1; }
 	for (size_t i = 0; i < n; i++) {
 		struct hot_page *p = &pages->v[refs[i].index];
 		uint64_t word = p->pfn / 64;
-		if (!p->eligible || !p->was_armed || p->previous_pfn != p->pfn) continue;
+		if ((p->flags & (ELIGIBLE | WAS_ARMED)) != (ELIGIBLE | WAS_ARMED)) continue;
 		if (word != previous) {
-			if (exact_io(idle_fd, &bits, 8, word * 8, false)) return -1;
+			if (exact_io(fd, &bits, 8, word * 8, false)) return -1;
 			previous = word;
 		}
-		p->sample = (bits & FLAG(p->pfn % 64)) ? 0 : 1;
+		p->sample = !(bits & FLAG(p->pfn % 64));
 	}
 	return 0;
 }
 
-/* Recheck pagemap after idle reads. A changed frame invalidates this round,
- * but does not erase the VA's earlier history. No page is pinned by this tool.
+/* Batched reread, only for sampling validation. Mid-window same-PFN ABA is
+ * deliberately not tracked. A changed resident frame contributes sample=0.
  */
-static int verify_pages(struct page_list *pages, int pm)
+static int verify_pages(struct page_list *pages, int pm, int flags_fd)
 {
 	uint64_t block[IO_WORDS], previous = UINT64_MAX;
 	for (size_t i = 0; i < pages->n; i++) {
 		struct hot_page *p = &pages->v[i];
-		uint64_t vpn = p->va / PAGE_BYTES, base = vpn & ~(uint64_t)(IO_WORDS - 1);
+		if (!(p->flags & IN_SCOPE)) continue;
+		uint64_t base = p->vpn & ~(uint64_t)(IO_WORDS - 1);
 		if (base != previous) {
 			if (exact_io(pm, block, sizeof(block), base * 8, false)) return -1;
 			previous = base;
 		}
-		uint64_t entry = block[vpn - base];
-		bool same = p->state == RESIDENT ?
-			((entry & (PM_PRESENT | PM_SWAPPED)) == PM_PRESENT && (entry & PM_PFN) == p->pfn) :
-			((entry & (PM_PRESENT | PM_SWAPPED)) == PM_SWAPPED && (entry & PM_PFN) == p->swap);
-		if (!same) {
-			if (p->pfn) p->previous_pfn = p->pfn;
-			p->pfn = 0;
-			p->state = CHANGED;
-			p->sample = -1;
-			p->eligible = 0;
+		uint64_t e = block[p->vpn - base];
+		uint64_t state = e & (PM_PRESENT | PM_SWAPPED);
+		if ((p->flags & RESIDENT) && state == PM_PRESENT && (e & PM_PFN) == p->pfn && !(e & PM_FILE)) continue;
+		p->sample = 0; p->pfn = 0; p->flags = 0;
+		if (e & PM_FILE) continue;
+		if (state == PM_SWAPPED && (e & 31) < NORMAL_SWAP_TYPES) p->flags = IN_SCOPE;
+		else if (state == PM_PRESENT && (e & PM_PFN)) {
+			uint64_t flags, pfn = e & PM_PFN;
+			if (exact_io(flags_fd, &flags, 8, pfn * 8, false)) return -1;
+			if (target_flags(flags)) {
+				p->pfn = pfn; p->flags = IN_SCOPE | RESIDENT;
+				/* Changed PFNs get a fresh baseline next round. */
+			}
 		}
 	}
 	return 0;
 }
-
-static int arm_pages(struct page_list *pages, const struct pfn_ref *refs,
-		     size_t n, int idle_fd)
+static int arm_pages(struct page_list *pages, const struct pfn_ref *refs, size_t n, int fd)
 {
 	for (size_t i = 0; i < n;) {
 		uint64_t word = refs[i].pfn / 64, bits = 0;
 		size_t end = i;
 		while (end < n && refs[end].pfn / 64 == word) {
 			struct hot_page *p = &pages->v[refs[end].index];
-			if (p->state == RESIDENT && p->eligible) bits |= FLAG(p->pfn % 64);
+			if (p->pfn == refs[end].pfn && (p->flags & (RESIDENT | ELIGIBLE)) == (RESIDENT | ELIGIBLE)) bits |= FLAG(p->pfn % 64);
 			end++;
 		}
-		if (bits && exact_io(idle_fd, &bits, 8, word * 8, true)) return -1;
+		if (bits && exact_io(fd, &bits, 8, word * 8, true)) return -1;
 		for (; i < end; i++) {
 			struct hot_page *p = &pages->v[refs[i].index];
-			p->armed = p->state == RESIDENT && p->eligible;
+			if (p->pfn == refs[i].pfn && (p->flags & (RESIDENT | ELIGIBLE)) == (RESIDENT | ELIGIBLE)) p->flags |= ARMED;
 		}
 	}
 	return 0;
 }
-
 static int collect_round(FILE *maps, int pm, int flags_fd, int idle_fd,
-			 const struct page_list *old, struct page_list *next, unsigned int window)
+		const struct page_list *old, struct page_list *next)
 {
+	struct page_list current = {0};
+	struct pfn_ref *refs = NULL;
 	size_t n;
-	struct pfn_ref *refs;
 	int ret = -1;
-	if (scan_maps(maps, pm, old, next) || classify_pages(next, flags_fd)) return -1;
+	if (scan_maps(maps, pm, &current) || classify_pages(&current, flags_fd) ||
+	    merge_history(old, &current, next)) goto out;
+	/* Release current before sorting the full history's resident subset. */
+	free(current.v); current.v = NULL;
 	refs = make_refs(next, &n);
-	if (!refs) return -1;
-	if (read_idle(next, refs, n, idle_fd) || verify_pages(next, pm)) goto out;
-	for (size_t i = 0; i < next->n; i++) heat_push(&next->v[i].heat, next->v[i].sample, window);
-	if (arm_pages(next, refs, n, idle_fd)) goto out;
-	/* Count a resident PFN or swapped entry once in the mean. Keep all VA rows
-	 * for diagnosis. Prefer a known history when an alias has just appeared.
-	 */
-	n = 0;
-	for (size_t i = 0; i < next->n; i++) {
-		struct hot_page *p = &next->v[i];
-		if (p->state == RESIDENT || p->state == SWAPPED)
-			refs[n++] = (struct pfn_ref){p->state == RESIDENT ? p->pfn : p->swap | PM_SWAPPED, i};
-	}
-	qsort(refs, n, sizeof(*refs), ref_compare);
-	for (size_t i = 0; i < n;) {
-		size_t end = i + 1, leader = refs[i].index;
-		while (end < n && refs[end].pfn == refs[i].pfn) end++;
-		for (size_t j = i; j < end; j++) {
-			size_t index = refs[j].index;
-			next->v[index].alias = 1;
-			if (!heat_valid(&next->v[leader].heat) && heat_valid(&next->v[index].heat)) leader = index;
-		}
-		next->v[leader].alias = 0;
-		i = end;
-	}
+	if (!refs || read_idle(next, refs, n, idle_fd) || verify_pages(next, pm, flags_fd) ||
+	    arm_pages(next, refs, n, idle_fd)) goto out;
 	ret = 0;
 out:
-	free(refs);
-	return ret;
+	free(refs); free(current.v); return ret;
+}
+static void finish_round(struct page_list *pages, unsigned int rounds, bool update)
+{
+	for (size_t i = 0; i < pages->n; i++) {
+		struct hot_page *p = &pages->v[i];
+		p->hits += p->sample == 1;
+		if (update) { p->heat = heat_update(p->heat, p->hits, rounds); p->hits = 0; }
+	}
+}
+static int count_pages(const struct page_list *pages, struct totals *t)
+{
+	memset(t, 0, sizeof(*t));
+	for (size_t i = 0; i < pages->n; i++) if (pages->v[i].flags & IN_SCOPE) {
+		if (t->pages == UINT32_MAX) { errno = EOVERFLOW; return -1; }
+		t->pages++; t->sum += pages->v[i].heat;
+		t->bins[heat_bin(pages->v[i].heat)]++;
+	}
+	return 0;
+}
+static int snapshot(FILE *out, pid_t pid, uint64_t window, uint64_t elapsed_ns,
+		const struct totals *t)
+{
+	char label[80];
+	if (!window) snprintf(label, sizeof(label), "0(0s)");
+	else snprintf(label, sizeof(label), "%" PRIu64 "(%.3fs)", window, elapsed_ns / 1e9);
+	long double mean = t->pages ? (long double)t->sum / RSWAP_VPN_HEAT_SCALE / t->pages : 0;
+	if (fprintf(out, "%-8ld\t%-22s\t%-12.2Lf\t%-12" PRIu64, (long)pid, label, mean, t->pages) < 0) return -1;
+	for (unsigned int i = 0; i < 5; i++) {
+		char cell[80];
+		snprintf(cell, sizeof(cell), "%" PRIu64 "(%.1Lf%%)", t->bins[i],
+			t->pages ? (long double)t->bins[i] * 100 / t->pages : 0);
+		if (fprintf(out, "\t%-18s", cell) < 0) return -1;
+	}
+	return fputc('\n', out) == EOF || fflush(out) ? -1 : 0;
 }
 
-/* Reopen proc files each round: a launch wrapper may exec the actual workload.
- * An exec racing the opens can leave one old mm fd at EOF. Retry EIO once;
- * invalidate the baseline because a partial attempt may already have armed
- * some frames. Persistent I/O/permission failures remain explicit errors.
- */
-static int collect_process(pid_t pid, int flags_fd, int idle_fd,
-			   struct page_list *old, struct page_list *next, unsigned int window)
+static int command_write(int fd, const struct rswap_vpn_heat_command *cmd,
+		const struct rswap_vpn_heat_record *rows)
 {
-	char path[80];
-	for (int attempt = 0; attempt < 2; attempt++) {
-		snprintf(path, sizeof(path), "/proc/%ld/maps", (long)pid);
-		FILE *maps = fopen(path, "r");
-		if (!maps) return -1;
-		snprintf(path, sizeof(path), "/proc/%ld/pagemap", (long)pid);
-		int pm = open(path, O_RDONLY | O_CLOEXEC);
-		if (pm < 0) { int saved = errno; fclose(maps); errno = saved; return -1; }
-		int ret = collect_round(maps, pm, flags_fd, idle_fd, old, next, window);
-		int saved = errno;
-		close(pm);
-		fclose(maps);
-		if (ret && saved == EIO && !attempt && !interrupted) {
-			free(next->v);
-			*next = (struct page_list){0};
-			for (size_t i = 0; i < old->n; i++) old->v[i].armed = 0;
-			continue;
-		}
-		errno = saved;
-		return ret;
+	unsigned char buffer[sizeof(*cmd) + RSWAP_VPN_HEAT_BATCH * sizeof(*rows)];
+	size_t bytes = cmd->op == RSWAP_VPN_HEAT_DATA ? cmd->count * sizeof(*rows) : 0;
+	if (bytes > sizeof(buffer) - sizeof(*cmd)) { errno = EINVAL; return -1; }
+	memcpy(buffer, cmd, sizeof(*cmd));
+	if (bytes) memcpy(buffer + sizeof(*cmd), rows, bytes);
+	ssize_t n;
+	do { n = write(fd, buffer, sizeof(*cmd) + bytes); } while (n < 0 && errno == EINTR && !interrupted);
+	if (n != (ssize_t)(sizeof(*cmd) + bytes)) { if (n >= 0) errno = EIO; return -1; }
+	return 0;
+}
+static int publisher_current(const struct publisher *p)
+{
+	char status[512];
+	ssize_t n = pread(p->identity_fd, status, sizeof(status) - 1, 0);
+	if (n < 0) return -1;
+	status[n] = 0;
+	char *id = strstr(status, "binding_id=");
+	uint64_t binding = 0;
+	if (!id || sscanf(id, "binding_id=%" SCNu64, &binding) != 1 || binding != p->binding ||
+	    !strstr(status, "attached=1") || !strstr(status, "mm_current=1")) { errno = ESTALE; return -1; }
+	return 0;
+}
+static int publisher_start(struct publisher *p, pid_t pid)
+{
+	char bind[80], status[512];
+	p->identity_fd = open("/sys/kernel/debug/rswap/identity", O_RDWR | O_CLOEXEC);
+	if (p->identity_fd < 0) return -1;
+	int len = snprintf(bind, sizeof(bind), "bind %ld", (long)pid);
+	if (write(p->identity_fd, bind, len) != len) return -1;
+	ssize_t n = pread(p->identity_fd, status, sizeof(status) - 1, 0);
+	if (n < 0) return -1;
+	status[n] = 0;
+	char *id = strstr(status, "binding_id=");
+	if (!id || sscanf(id, "binding_id=%" SCNu64, &p->binding) != 1 || publisher_current(p)) {
+		errno = ESTALE; return -1;
 	}
-	return -1;
+	p->heat_fd = open("/sys/kernel/debug/rswap/vpn_heat", O_RDWR | O_CLOEXEC);
+	if (p->heat_fd < 0) return -1;
+	struct rswap_vpn_heat_command cmd = {.version = RSWAP_VPN_HEAT_VERSION,
+		.op = RSWAP_VPN_HEAT_BIND, .binding_id = p->binding};
+	return command_write(p->heat_fd, &cmd, NULL);
+}
+static int publish_snapshot(const struct publisher *p, const struct page_list *pages,
+		uint64_t window, const struct totals *t)
+{
+	struct rswap_vpn_heat_record rows[RSWAP_VPN_HEAT_BATCH];
+	struct rswap_vpn_heat_command cmd = {.version = RSWAP_VPN_HEAT_VERSION,
+		.op = RSWAP_VPN_HEAT_BEGIN, .binding_id = p->binding, .window = window,
+		.count = pages->n, .pages = t->pages, .sum_heat = t->sum};
+	struct rswap_vpn_heat_ack ack;
+	if (publisher_current(p) || command_write(p->heat_fd, &cmd, NULL)) return -1;
+	cmd.op = RSWAP_VPN_HEAT_DATA; cmd.pages = cmd.sum_heat = 0;
+	for (size_t i = 0; i < pages->n;) {
+		size_t n = pages->n - i;
+		if (n > RSWAP_VPN_HEAT_BATCH) n = RSWAP_VPN_HEAT_BATCH;
+		for (size_t j = 0; j < n; j++) rows[j] = (struct rswap_vpn_heat_record){
+			.vpn = pages->v[i+j].vpn, .heat = pages->v[i+j].heat,
+			.in_scope = !!(pages->v[i+j].flags & IN_SCOPE)};
+		cmd.count = n;
+		if (command_write(p->heat_fd, &cmd, rows)) return -1;
+		i += n;
+	}
+	cmd.op = RSWAP_VPN_HEAT_COMMIT; cmd.count = 0;
+	if (command_write(p->heat_fd, &cmd, NULL) || exact_io(p->heat_fd, &ack, sizeof(ack), 0, false)) return -1;
+	if (!ack.has_snapshot || ack.binding_id != p->binding || ack.window != window ||
+	    ack.records != pages->n || ack.pages != t->pages || ack.sum_heat != t->sum) { errno = EPROTO; return -1; }
+	return 0;
 }
 
 /* /proc/PID/stat field 22; comm can contain spaces and parentheses. */
-static int parse_identity(char *line, uint64_t *start, char *state)
-{
-	char *end = strrchr(line, ')'), *save, *token;
-	if (!end || end[1] != ' ') return -1;
-	for (int field = 3; (token = strtok_r(field == 3 ? end + 2 : NULL, " \n", &save)); field++) {
-		if (field == 3) *state = token[0];
-		if (field == 22) {
-			char *tail;
-			errno = 0;
-			*start = strtoull(token, &tail, 10);
-			return errno || *tail ? -1 : 0;
-		}
-	}
-	return -1;
-}
-
 static int identity(pid_t pid, uint64_t *start)
 {
-	char path[80], *line = NULL, state = 0;
+	char path[80], *line = NULL, *save, *token, state = 0;
 	size_t size = 0;
-	FILE *f;
-	int ret;
-	snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
-	f = fopen(path, "r");
-	if (!f) return errno == ENOENT || errno == ESRCH ? 0 : -1;
-	ret = getline(&line, &size, f) < 0 ? -1 : parse_identity(line, start, &state);
-	fclose(f);
-	free(line);
-	if (ret) { errno = EPROTO; return -1; }
-	return state == 'Z' || state == 'X' ? 0 : 1;
-}
-
-static int upload_command(int fd, struct rswap_upload_command *command,
-		struct rswap_upload_ack *ack)
-{
-	ssize_t written;
-	do { written = write(fd, command, sizeof(*command)); }
-	while (written < 0 && errno == EINTR && !interrupted);
-	if (written != sizeof(*command)) {
-		if (written >= 0) errno = EIO;
-		return -1;
-	}
-	return ack ? exact_io(fd, ack, sizeof(*ack), 0, false) : 0;
-}
-
-static int placement_start(const struct config *c, uint64_t *t0)
-{
-	struct rswap_upload_command command = {.version = RSWAP_PLACEMENT_VERSION,
-		.op = RSWAP_UPLOAD_START, .count = (uint64_t)(c->warmup * 1e9),
-		.value = c->manual};
-	struct rswap_upload_ack ack;
-	if (upload_command(c->upload_fd, &command, &ack)) return -1;
-	if (!ack.run_id || !ack.start_ns || ack.generation) { errno = EPROTO; return -1; }
-	*t0 = ack.start_ns;
-	return 0;
-}
-
-static int heat_record_compare(const void *a, const void *b)
-{
-	const struct rswap_heat_record *x = a, *y = b;
-	return (x->pfn > y->pfn) - (x->pfn < y->pfn);
-}
-
-/* Read the finite effective cgroup-v1 limit, including tighter ancestors.
- * An explicit path avoids reading the launch wrapper's pre-exec/root cgroup.
- */
-static int local_capacity(const struct config *c, uint64_t *pages)
-{
-	uint64_t limit = c->local_bytes;
-	if (!limit) {
-		char directory[PATH_MAX], file[PATH_MAX];
-		bool first = true;
-		if (!c->memory_cgroup || !realpath(c->memory_cgroup, directory)) return -1;
-		limit = UINT64_MAX;
-		for (;;) {
-			if (snprintf(file, sizeof(file), "%s/memory.limit_in_bytes", directory) >= (int)sizeof(file)) {
-				errno = ENAMETOOLONG; return -1;
-			}
-			FILE *f = fopen(file, "r");
-			if (!f) {
-				if (!first && errno == ENOENT) break;
-				return -1;
-			}
-			unsigned long long value;
-			int parsed = fscanf(f, "%llu", &value);
-			int error = ferror(f);
-			fclose(f);
-			if (parsed != 1 || error || !value) { errno = EINVAL; return -1; }
-			if (value < (UINT64_C(1) << 60) && value < limit) limit = value;
-			first = false;
-			char *slash = strrchr(directory, '/');
-			if (!slash || slash == directory) break;
-			*slash = 0;
-		}
-	}
-	if (limit == UINT64_MAX || limit <= c->reserve_bytes ||
-	    (limit - c->reserve_bytes) / PAGE_BYTES == 0) { errno = EINVAL; return -1; }
-	*pages = (limit - c->reserve_bytes) / PAGE_BYTES;
-	return 0;
-}
-
-static int prepare_threshold(struct config *c, const struct page_list *pages,
-		uint64_t generation, int mean)
-{
-	struct rswap_threshold_hist hist = {0};
-	struct rswap_heat_bin bins[RSWAP_THRESHOLD_BINS];
-	uint64_t local = 0;
-	for (size_t i = 0; i < pages->n; i++) {
-		const struct hot_page *p = &pages->v[i];
-		if (p->alias || (p->state != RESIDENT && p->state != SWAPPED)) continue;
-		hist.population++;
-		unsigned int valid = heat_valid(&p->heat), active = heat_active(&p->heat);
-		if (valid) { hist.known++; hist.counts[valid][active]++; }
-	}
-	size_t n = rswap_threshold_bins(&hist, bins);
-	if (c->threshold_config.policy == RSWAP_THRESHOLD_CAPACITY && local_capacity(c, &local)) return -1;
-	c->threshold = rswap_threshold_select(&c->threshold_config, &hist, bins, n, local,
-		generation + 1, mean, &c->previous_threshold);
-	if (c->distribution_log) {
-		uint64_t rounded[101] = {0};
-		char text[16];
-
-		for (size_t i = 0; i < n; i++)
-			rounded[(bins[i].heat + 5000) / 10000] += bins[i].pages;
-		for (unsigned int i = 0; i <= 100; i++)
-			if (rounded[i]) fprintf(c->distribution_log, "2\t%" PRIu64 "\t%s\t%" PRIu64 "\n",
-				generation, heat_text(i * 10000, text), rounded[i]);
-		if (hist.population > hist.known)
-			fprintf(c->distribution_log, "2\t%" PRIu64 "\t-\t%" PRIu64 "\n",
-				generation, hist.population - hist.known);
-		if (fflush(c->distribution_log) || ferror(c->distribution_log)) return -1;
-	}
-	if (c->raw_distribution_log) {
-		for (size_t i = 0; i < n; i++)
-			fprintf(c->raw_distribution_log, "1\t%" PRIu64 "\t%u\t%" PRIu64 "\n",
-				generation, bins[i].heat, bins[i].pages);
-		if (hist.population > hist.known)
-			fprintf(c->raw_distribution_log, "1\t%" PRIu64 "\t-1\t%" PRIu64 "\n",
-				generation, hist.population - hist.known);
-		if (fflush(c->raw_distribution_log) || ferror(c->raw_distribution_log)) return -1;
-	}
-	return 0;
-}
-
-static int placement_snapshot(const struct config *c, const struct page_list *pages,
-		uint64_t generation, size_t known, int mean)
-{
-	size_t n = 0;
-	struct rswap_heat_record *records = NULL;
-	struct {
-		struct rswap_upload_command command;
-		struct rswap_heat_record records[RSWAP_UPLOAD_BATCH];
-	} packet;
-	struct rswap_upload_ack ack;
-	struct rswap_upload_command command = {.version = RSWAP_PLACEMENT_VERSION,
-		.op = RSWAP_UPLOAD_BEGIN, .generation = generation + 1,
-		.value = known, .mean_ppm = mean};
-	uint64_t begin = monotonic_ns();
 	int ret = -1;
-
-	for (size_t i = 0; i < pages->n; i++) {
-		const struct hot_page *p = &pages->v[i];
-		n += p->state == RESIDENT && !p->alias && p->pfn && heat_valid(&p->heat);
-	}
-	if (n) {
-		records = malloc(n * sizeof(*records));
-		if (!records) return -1;
-	}
-	n = 0;
-	for (size_t i = 0; i < pages->n; i++) {
-		const struct hot_page *p = &pages->v[i];
-		if (p->state == RESIDENT && !p->alias && p->pfn && heat_valid(&p->heat))
-			records[n++] = (struct rswap_heat_record){.pfn = p->pfn,
-				.heat_ppm = heat_ppm(&p->heat)};
-	}
-	if (n > 1) qsort(records, n, sizeof(*records), heat_record_compare);
-	command.count = n;
-	struct { struct rswap_upload_command command; struct rswap_threshold_metadata metadata; } begin_packet = {
-		.command = command, .metadata = c->threshold};
-	ssize_t sent;
-	do { sent = write(c->upload_fd, &begin_packet, sizeof(begin_packet)); }
-	while (sent < 0 && errno == EINTR && !interrupted);
-	if (sent != (ssize_t)sizeof(begin_packet)) { if (sent >= 0) errno = EIO; goto out; }
-	for (size_t i = 0; i < n;) {
-		size_t count = n - i;
-		if (count > RSWAP_UPLOAD_BATCH) count = RSWAP_UPLOAD_BATCH;
-		packet.command = (struct rswap_upload_command){.version = RSWAP_PLACEMENT_VERSION,
-			.op = RSWAP_UPLOAD_DATA, .generation = generation + 1, .count = count};
-		memcpy(packet.records, records + i, count * sizeof(*records));
-		size_t bytes = sizeof(packet.command) + count * sizeof(*records);
-		ssize_t written;
-		do { written = write(c->upload_fd, &packet, bytes); }
-		while (written < 0 && errno == EINTR && !interrupted);
-		if (written != (ssize_t)bytes) { if (written >= 0) errno = EIO; goto out; }
-		i += count;
-	}
-	command = (struct rswap_upload_command){.version = RSWAP_PLACEMENT_VERSION,
-		.op = RSWAP_UPLOAD_COMMIT, .generation = generation + 1};
-	if (upload_command(c->upload_fd, &command, &ack)) goto out;
-	if (ack.generation != generation + 1) { errno = EPROTO; goto out; }
-	const struct rswap_threshold_metadata *t = &c->threshold;
-	double upload_ms = (monotonic_ns() - begin) / 1e6;
-	for (unsigned int raw = 0; raw < 2; raw++) {
-		FILE *log = raw ? c->raw_placement_log : c->placement_log;
-		char mean_text[16], threshold_text[16], coverage_text[16];
-
-		if (!log) continue;
-		if (raw) {
-			snprintf(mean_text, sizeof(mean_text), "%d", mean);
-			snprintf(threshold_text, sizeof(threshold_text), "%d", t->threshold_ppm);
-			snprintf(coverage_text, sizeof(coverage_text), "%u", t->min_coverage_ppm);
-		} else {
-			heat_text(mean, mean_text);
-			heat_text(t->threshold_ppm, threshold_text);
-			heat_text(t->min_coverage_ppm, coverage_text);
-		}
-		fprintf(log, "%u\t%" PRIu64 "\t%llu\t%llu\t%llu\t%llu\t%zu\t%zu\t%s\t%.3f",
-			raw ? 2 : 3, generation, (unsigned long long)ack.run_id, (unsigned long long)ack.start_ns,
-			(unsigned long long)ack.generation, (unsigned long long)ack.publish_ns,
-			n, known, mean_text, upload_ms);
-		fprintf(log, "\t%u\t%s\t%u\t%llu\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\n",
-			t->policy, threshold_text, t->source, (unsigned long long)t->generation, t->status,
-			(unsigned long long)t->population_pages, (unsigned long long)t->sample_pages,
-			(unsigned long long)t->candidate_pages, (unsigned long long)t->local_pages,
-			(unsigned long long)t->min_pages, coverage_text);
-		if (fflush(log) || ferror(log)) goto out;
-	}
-	ret = 0;
-out:
-	free(records);
-	/* An explicit Stop or swapoff ends this run, not observation/the workload.
-	 * Other upload failures retain Patch 8's explicit monitor-error behavior.
-	 */
-	if (ret && errno == ESTALE) return 1;
-	return ret;
-}
-
-static int snapshot(struct config *c, FILE *summary, const struct page_list *pages,
-		    uint64_t generation, uint64_t begin, uint64_t end, uint64_t t0)
-{
-	size_t known = 0, active = 0, idle = 0, present = 0, swapped = 0;
-	long double sum = 0;
-	char name[80] = "-", *path = NULL;
-	FILE *detail = NULL, *raw_detail = NULL;
-	if (c->pages) {
-		snprintf(name, sizeof(name), "pages-%06" PRIu64 ".tsv", generation);
-		if (asprintf(&path, "%s/%s", c->out, name) < 0) return -1;
-		detail = fopen(path, "wx");
-		free(path);
-		if (!detail) return -1;
-		fprintf(detail, "va\tpfn\tlast_pfn\tstate\theat\n");
-		if (c->raw_out) {
-			if (asprintf(&path, "%s/%s", c->raw_out, name) < 0) goto fail;
-			raw_detail = fopen(path, "wx");
-			free(path);
-			if (!raw_detail) goto fail;
-			fprintf(raw_detail, "va\tpfn\tlast_pfn\tstate\tactive\tvalid\theat_ppm\talias\tswap_type\tswap_offset\n");
+	snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+	FILE *f = fopen(path, "r");
+	if (!f) return errno == ENOENT || errno == ESRCH ? 0 : -1;
+	if (getline(&line, &size, f) < 0) { if (!ferror(f)) errno = EPROTO; goto out; }
+	char *end = strrchr(line, ')');
+	if (!end || end[1] != ' ') { errno = EPROTO; goto out; }
+	for (int field = 3; (token = strtok_r(field == 3 ? end + 2 : NULL, " \n", &save)); field++) {
+		if (field == 3) state = token[0];
+		if (field == 22) {
+			char *tail;
+			errno = 0; *start = strtoull(token, &tail, 10);
+			if (!errno && !*tail) ret = state == 'Z' || state == 'X' ? 0 : 1;
+			else errno = EPROTO;
+			break;
 		}
 	}
-	for (size_t i = 0; i < pages->n; i++) {
-		const struct hot_page *p = &pages->v[i];
-		unsigned int valid = heat_valid(&p->heat);
-		present += p->state == RESIDENT;
-		swapped += p->state == SWAPPED;
-		active += p->sample == 1;
-		idle += p->sample == 0;
-		if (valid && !p->alias) { known++; sum += (long double)heat_active(&p->heat) / valid; }
-		if (detail) {
-			char text[16];
-			fprintf(detail, "0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%s\n",
-				p->va, p->pfn, p->pfn ? p->pfn : p->previous_pfn, state_names[p->state],
-				heat_text(heat_ppm(&p->heat), text));
-		}
-		if (raw_detail) fprintf(raw_detail, "0x%" PRIx64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%u\t%u\t%d\t%u\t%d\t%" PRIu64 "\n",
-			p->va, p->pfn, p->pfn ? p->pfn : p->previous_pfn, state_names[p->state],
-			heat_active(&p->heat), valid, heat_ppm(&p->heat), p->alias,
-			p->state == SWAPPED ? (int)(p->swap & 31) : -1,
-			p->state == SWAPPED ? p->swap >> 5 : 0);
-	}
-	bool error = false;
-	if (raw_detail) {
-		error = ferror(raw_detail);
-		if (fclose(raw_detail)) error = true;
-		raw_detail = NULL;
-	}
-	if (detail) {
-		if (ferror(detail)) error = true;
-		if (fclose(detail)) error = true;
-		detail = NULL;
-	}
-	if (error) { errno = EIO; return -1; }
-	/* A row commits a fully written snapshot. Only ready_ns <= Store time may
- 	 * be used by the offline checker; end_ns alone would permit future data.
-	 */
-	double mean = known ? (double)(sum / known) : -1;
-	/* Display rounding never feeds back into the threshold or upload. */
-	int mean_ppm = known ? (int)(sum * RSWAP_HEAT_SCALE / known) : -1;
-	if (c->placement && c->upload_fd >= 0) {
-		if (prepare_threshold(c, pages, generation, mean_ppm)) return -1;
-		int uploaded = placement_snapshot(c, pages, generation, known, mean_ppm);
-		if (uploaded < 0) return -1;
-		if (!uploaded) c->previous_threshold = c->threshold;
-		if (uploaded > 0) {
-			close(c->upload_fd);
-			c->upload_fd = -1;
-			printf("PLACEMENT stopped by control/swapoff; continuing observation only\n");
-		}
-	}
-	uint64_t ready = monotonic_ns();
-	const char *phase = ready - t0 < c->warmup * 1e9 ? "warmup" : "observe";
-	if (c->raw_summary) {
-		fprintf(c->raw_summary, "1\t%ld\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%s\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%.9f\t%.3f\t%d\t%s\n",
-			(long)c->pid, generation, t0, begin, end, ready, phase, pages->n, present, swapped,
-			active, idle, pages->n - active - idle, known, mean, (end - begin) / 1e6,
-			ready - begin > c->interval * 1e9, name);
-		if (fflush(c->raw_summary) || ferror(c->raw_summary)) return -1;
-	}
-	char mean_text[16];
-	fprintf(summary, "2\t%ld\t%" PRIu64 "\t%zu\t%zu\t%zu\t%zu\t%s\t%.3f\t%s\n",
-		(long)c->pid, generation, pages->n, present, swapped, pages->n - present - swapped,
-		heat_text(mean_ppm, mean_text), (end - begin) / 1e6, name);
-	if (fflush(summary) || ferror(summary)) return -1;
-	printf("generation=%" PRIu64 " elapsed=%.3f pages=%zu present=%zu swapped=%zu others=%zu mean=%s scan_ms=%.3f\n",
-		generation, (ready - t0) / 1e9, pages->n, present, swapped, pages->n - present - swapped,
-		mean_text, (end - begin) / 1e6);
-	return fflush(stdout);
-fail:
-	if (raw_detail) fclose(raw_detail);
-	if (detail) fclose(detail);
-	return -1;
+ out:
+	fclose(f); free(line); return ret;
 }
-
-static void usage(FILE *f)
+static pid_t launch(char **command)
 {
-	fprintf(f, "Usage: rswap_hotness --out DIR [--interval SEC] [--window N] [--warmup SEC]\n"
-		"                     [--pages] [--raw-logs] [--placement [--manual]] (--pid PID | -- COMMAND [ARGS...])\n"
-		"Defaults: interval=20, window=4 (1..64 rounds), warmup=90.\n"
-		"DIR must not exist. --pages writes per-round TSVs for offline Store matching.\n"
-		"Default TSVs show two-decimal heat in [0,1], unknown='-'.\n"
-		"--raw-logs additionally saves original precise logs under DIR/raw for full validation.\n"
-		"Requires 4-KiB pages, CAP_SYS_ADMIN/PFN visibility, and page_idle write access.\n"
-		"--placement starts Client policy before launch (active swap required); --manual waits for adaptive command.\n"
-		"--threshold-policy global-mean|capacity-mean (default global-mean).\n"
-		"capacity-mean requires --placement and --memory-cgroup DIR or --local-memory-gib GIB.\n"
-		"--reserve-gib GIB (default 1); --threshold-min-pages N (1024); --threshold-min-coverage FRACTION (0.05).\n"
-		"Known heat zero keeps Interleave; Adaptive unknowns prefer DRAM. Positive heat >= threshold prefers DRAM.\n"
-		"Default is observation only. Ctrl-C stops; launched children receive the signal.\n");
-}
-
-static int open_raw_logs(struct config *c)
-{
-	if (!c->raw_logs) return 0;
-	if (asprintf(&c->raw_out, "%s/raw", c->out) < 0) return -1;
-	if (mkdir(c->raw_out, 0700)) return -1;
-	const char *names[] = { "summary.tsv", "placement.tsv", "distribution.tsv" };
-	const char *headers[] = { raw_summary_header, raw_placement_header,
-		"version\tsample_generation\theat_ppm\tpages\n" };
-	FILE **files[] = { &c->raw_summary, &c->raw_placement_log, &c->raw_distribution_log };
-	for (unsigned int i = 0; i < (c->placement ? 3U : 1U); i++) {
-		char *path;
-		if (asprintf(&path, "%s/%s", c->raw_out, names[i]) < 0) return -1;
-		*files[i] = fopen(path, "wx");
-		free(path);
-		if (!*files[i] || fcntl(fileno(*files[i]), F_SETFD, FD_CLOEXEC)) return -1;
-		fputs(headers[i], *files[i]);
-	}
-	return 0;
-}
-
-static int run_metadata(const struct config *c, uint64_t token, uint64_t start,
-			uint64_t end, int status, int error, int stop_signal)
-{
-	const char *directories[] = { c->out, c->raw_out };
-	for (unsigned int i = 0; i < 2; i++) {
-		char *path;
-		if (!directories[i]) continue;
-		if (asprintf(&path, "%s/run.tsv", directories[i]) < 0) return -1;
-		FILE *run = fopen(path, "wx");
-		free(path);
-		if (!run) return -1;
-		fprintf(run, "version\tpid\tstart_ticks\tstart_ns\tend_ns\twindow\tinterval\twarmup\texit_status\tmonitor_error\tstop_signal\n"
-			"1\t%ld\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%.9f\t%.9f\t%d\t%d\t%d\n",
-			(long)c->pid, token, start, end, c->window, c->interval, c->warmup, status, error, stop_signal);
-		bool failed = ferror(run);
-		if (fclose(run)) failed = true;
-		if (failed) { errno = EIO; return -1; }
-	}
-	return 0;
-}
-
-static double seconds_value(const char *s, bool zero_ok)
-{
-	char *end;
-	double value;
-	errno = 0;
-	value = strtod(s, &end);
-	if (errno || end == s || *end || !isfinite(value) || value < 0 || (!zero_ok && !value) || value > 86400) return -1;
-	return value;
-}
-
-static long integer_value(const char *s, long max)
-{
-	char *end;
-	long value;
-	errno = 0;
-	value = strtol(s, &end, 10);
-	return errno || end == s || *end || value < 1 || value > max ? -1 : value;
-}
-
-static pid_t launch(char **command, uint64_t *t0, const struct config *c)
-{
-	int gate[2], result[2], error = 0;
-	pid_t pid;
-	if (pipe2(gate, O_CLOEXEC)) return -1;
-	if (pipe2(result, O_CLOEXEC)) { close(gate[0]); close(gate[1]); return -1; }
-	pid = fork();
+	int result[2], error = 0;
+	if (pipe2(result, O_CLOEXEC)) return -1;
+	pid_t pid = fork();
 	if (!pid) {
-		char go;
-		if (c->placement) close(c->upload_fd);
-		close(gate[1]); close(result[0]);
-		if (read(gate[0], &go, 1) != 1) _exit(127);
-		close(gate[0]);
-		signal(SIGPIPE, SIG_DFL);
+		close(result[0]); signal(SIGPIPE, SIG_DFL);
 		execvp(command[0], command);
 		error = errno;
 		if (write(result[1], &error, sizeof(error)) < 0) _exit(127);
 		_exit(127);
 	}
-	close(gate[0]); close(result[1]);
-	if (pid < 0) { close(gate[1]); close(result[0]); return -1; }
-	*t0 = monotonic_ns();
-	if (c->placement && placement_start(c, t0)) {
-		int saved = errno;
-		close(gate[1]); close(result[0]);
-		while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-		errno = saved;
-		return -1;
-	}
-	ssize_t sent = write(gate[1], "x", 1);
-	close(gate[1]);
-	ssize_t got;
-	do { got = read(result[0], &error, sizeof(error)); } while (got < 0 && errno == EINTR);
+	close(result[1]);
+	if (pid < 0) { close(result[0]); return -1; }
+	ssize_t n;
+	do { n = read(result[0], &error, sizeof(error)); } while (n < 0 && errno == EINTR);
 	close(result[0]);
-	if (sent != 1 || got != 0) {
+	if (n) {
 		kill(pid, SIGTERM);
-		waitpid(pid, NULL, 0);
-		errno = error ? error : EIO;
-		return -1;
+		while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+		errno = error ? error : EIO; return -1;
 	}
 	return pid;
+}
+static double seconds_value(const char *s)
+{
+	char *end;
+	errno = 0; double n = strtod(s, &end);
+	return errno || end == s || *end || !isfinite(n) || n < .001 || n > 86400 ? -1 : n;
+}
+static long integer_value(const char *s, long max)
+{
+	char *end;
+	errno = 0; long n = strtol(s, &end, 10);
+	return errno || end == s || *end || n < 1 || n > max ? -1 : n;
+}
+static void usage(FILE *f)
+{
+	fputs("Usage: rswap_hotness --out NEW_DIR [--a-bit-window SECONDS] [--ewma-window N]\n"
+	      "                     [--publish] (--pid PID | -- COMMAND...)\n"
+	      "Defaults: wait 5 seconds AFTER each scan; EWMA every 4 completed rounds.\n"
+	      "--interval/--window are aliases. --publish needs Client 1.18 identity/vpn_heat.\n"
+	      "Only summary.tsv is written. This phase does not enable placement policy.\n", f);
 }
 
 int main(int argc, char **argv)
 {
-	struct config c = {.interval = 20, .window = 4, .warmup = 90, .upload_fd = -1,
-		.upload_path = "/sys/kernel/debug/rswap/hotness",
-		.reserve_bytes = UINT64_C(1) << 30,
-		.threshold_config = {.min_pages = 1024, .min_coverage_ppm = 50000}};
-	const struct option options[] = {{"pid", 1, NULL, 'p'}, {"interval", 1, NULL, 'i'},
-		{"window", 1, NULL, 'w'}, {"warmup", 1, NULL, 't'}, {"out", 1, NULL, 'o'},
-		{"pages", 0, NULL, 'P'}, {"placement", 0, NULL, 'A'},
-		{"raw-logs", 0, NULL, 'D'},
-		{"manual", 0, NULL, 'M'}, {"threshold-policy", 1, NULL, 'S'},
-		{"memory-cgroup", 1, NULL, 'C'}, {"local-memory-gib", 1, NULL, 'L'},
-		{"reserve-gib", 1, NULL, 'R'}, {"threshold-min-pages", 1, NULL, 'N'},
-		{"threshold-min-coverage", 1, NULL, 'V'}, {"help", 0, NULL, 'h'}, {NULL, 0, NULL, 0}};
+	struct config c = {.interval = 5, .window = 4};
+	struct publisher p = {.identity_fd = -1, .heat_fd = -1};
+	const struct option options[] = {{"pid", 1, NULL, 'p'}, {"out", 1, NULL, 'o'},
+		{"a-bit-window", 1, NULL, 'i'}, {"interval", 1, NULL, 'i'},
+		{"ewma-window", 1, NULL, 'w'}, {"window", 1, NULL, 'w'},
+		{"publish", 0, NULL, 'U'}, {"placement", 0, NULL, 'A'},
+		{"help", 0, NULL, 'h'}, {NULL, 0, NULL, 0}};
 	struct page_list old = {0};
-	int option, flags_fd = -1, idle_fd = -1, status = 0, ret = 1, monitor_error;
+	int option, flags_fd = -1, idle_fd = -1, pm = -1, ret = 1, status = 0;
 	pid_t child = -1;
-	uint64_t t0 = 0, token = 0, generation = 0, observation_end;
-	FILE *summary = NULL;
+	FILE *maps = NULL, *summary = NULL;
+	uint64_t token = 0, baseline = 0, window = 0;
+	unsigned int rounds = 0;
 	char path[PATH_MAX];
 	while ((option = getopt_long(argc, argv, "+", options, NULL)) != -1) {
 		long n;
 		switch (option) {
 		case 'p': n = integer_value(optarg, INT_MAX); if (n < 0) goto bad; c.pid = n; break;
-		case 'i': c.interval = seconds_value(optarg, false); if (c.interval < 0.001) goto bad; break;
-		case 'w': n = integer_value(optarg, 64); if (n < 0) goto bad; c.window = n; break;
-		case 't': c.warmup = seconds_value(optarg, true); if (c.warmup < 0) goto bad; break;
 		case 'o': c.out = optarg; break;
-		case 'P': c.pages = true; break;
-		case 'D': c.raw_logs = true; break;
-		case 'A': c.placement = true; break;
-		case 'M': c.manual = true; break;
-		case 'S':
-			if (!strcmp(optarg, "global-mean")) c.threshold_config.policy = RSWAP_THRESHOLD_GLOBAL;
-			else if (!strcmp(optarg, "capacity-mean")) c.threshold_config.policy = RSWAP_THRESHOLD_CAPACITY;
-			else goto bad;
-			break;
-		case 'C': c.memory_cgroup = optarg; break;
-		case 'L': case 'R': {
-			char *end; errno = 0; double value = strtod(optarg, &end);
-			if (errno || end == optarg || *end || !isfinite(value) || value < 0 ||
-			    value >= (double)UINT64_MAX / (1ULL << 30)) goto bad;
-			uint64_t bytes = (uint64_t)(value * (1ULL << 30));
-			if (option == 'L') { if (bytes < PAGE_BYTES) goto bad; c.local_bytes = bytes; }
-			else c.reserve_bytes = bytes;
-			break;
-		}
-		case 'N': n = integer_value(optarg, INT_MAX); if (n < 0) goto bad; c.threshold_config.min_pages = n; break;
-		case 'V': {
-			char *end; errno = 0; double value = strtod(optarg, &end);
-			if (errno || end == optarg || *end || !isfinite(value) || value < 0 || value > 1) goto bad;
-			c.threshold_config.min_coverage_ppm = (unsigned int)(value * RSWAP_HEAT_SCALE); break;
-		}
+		case 'i': c.interval = seconds_value(optarg); if (c.interval < 0) goto bad; break;
+		case 'w': n = integer_value(optarg, 64); if (n < 0) goto bad; c.window = n; break;
+		case 'U': c.publish = true; break;
+		case 'A': fputs("--placement belongs to the previous PFN policy; use --publish for VPN observation.\n", stderr); goto bad;
 		case 'h': usage(stdout); return 0;
 		default: goto bad;
 		}
 	}
-	if (!c.out || (!!c.pid == (optind < argc)) || (c.manual && !c.placement)) goto bad;
-	if (c.threshold_config.policy == RSWAP_THRESHOLD_CAPACITY &&
-	    (!c.placement || (!c.local_bytes && !c.memory_cgroup))) goto bad;
-	if (c.threshold_config.policy == RSWAP_THRESHOLD_CAPACITY) {
-		uint64_t local;
-		if (local_capacity(&c, &local)) { perror("capacity-mean requires a finite cgroup/local limit greater than reserve"); goto out; }
-	}
-	if (sysconf(_SC_PAGESIZE) != 4096) { fprintf(stderr, "4-KiB system pages required\n"); return 1; }
+	if (!c.out || (!!c.pid == (optind < argc))) goto bad;
+	if (sysconf(_SC_PAGESIZE) != 4096) { fputs("4-KiB system pages required\n", stderr); return 1; }
 	flags_fd = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
 	idle_fd = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
 	if (flags_fd < 0 || idle_fd < 0) { perror("open kpageflags/page_idle (privileged access required)"); goto out; }
 	if (mkdir(c.out, 0700)) { perror("create output directory (must be new)"); goto out; }
 	if (snprintf(path, sizeof(path), "%s/summary.tsv", c.out) >= (int)sizeof(path)) { errno = ENAMETOOLONG; goto fail; }
-	summary = fopen(path, "wx");
-	if (!summary) goto fail;
-	if (fcntl(fileno(summary), F_SETFD, FD_CLOEXEC)) goto fail;
-	fputs(summary_header, summary);
-	if (fflush(summary)) goto fail;
-	if (c.placement) {
-		c.upload_fd = open(c.upload_path, O_RDWR | O_CLOEXEC);
-		if (c.upload_fd < 0) goto fail;
-		if (snprintf(path, sizeof(path), "%s/placement.tsv", c.out) >= (int)sizeof(path)) {
-			errno = ENAMETOOLONG; goto fail;
-		}
-		c.placement_log = fopen(path, "wx");
-		if (!c.placement_log || fcntl(fileno(c.placement_log), F_SETFD, FD_CLOEXEC)) goto fail;
-		fputs(placement_header, c.placement_log);
-
-		if (snprintf(path, sizeof(path), "%s/distribution.tsv", c.out) >= (int)sizeof(path)) { errno = ENAMETOOLONG; goto fail; }
-		c.distribution_log = fopen(path, "wx");
-		if (!c.distribution_log || fcntl(fileno(c.distribution_log), F_SETFD, FD_CLOEXEC)) goto fail;
-		fputs("version\tsample_generation\theat\tpages\n", c.distribution_log);
-	}
-	if (open_raw_logs(&c)) goto fail;
+	summary = fopen(path, "wxe");
+	if (!summary || fputs(summary_header, summary) == EOF || fflush(summary)) goto fail;
 	struct sigaction action = {.sa_handler = on_signal};
 	sigemptyset(&action.sa_mask);
-	sigaction(SIGINT, &action, NULL); sigaction(SIGTERM, &action, NULL);
-	signal(SIGPIPE, SIG_IGN);
-	t0 = monotonic_ns();
-	if (!c.pid) {
-		child = launch(argv + optind, &t0, &c);
-		if (child < 0) goto fail;
-		c.pid = child;
-	} else if (c.placement && placement_start(&c, &t0)) {
-		goto fail;
-	}
+	sigaction(SIGINT, &action, NULL); sigaction(SIGTERM, &action, NULL); signal(SIGPIPE, SIG_IGN);
+	if (!c.pid) { child = launch(argv + optind); if (child < 0) goto fail; c.pid = child; }
 	int alive = identity(c.pid, &token);
 	if (alive < 0) goto fail;
-	if (!alive && child < 0) { errno = ESRCH; goto fail; }
+	if (!alive) { if (child > 0) { ret = 0; goto out; } errno = ESRCH; goto fail; }
+	/* Bind after successful exec, then hold the same mm's proc fds throughout. */
+	if (c.publish && publisher_start(&p, c.pid)) goto fail;
+	snprintf(path, sizeof(path), "/proc/%ld/maps", (long)c.pid);
+	maps = fopen(path, "re");
+	snprintf(path, sizeof(path), "/proc/%ld/pagemap", (long)c.pid);
+	pm = open(path, O_RDONLY | O_CLOEXEC);
+	if (!maps || pm < 0) goto fail;
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	printf("START pid=%ld start_ns=%" PRIu64 " interval=%.6f window=%u warmup=%.3f mode=%s\n",
-		(long)c.pid, t0, c.interval, c.window, c.warmup, child > 0 ? "launch" : "attach");
-	while (alive && !interrupted) {
-		uint64_t begin = monotonic_ns(), current;
-		struct page_list next = {0};
+	printf("START pid=%ld a_bit_window=%.3f EWMA_window=%u publish=%u\n",
+		(long)c.pid, c.interval, c.window, c.publish);
+	while (!interrupted) {
+		uint64_t current;
 		alive = identity(c.pid, &current);
 		if (alive < 0) goto fail;
 		if (!alive || current != token) break;
-		int collected = collect_process(c.pid, flags_fd, idle_fd, &old, &next, c.window);
-		int saved = errno;
+		if (c.publish && publisher_current(&p)) goto fail;
+		struct page_list next = {0};
+		int collected = collect_round(maps, pm, flags_fd, idle_fd, &old, &next), saved = errno;
 		alive = identity(c.pid, &current);
 		if (!alive || (alive > 0 && current != token) || interrupted) { free(next.v); break; }
-		if (alive < 0 || collected) { free(next.v); errno = saved; goto fail; }
-		uint64_t end = monotonic_ns();
-		free(old.v);
-		old = next;
-		if (snapshot(&c, summary, &old, generation++, begin, end, t0)) goto fail;
-		uint64_t deadline = begin + (uint64_t)(c.interval * 1e9);
-		struct timespec until = {.tv_sec = deadline / 1000000000, .tv_nsec = deadline % 1000000000};
+		if (alive < 0) { free(next.v); goto fail; }
+		if (collected) { free(next.v); errno = saved; goto fail; }
+		free(old.v); old = next;
+		bool output = !baseline;
+		if (!baseline) baseline = monotonic_ns();
+		else {
+			rounds++; output = rounds == c.window;
+			finish_round(&old, c.window, output);
+			if (output) { window++; rounds = 0; }
+		}
+		if (output) {
+			struct totals t;
+			if (count_pages(&old, &t) || (c.publish && publish_snapshot(&p, &old, window, &t)) ||
+			    snapshot(summary, c.pid, window, monotonic_ns() - baseline, &t)) goto fail;
+		}
+		/* KISS: scan/output finish, then wait. Never manufacture missed rounds. */
+		struct timespec wait = {.tv_sec = (time_t)c.interval,
+			.tv_nsec = (long)((c.interval - (time_t)c.interval) * 1e9)};
 		int slept;
-		do { slept = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL); }
-		while (slept == EINTR && !interrupted);
-		if (slept && slept != EINTR) { errno = slept; goto fail; }
+		do { slept = nanosleep(&wait, &wait); } while (slept && errno == EINTR && !interrupted);
+		if (slept && errno != EINTR) goto fail;
 	}
-	ret = 0;
-	goto out;
+	ret = 0; goto out;
 bad:
-	usage(stderr);
-	return 2;
+	usage(stderr); return 2;
 fail:
 	perror("rswap hotness");
 out:
-	observation_end = monotonic_ns();
-	/* Closing the owner fd stops policy even on errors, before waiting for a
-	 * launched child. SIGKILL also closes it; inherited child copy was closed.
-	 */
-	if (c.upload_fd >= 0) close(c.upload_fd);
-	if (c.placement_log && fclose(c.placement_log)) ret = 1;
-	if (c.distribution_log && fclose(c.distribution_log)) ret = 1;
-	if (c.raw_summary && fclose(c.raw_summary)) ret = 1;
-	if (c.raw_placement_log && fclose(c.raw_placement_log)) ret = 1;
-	if (c.raw_distribution_log && fclose(c.raw_distribution_log)) ret = 1;
+	if (p.heat_fd >= 0) close(p.heat_fd);
+	if (p.identity_fd >= 0) close(p.identity_fd);
+	if (pm >= 0) close(pm);
+	if (maps) fclose(maps);
 	if (flags_fd >= 0) close(flags_fd);
 	if (idle_fd >= 0) close(idle_fd);
 	if (summary && fclose(summary)) ret = 1;
 	free(old.v);
-	monitor_error = ret;
 	if (child > 0) {
-		if (interrupted || ret) kill(child, interrupted ? interrupted : SIGTERM);
+		if (ret || interrupted) kill(child, interrupted ? interrupted : SIGTERM);
 		pid_t waited;
 		do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
 		if (waited < 0) ret = 1;
 		else if (!ret) ret = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 	}
-	if (interrupted) ret = 128 + interrupted;
-	if (summary && t0 && run_metadata(&c, token, t0, observation_end, ret, monitor_error, interrupted)) {
-		perror("write run metadata");
-		ret = 1;
-	}
-	free(c.raw_out);
-	return ret;
+	return interrupted ? 128 + interrupted : ret;
 }

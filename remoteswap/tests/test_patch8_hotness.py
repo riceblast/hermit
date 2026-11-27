@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production sampler/window checks against unprivileged pagemap/idle fixtures."""
+"""Archived PFN sampler/window compatibility checks against unprivileged pagemap/idle fixtures."""
 from pathlib import Path
 import csv
 import subprocess
@@ -18,7 +18,7 @@ static int fixture_open(const char *, int, ...);
 #define fopen fixture_fopen
 #define open fixture_open
 #define main hotness_tool_main
-#include "rswap_hotness.c"
+#include "../tests/fixtures/rswap_hotness_v1.c"
 #undef main
 #undef fopen
 #undef open
@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 7);
     char *missing[] = {"/nonexistent-rswap-command", NULL};
     assert(launch(missing, &start, &config) == -1 && errno == ENOENT);
-    puts("PASS: production sampler fixtures, windows, aliases, mapping changes and launcher");
+    puts("PASS: archived PFN sampler fixtures, windows, aliases, mapping changes and launcher");
 }
 '''
 
@@ -200,7 +200,7 @@ class SamplerTests(unittest.TestCase):
         cls.path = Path(cls.tmp.name)
         cls.tool = cls.path / "rswap_hotness"
         cls.pattern = cls.path / "hotness_pattern"
-        for source, output, extra in ((ROOT / "tools/rswap_hotness.c", cls.tool, []),
+        for source, output, extra in ((ROOT / "tests/fixtures/rswap_hotness_v1.c", cls.tool, []),
                                       (ROOT / "tests/hotness_pattern.c", cls.pattern, ["-pthread"])):
             subprocess.run(["gcc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
                             str(source), *extra, "-o", str(output)], check=True)
@@ -209,7 +209,7 @@ class SamplerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def test_production_sampler_with_fixture_interfaces(self):
+    def test_archived_pfn_sampler_with_fixture_interfaces(self):
         source = self.path / "sampler.c"
         binary = self.path / "sampler"
         source.write_text(HARNESS)
@@ -218,7 +218,7 @@ class SamplerTests(unittest.TestCase):
                         "-o", str(binary)], check=True)
         result = subprocess.run([str(binary), str(self.path)], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn("PASS: production sampler", result.stdout)
+        self.assertIn("PASS: archived PFN sampler", result.stdout)
         with (self.path / "raw/summary.tsv").open() as stream:
             row = next(csv.DictReader(stream, delimiter="\t"))
         trace = self.path / "stores.log"

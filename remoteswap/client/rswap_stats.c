@@ -5,6 +5,7 @@
 #include "rswap_placement.h"
 #include "rswap_app.h"
 #include "rswap_identity.h"
+#include "rswap_vpn_heat.h"
 
 static struct dentry *stats_root;
 static unsigned int stats_nr_servers;
@@ -294,6 +295,8 @@ int rswap_stats_init(unsigned int nr_servers)
 		ret = rswap_app_debugfs(stats_root);
 	if (!ret)
 		ret = rswap_identity_debugfs(stats_root);
+	if (!ret)
+		ret = rswap_vpn_heat_debugfs(stats_root);
 	if (ret)
 		rswap_stats_exit();
 	return ret;

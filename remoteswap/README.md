@@ -1,13 +1,16 @@
 # Remoteswap
 
-**Development stage: Client 1.17, stage 1 of VPN-based heat tracking.**
-The paired kernel now notifies the Client of anonymous-page swap-entry/VPN
-associations and entry release, with an initial scan for an attached process.
-This stage adds the identity bridge and debugfs validation controls; the current
-heat algorithm, upload ABI and placement behavior are unchanged. Client 1.17
-requires the rebuilt kernel exporting `rswap_identity_scan_mm` and the two
-identity tracepoints. Kernel/Client builds and 105 local checks passed; hardware
-acceptance is pending. See [installation and stage-1 validation](tests/stage1-identity.md).
+**Development stage: Client 1.18, stage 2 of VPN-based heat tracking.**
+The sampler retains VPN histories across swap, empty PTEs and address reuse,
+updates EWMA after nonoverlapping groups (defaults: wait 5 seconds after each scan,
+4 rounds per group), and writes only `summary.tsv`. Optional `--publish` sends
+atomic VPN snapshots to the Client for observation; existing placement behavior
+and the old PFN upload ABI remain unchanged. See [stage-2 semantics, commands and
+local checks](tests/stage2-vpn-hotness.md). Stage-2 hardware acceptance is pending.
+
+The paired kernel exports `rswap_identity_scan_mm` and the two identity
+tracepoints. The stage-1 identity bridge passed dual-node core, lifecycle,
+Hermit and real BFS tests; see [Patch 12 results](tests/patch12-kernel-swap.md).
 
 Client 1.16 added unified placement-choice output.
 The new `tools/rswap_run.py` launches a command in an existing, empty cgroup-v1
@@ -77,11 +80,13 @@ original Chunk number and reports its `[start,end)` range and byte length. This
 read-only view is available before swapon; see the [pool guide](operation_doc/create_pool.md)
 for interpretation and a minimal connection-only check.
 
-The independent `tools/rswap_hotness` sampler observes a PID or launches a command,
-tracks activity over a configurable window, and exports per-page heat and means.
-The disabled-by-default `rswap:store_sample` event and offline checker correlate
-prior heat snapshots with Store PFNs. With `--placement`, the sampler starts the
-Client policy before launching a workload and publishes complete heat generations.
+The current independent `tools/rswap_hotness` sampler observes a fixed target mm,
+or launches a target executable, and exports VPN EWMA summary statistics.
+Use the [stage-2 guide](tests/stage2-vpn-hotness.md); the former `--placement`,
+`--pages` and `--raw-logs` options are no longer supported by this sampler.
+The disabled-by-default `rswap:store_sample` event and historical offline checker
+remain available for archived PFN logs. The following describes the retained
+legacy PFN placement implementation, which is not activated by `--publish`:
 After warmup, known positive pages at or above the configured threshold prefer DRAM, lower positive pages PMem, with per-Tier
 Server round-robin. Unknown pages prefer DRAM; zero-heat pages keep interleave.
 All choices use capacity fallback.
@@ -107,7 +112,7 @@ plan for this version.
 Use the matching Hermit kernel exporting `frontswap_register_managed_ops_v2`.
 The Patch 9 review fix also changes swap-fault error/PTE validation in the kernel:
 its fixed kernel must be deployed before hardware acceptance. The current Client
-already runs the verified #8 build; Patch 10 does not change the kernel.
+already runs the stage-1 #9 build; stage 2 does not change the kernel core.
 See the [minimal core acceptance and kernel handoff](tests/patch9-core-smoke.md).
 The kernel release string is unchanged, so `uname -r` alone does not identify this build.
 See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.

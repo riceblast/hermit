@@ -233,7 +233,7 @@ int main(void) {''')
             (cg.parent/'memory.limit_in_bytes').write_text(str(6*1024**3))
             source=r'''
 #define main sampler_unused_main
-#include "rswap_hotness.c"
+#include "../tests/fixtures/rswap_hotness_v1.c"
 #undef main
 #include <assert.h>
 int main(int argc,char **argv) {
