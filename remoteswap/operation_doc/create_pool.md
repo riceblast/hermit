@@ -246,6 +246,14 @@ bash remoteswap/client/manage_rswap_client.sh monitor 2
 
 看每个 Server/Tier 的 `write_MiB/s`、`read_total_MiB/s`、`total_MiB/s`；双节点应在运行期间都出现成功读写，`wc_error_delta`、`submit_error_delta`、`unrouted_error_delta` 应无新增。
 
+查看当前应用的固定策略绑定：
+
+```bash
+sudo cat /sys/kernel/debug/rswap/app_policies
+```
+
+列出当前有效绑定的编号、注册 PID 和 `pureDRAM`／`purePMem` 策略；策略按应用所在的 memory cgroup 生效。工具退出或 swapoff 后，相应绑定会移除。
+
 ### client D：查看 Adaptive 阈值、分类统计和逐页选择
 
 观察 Adaptive 前，需已通过 `rswap_hotness --placement` 启动策略并切入 `adaptive`；上面的普通 BFS 命令不会自动开启 Adaptive。以下持续查看命令按需切换，Ctrl-C 退出当前查看。
