@@ -296,6 +296,11 @@ sudo watch -n 1 'tail -n 10 /sys/kernel/debug/tracing/instances/rswap_demo/trace
 
 新 `decision` 只显示 Store 成功分配后的六项：`req_type`、十六进制 `pfn`、`placement_policy`、`reason`、`server`、`target_mem`，每项后带逗号。Interleave／Warmup 分别标记 `interleave`／`interleave(warmup)`；Adaptive 的 hot/cold 按实际 DRAM／PMem 目标标记，包含未知页和容量回退，不是原始热度分类。分配成功不等于 RDMA 写完成，Load 不输出 decision。
 
+Client 1.16 起，开启同一个事件也能看到 `placement_policy: pureDRAM`／`purePMem`。
+首选介质分配成功显示 `reason: fixed`，同介质切换 Server 仍为 `fixed`；跨介质容量回退显示
+`reason: capacity_fallback`。`server` 和 `target_mem` 始终是实际结果。
+完整例子及固定策略原始事件见 [应用放置说明](../tests/app-placement.md)。
+
 如需原来的热度、阈值、offset、alloc_seq、RR 和 fallback 等精确证据，独立开启 `events/rswap/decision_raw/enable`。详细格式及采样器 `--raw-logs` 选项见 [输出说明](../tests/compact-output.md)。
 
 Ctrl-C 只退出查看，采集仍继续。观察结束后关闭并删除本 instance：

@@ -93,7 +93,7 @@ typedef uint64_t u64;
 #define RSWAP_WARMUP 1
 #define RSWAP_ADAPTIVE 2
 #define RSWAP_TIER_DRAM 0
-struct rswap_decision { unsigned int state, reason; };
+#define RSWAP_APP_DRAM 1
 struct rswap_location { unsigned int server, tier; };
 '''
         code += function(source, 'rswap_format_decision')
@@ -103,9 +103,8 @@ int main(void) {
         for (unsigned int server=0;server<2;server++)
             for (unsigned int tier=0;tier<2;tier++)
                 for(unsigned int reason=0;reason<8;reason++) {
-                    struct rswap_decision d={state,reason};
                     struct rswap_location loc={server,tier}; char text[192];
-                    rswap_format_decision(text,sizeof(text),UINT64_MAX,&d,&loc);
+                    rswap_format_decision(text,sizeof(text),UINT64_MAX,state,0,tier,&loc);
                     puts(text);
                 }
 }
@@ -134,12 +133,130 @@ int main(void) {
         with self.assertRaisesRegex(ValueError,'decision_raw'):
             read_decisions([display],layout)
 
+    def test_fixed_decision_format_and_tier_fallback(self):
+        source = (ROOT/'client/rswap_trace.h').read_text()
+        code = r'''
+#include <stdio.h>
+#include <stdint.h>
+typedef uint64_t u64;
+#define scnprintf snprintf
+#define RSWAP_WARMUP 1
+#define RSWAP_ADAPTIVE 2
+#define RSWAP_TIER_DRAM 0
+#define RSWAP_APP_DRAM 1
+struct rswap_location { unsigned int server, tier; };
+'''
+        code += function(source, 'rswap_format_decision')
+        code += r'''
+int main(void) {
+    for (unsigned int state=0;state<3;state++)
+        for (unsigned int policy=1;policy<=2;policy++)
+            for (unsigned int server=0;server<2;server++)
+                for (unsigned int tier=0;tier<2;tier++) {
+                    struct rswap_location loc={server,tier}; char text[192];
+                    rswap_format_decision(text,sizeof(text),UINT64_MAX,state,policy,policy-1,&loc);
+                    puts(text);
+                }
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = build(code, Path(tmp)/'fixed-format.c')
+            lines = subprocess.check_output([str(binary)], text=True).splitlines()
+        self.assertEqual(len(lines),24)
+        expected = []
+        for state in range(3):
+            for policy in (1,2):
+                for server in range(2):
+                    for tier in range(2):
+                        name = ('pureDRAM','purePMem')[policy-1]
+                        reason = 'fixed' if tier == policy-1 else 'capacity_fallback'
+                        expected.append(f'req_type: store, pfn: 0xffffffffffffffff, placement_policy: {name}, reason: {reason}, server: {server}, target_mem: {("dram","pmem")[tier]},')
+        self.assertEqual(lines,expected)
+        self.assertTrue(all(len(line)<192 and line.count(',')==6 for line in lines))
+
+    def test_fixed_store_emission_success_failure_fallback_and_load(self):
+        code = client_code(SUPPORT.replace('int main(void)', 'int legacy_main(void)'))
+        formatter = '#define scnprintf snprintf\n' + function(
+            (ROOT/'client/rswap_trace.h').read_text(), 'rswap_format_decision')
+        code = code.replace(definition(code,'trace_decision'), formatter + r'''
+static int displayed, app_detailed;
+static char last_text[192];
+static void trace_decision(u64 pfn,unsigned int state,unsigned int app_policy,
+                          unsigned int preferred_tier,const struct rswap_location *loc) {
+    assert(app_policy>=1 && app_policy<=2 && preferred_tier==app_policy-1);
+    rswap_format_decision(last_text,sizeof(last_text),pfn,state,app_policy,preferred_tier,loc);
+    displayed++;
+}
+''')
+        code = code.replace('#define trace_app_decision(...) ((void)0)', r'''
+static void trace_app_decision(u64 offset,u64 pfn,const struct rswap_app_decision *d,
+                               const struct rswap_location *loc,int ret);
+''')
+        code += r'''
+static void trace_app_decision(u64 offset,u64 pfn,const struct rswap_app_decision *d,
+                               const struct rswap_location *loc,int ret) { app_detailed++; }
+static void fresh(struct page *p) {
+    *p=(struct page){0}; atomic_store(&p->refs,1); atomic_store(&p->locked,1);
+}
+static void store(struct page *p,u64 offset) {
+    void *cookie; fresh(p);
+    assert(!rswap_store_prepare(0,offset,p,0,&cookie));
+    struct ib_cq *cq=((struct fs_rdma_req *)cookie)->rdma_queue->cq;
+    atomic_store(&p->valid,1); rswap_store_commit(cookie); complete_one(cq);
+}
+int main(void) {
+    init(); rswap_mapping_destroy();
+    pool_layout=(struct rswap_pool_layout){.nr_servers=2,.total_pages=8,
+        .server_pages={4,4},.tier_pages={{2,2},{2,2}}};
+    assert(!rswap_mapping_init(&pool_layout)); trace_enabled=false;
+    for (int preferred=0;preferred<2;preferred++) {
+        struct page pages[8],extra,read;
+        struct rswap_location pinned;
+        void *cookie;
+        app_override=preferred; app_rr=0; displayed=app_detailed=0;
+        for (unsigned off=0;off<8;off++) {
+            store(&pages[off],off);
+            assert(displayed==(int)off+1 && app_detailed==(int)off+1);
+            assert(strstr(last_text,preferred ? "placement_policy: purePMem," : "placement_policy: pureDRAM,"));
+            assert(strstr(last_text,off<4 ? "reason: fixed," : "reason: capacity_fallback,"));
+        }
+        fresh(&extra);
+        assert(rswap_store_prepare(0,0,&extra,0,&cookie)==-EEXIST);
+        assert(displayed==8 && app_detailed==9);
+        assert(!rswap_mapping_get(0,&pinned)); rswap_mapping_invalidate(0);
+        assert(rswap_store_prepare(0,0,&extra,0,&cookie)==-ENOSPC);
+        assert(displayed==8 && app_detailed==10);
+        rswap_mapping_put(pinned.id);
+        store(&extra,0);
+        assert(displayed==9 && app_detailed==11 && strstr(last_text,"reason: fixed,"));
+        fresh(&read);
+        assert(!rswap_rdma_submit(0,0,&read,QP_LOAD_SYNC,NULL));
+        complete_one(&cqs[0][QP_LOAD_SYNC]);
+        assert(displayed==9 && app_detailed==11 && atomic_load(&read.uptodate));
+        rswap_mapping_reset();
+    }
+    /* Another Server in the same Tier is still labelled fixed. */
+    struct rswap_location loc; struct page p;
+    for (unsigned off=0;off<2;off++) {
+        assert(!rswap_mapping_alloc_preferred(off,0,0,&loc)); rswap_mapping_put(loc.id);
+    }
+    app_override=0; app_rr=0; store(&p,2);
+    assert(strstr(last_text,"reason: fixed,") && strstr(last_text,"server: 1, target_mem: dram,"));
+    rswap_invalidate_area(0); rswap_mapping_destroy();
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = build(code, Path(tmp)/'fixed-io.c', '-pthread')
+            subprocess.run([str(binary)], check=True, capture_output=True, timeout=15)
+
     def test_actual_io_emits_no_load_or_failed_allocation_display(self):
         code = client_code(SUPPORT.replace('int main(void)', 'int legacy_main(void)'))
         code = code.replace(definition(code,'trace_decision'), '''
 static int displayed, detailed;
-static void trace_decision(u64 off,u64 pfn,const struct rswap_decision *d,const struct rswap_location *loc,int ret) {
-    assert(!ret); displayed++;
+static void trace_decision(u64 pfn,unsigned int state,unsigned int app_policy,
+                          unsigned int preferred_tier,const struct rswap_location *loc) {
+    displayed++;
 }
 ''')
         code = code.replace(definition(code,'trace_decision_raw'), '''

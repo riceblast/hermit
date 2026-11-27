@@ -9,8 +9,8 @@
 #include "rswap_placement.h"
 #include "rswap_app.h"
 
-/* Fixed application preferences have no heat classification. Keep their
- * evidence independent of the existing adaptive trace format and tools.
+/* Detailed fixed-policy evidence remains independent of the adaptive raw
+ * format. Both policies also use the shared human-readable decision event.
  */
 TRACE_EVENT(app_decision,
 	TP_PROTO(u64 offset, u64 pfn, const struct rswap_app_decision *d,
@@ -64,15 +64,19 @@ TRACE_EVENT(store_result,
 #ifndef _RSWAP_DECISION_FORMAT
 #define _RSWAP_DECISION_FORMAT
 static inline void rswap_format_decision(char *buf, size_t size, u64 pfn,
-		const struct rswap_decision *d, const struct rswap_location *loc)
+		unsigned int state, unsigned int app_policy, unsigned int preferred_tier,
+		const struct rswap_location *loc)
 {
 	const char *policy = "interleave", *reason = "interleave";
 	const char *tier = loc->tier == RSWAP_TIER_DRAM ? "dram" : "pmem";
 
-	if (d->state == RSWAP_WARMUP) {
+	if (app_policy) {
+		policy = app_policy == RSWAP_APP_DRAM ? "pureDRAM" : "purePMem";
+		reason = loc->tier == preferred_tier ? "fixed" : "capacity_fallback";
+	} else if (state == RSWAP_WARMUP) {
 		policy = "adaptive(warmup)";
 		reason = "interleave(warmup)";
-	} else if (d->state == RSWAP_ADAPTIVE) {
+	} else if (state == RSWAP_ADAPTIVE) {
 		policy = "adaptive";
 		reason = loc->tier == RSWAP_TIER_DRAM ? "hot" : "cold";
 	}
@@ -83,14 +87,16 @@ static inline void rswap_format_decision(char *buf, size_t size, u64 pfn,
 #endif
 
 /* Display only: successful Store allocation, not post/WC success. Never Load.
- * Original numeric evidence is available independently as decision_raw.
+ * app_policy=0 selects the legacy state-based labels. Numeric evidence is
+ * available independently as decision_raw (legacy) or app_decision (fixed).
  */
 TRACE_EVENT(decision,
-	TP_PROTO(u64 offset, u64 pfn, const struct rswap_decision *d,
-		 const struct rswap_location *loc, int ret),
-	TP_ARGS(offset, pfn, d, loc, ret),
+	TP_PROTO(u64 pfn, unsigned int state, unsigned int app_policy,
+		 unsigned int preferred_tier, const struct rswap_location *loc),
+	TP_ARGS(pfn, state, app_policy, preferred_tier, loc),
 	TP_STRUCT__entry(__array(char, text, 192)),
-	TP_fast_assign(rswap_format_decision(__entry->text, sizeof(__entry->text), pfn, d, loc);),
+	TP_fast_assign(rswap_format_decision(__entry->text, sizeof(__entry->text),
+		pfn, state, app_policy, preferred_tier, loc);),
 	TP_printk("%s", __entry->text)
 );
 

@@ -70,6 +70,22 @@ PFN 是换出源页面的页框号，不乘页大小。Load 不新增事件。�
 新正文在事件自己的 char 数组内格式化，再通过单个 `%s` 输出，避免 5.14 在 full seq
 条件下对混合数值／字符串参数的校验告警。实际内核校验函数回归覆盖原告警及新格式。
 
+### Client 1.16 固定策略扩展
+
+`rswap:decision` 同时显示 pureDRAM／purePMem，仍只在成功分配 Slot 后输出六字段：
+
+```text
+req_type: store, pfn: 0x12345, placement_policy: pureDRAM, reason: fixed, server: 0, target_mem: dram,
+req_type: store, pfn: 0x12345, placement_policy: pureDRAM, reason: capacity_fallback, server: 1, target_mem: pmem,
+req_type: store, pfn: 0x12345, placement_policy: purePMem, reason: fixed, server: 1, target_mem: pmem,
+req_type: store, pfn: 0x12345, placement_policy: purePMem, reason: capacity_fallback, server: 0, target_mem: dram,
+```
+
+`placement_policy` 保留应用配置，`server`／`target_mem` 为实际结果；同 Tier Server 回退仍为
+`fixed`，跨 Tier 才为 `capacity_fallback`。Interleave／Warmup／Adaptive 正文、统计和原始
+`decision_raw` 格式不变。固定策略的详细证据继续使用默认关闭的 `rswap:app_decision`。
+无需改变原 `events/rswap/decision/enable` 的采集方式，见 [固定策略用法](app-placement.md)。
+
 ## 本地检查
 
 - Client 1.14、采样器构建通过，无新增编译告警。

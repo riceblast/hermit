@@ -304,6 +304,9 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 		if (fixed) {
 			ret = rswap_mapping_alloc_preferred(offset, app.server, app.tier, &location);
 			trace_app_decision((u64)offset, page_to_pfn(page), &app, &location, ret);
+			if (!ret)
+				trace_decision(page_to_pfn(page), RSWAP_INACTIVE,
+					app.policy, app.tier, &location);
 		} else {
 			ret = rswap_placement_choose(offset, page_to_pfn(page), &decision);
 			if (!ret) {
@@ -313,7 +316,8 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 				/* Decision does not imply post acceptance or WC success. */
 				trace_decision_raw((u64)offset, page_to_pfn(page), &decision, &location, ret);
 				if (!ret)
-					trace_decision((u64)offset, page_to_pfn(page), &decision, &location, ret);
+					trace_decision(page_to_pfn(page), decision.state,
+						0, decision.tier, &location);
 			}
 		}
 	} else {

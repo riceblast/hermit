@@ -194,8 +194,8 @@ void rswap_policy_record_submit(unsigned int reason, int status) {}
 void rswap_policy_record_wc(unsigned int reason, int status) {}
 static void trace_store_result(u64 seq, u64 offset, unsigned int s, unsigned int t,
                                unsigned int stage, int status) {}
-static void trace_decision(u64 offset, u64 pfn, const struct rswap_decision *d,
-                          const struct rswap_location *loc, int ret) {}
+static void trace_decision(u64 pfn, unsigned int state, unsigned int app_policy,
+                          unsigned int preferred_tier, const struct rswap_location *loc) {}
 static void trace_decision_raw(u64 offset, u64 pfn, const struct rswap_decision *d,
                               const struct rswap_location *loc, int ret) {}
 static unsigned int active_servers = 2, area_type;

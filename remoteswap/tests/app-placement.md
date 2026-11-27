@@ -1,4 +1,4 @@
-# Client 1.15：应用固定首选介质
+# Client 1.16：应用固定首选介质与统一决策输出
 
 `pureDRAM`／`purePMem` 只决定应用新 Store 的首选远端介质，不使用热度或 Warmup。
 两台 Server 都有位置时，按应用独立的 RR 计数轮询；先尝试两台同类介质，再尝试另一类介质。
@@ -25,14 +25,28 @@ Load 查询已有映射；策略注销、快照更新不迁移旧页面。未绑
   无有限 memsw 配额；不读取 Swap 用量判断归属、容量或回收。共享／继承页遵循实际记账归属，
   不承诺按所有使用者各自的策略放置同一个物理页。不以 cgroup 删除成功证明旧引用问题解决。
 - 多个应用共享远端池，不预留容量、不按容量加权。沿用 4 KiB、1／2 Server、一个活动 swap area，
-  测试禁用 THP。无需修改或重新安装内核，无 Server 改动；需重新加载 Client 1.15。
+  测试禁用 THP。无需修改或重新安装内核，无 Server 改动；需重新加载 Client 1.16。
 
 ## 统计与只读检查
 
 现有 `stats`、`monitor`、`mapping`、`pool-status`、`pool-monitor` 工具及其格式不变。
 Server／Tier 的成功 RDMA Read／Write 和错误计数包含所有应用，没有应用级带宽。
-原 `policy_stats` 及冷热 decision 事件只统计原 Interleave／Adaptive 路径，不包含固定策略；
+原 `policy_stats` 及 `decision_raw` 只统计原 Interleave／Adaptive 路径，不包含固定策略；
 不能把其决策总数当作本轮全部 Store 数。
+
+Client 1.16 将固定策略接入原 `rswap:decision` 展示事件，仍为六字段、十六进制 PFN、
+每项后带逗号。`placement_policy` 表示所配置的策略，`server`／`target_mem` 表示实际位置：
+
+```text
+req_type: store, pfn: 0x12345, placement_policy: pureDRAM, reason: fixed, server: 0, target_mem: dram,
+req_type: store, pfn: 0x12345, placement_policy: pureDRAM, reason: capacity_fallback, server: 1, target_mem: pmem,
+req_type: store, pfn: 0x12345, placement_policy: purePMem, reason: fixed, server: 1, target_mem: pmem,
+req_type: store, pfn: 0x12345, placement_policy: purePMem, reason: capacity_fallback, server: 0, target_mem: dram,
+```
+
+同介质切换 Server 仍显示 `fixed`，只有跨介质回退显示 `capacity_fallback`。
+与原行为一致，只在 Store 成功分配 Slot 后输出；Load、分配失败不输出该展示事件。
+成功分配不表示 RDMA 提交或 WC 成功，原 Interleave／Warmup／Adaptive 输出内容保持不变。
 
 `sudo cat /sys/kernel/debug/rswap/app_policies` 显示当前绑定编号、注册 PID 和策略。
 PID 只是注册来源，退出／复用不改变 memcg 绑定；工具退出、swapoff 后相应绑定消失。
@@ -82,6 +96,24 @@ bash remoteswap/client/manage_rswap_client.sh monitor 1
 bash remoteswap/client/manage_rswap_client.sh mapping
 ```
 
+需要逐页 placement choice 时，加载新模块后创建独立 Trace instance；在 BFS 运行期间读取：
+
+```bash
+TRACE=/sys/kernel/debug/tracing/instances/rswap_pure_choice
+sudo mkdir "$TRACE"
+echo 1 | sudo tee "$TRACE/events/rswap/decision/enable"
+echo 1 | sudo tee "$TRACE/tracing_on"
+sudo cat "$TRACE/trace_pipe"
+```
+
+Ctrl-C 退出查看后关闭采集，释放 instance：
+
+```bash
+echo 0 | sudo tee "$TRACE/tracing_on"
+echo 0 | sudo tee "$TRACE/events/rswap/decision/enable"
+sudo rmdir "$TRACE"
+```
+
 运行中应看到注册策略、实际 RDMA 读写和零新增错误；首选介质满池后另一介质有流量是预期行为。
 应用退出后绑定消失。旧远端位置按原 Frontswap 生命周期回收，必要时按原流程 swapoff 后确认
 所有 Slot 空闲，再卸载 Client，最后停止 Server。不要用 cgroup Swap 计数验收。
@@ -90,6 +122,10 @@ bash remoteswap/client/manage_rswap_client.sh mapping
 
 Client 1.15 构建通过，无新增编译告警；现有采样器构建检查通过。
 完整 **98 项无特权回归通过**（原 88 项＋新增 10 项），`git diff --check` 通过。
+
+Client 1.16 统一 decision 输出扩展已编译通过，无新增编译告警；完整 **100 项无特权回归通过**。
+新增检查覆盖两种固定策略的精确六字段格式、跨 Tier 与同 Tier Server 回退、失败不展示、
+Load 不展示，以及原 Interleave／Warmup／Adaptive 输出兼容；5.14 full-seq 格式校验继续通过。
 
 编译 Client 与现有采样器；运行 `python3 -B -m unittest discover -s remoteswap/tests -p 'test_*.py'`。
 新回归直接编译生产注册、RCU 查询、分配器和 RDMA 请求代码，覆盖独立 memcg／RR、
