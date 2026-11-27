@@ -3,6 +3,7 @@
 #include "rswap_rdma.h"
 #include "rswap_mapping.h"
 #include "rswap_placement.h"
+#include "rswap_app.h"
 
 static struct dentry *stats_root;
 static unsigned int stats_nr_servers;
@@ -288,6 +289,8 @@ int rswap_stats_init(unsigned int nr_servers)
 		return ret;
 	}
 	ret = rswap_placement_debugfs(stats_root);
+	if (!ret)
+		ret = rswap_app_debugfs(stats_root);
 	if (ret)
 		rswap_stats_exit();
 	return ret;

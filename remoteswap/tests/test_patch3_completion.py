@@ -52,6 +52,7 @@ typedef atomic_llong atomic64_t;
 #define atomic64_read(p) atomic_load(p)
 #include "rswap_mapping.h"
 #include "rswap_placement.h"
+#include "rswap_app.h"
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 4096ULL
 #define CHUNK_SHIFT 33
@@ -169,6 +170,17 @@ struct rswap_rdma_queue {
 static struct rdma_session_context rdma_sessions[2];
 static struct rswap_pool_layout pool_layout;
 static int policy_override = -1;
+static int app_override = -1;
+static u64 app_rr;
+bool rswap_app_choose(struct page *p, struct rswap_app_decision *d) {
+    if (app_override < 0) return false;
+    *d = (struct rswap_app_decision){.binding_id=1, .rr=app_rr,
+        .policy=app_override+1, .server=app_rr++ % pool_layout.nr_servers,
+        .tier=app_override};
+    return true;
+}
+void rswap_app_area(bool active) { if (!active) app_override = -1; }
+#define trace_app_decision(...) ((void)0)
 int rswap_placement_choose(u64 offset, u64 pfn, struct rswap_decision *d) {
     u64 ignored;
     memset(d, 0, sizeof(*d));

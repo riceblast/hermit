@@ -7,6 +7,34 @@
 
 #include <linux/tracepoint.h>
 #include "rswap_placement.h"
+#include "rswap_app.h"
+
+/* Fixed application preferences have no heat classification. Keep their
+ * evidence independent of the existing adaptive trace format and tools.
+ */
+TRACE_EVENT(app_decision,
+	TP_PROTO(u64 offset, u64 pfn, const struct rswap_app_decision *d,
+		 const struct rswap_location *loc, int ret),
+	TP_ARGS(offset, pfn, d, loc, ret),
+	TP_STRUCT__entry(
+		__field(u64, binding) __field(u64, offset) __field(u64, pfn)
+		__field(u64, rr) __field(u64, alloc_seq)
+		__field(unsigned int, policy) __field(unsigned int, preferred_server)
+		__field(unsigned int, preferred_tier) __field(unsigned int, server)
+		__field(unsigned int, tier) __field(int, ret)
+	),
+	TP_fast_assign(
+		__entry->binding = d->binding_id; __entry->offset = offset; __entry->pfn = pfn;
+		__entry->rr = d->rr; __entry->alloc_seq = ret ? 0 : loc->alloc_seq;
+		__entry->policy = d->policy; __entry->preferred_server = d->server;
+		__entry->preferred_tier = d->tier; __entry->server = loc->server;
+		__entry->tier = loc->tier; __entry->ret = ret;
+	),
+	TP_printk("binding=%llu offset=%llu pfn=%llu policy=%u rr=%llu preferred_server=%u preferred_tier=%u server=%u tier=%u alloc_seq=%llu alloc_ret=%d",
+		__entry->binding, __entry->offset, __entry->pfn, __entry->policy,
+		__entry->rr, __entry->preferred_server, __entry->preferred_tier,
+		__entry->server, __entry->tier, __entry->alloc_seq, __entry->ret)
+);
 
 /* Store-only results. stage 0 = post accepted/pre-post error, stage 1 = WC.
  * A fast WC can precede stage 0 in the log. Key by alloc_seq, never offset alone.

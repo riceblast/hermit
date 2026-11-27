@@ -1,6 +1,16 @@
 # Remoteswap
 
-**Development stage: Client 1.14 compact heat/Store-decision output (build, 88 local checks, and one 32G BFS / 4-GiB core workload validation passed).**
+**Development stage: Client 1.15 per-application pureDRAM/purePMem preferences.**
+The new `tools/rswap_run.py` launches a command in an existing, empty cgroup-v1
+memory group and registers its policy before exec. Each application has its own
+Server round-robin, with same-Tier capacity fallback before crossing Tiers.
+Existing bandwidth tools work unchanged. Kernel/Server source and protocol are
+unchanged; fixed application policies do not need heat sampling or warmup.
+See [the implementation, local validation and BFS commands](tests/app-placement.md).
+Hardware acceptance of this new feature is pending.
+
+Client 1.14 added compact heat/Store-decision output (build, 88 local checks, and
+one 32G BFS / 4-GiB core workload validation passed).
 Human heat output now uses two decimals in [0,1], with `-` for unknown. The
 sampler's `--raw-logs` option additionally preserves exact original logs under
 `OUT/raw/`. `rswap:decision` shows six Store-only fields; detailed original
