@@ -4,6 +4,9 @@
 仓库：`/mnt/sdb3/data/yxr/projects/hermit`。
 第一阶段代码提交：`fcbf69e3e`（`kernel support for swap modification`）。
 
+**最新状态（2026-11-28）：第一阶段双节点核心测试、补充专项和真实 BFS 验证通过，结果见第 9、10 节。**
+第 6 节记录的是安装交接时的历史状态；第 7 节的完整矩阵仍有未覆盖项目，不能宣称全部通过。
+
 ## 1. 当前阶段的目标和边界
 
 整体修改分三个阶段，每个阶段完成后分别验证：
@@ -184,7 +187,9 @@ sudo grep -w rswap_identity_scan_mm /proc/kallsyms
 
 如果后续重新编译，编号和时间可能变化，应与 `include/generated/compile.h` 核对。新 Client 需要新内核导出的接口，不能因为旧 `#8` 的 release 名字相同就认为能够加载。
 
-## 7. 待完成的第一阶段实机测试
+## 7. 第一阶段完整实机测试清单
+
+以下为完整验收范围。本次按用户要求压缩为双节点核心冒烟，已覆盖及未覆盖项目见第 9 节。
 
 先确认已启动正确的新内核，再按既有流程准备 Server、Client 和 swap。使用可控的小型普通匿名页工作集，禁用 THP，确保测试访问的是 4 KiB 页，且能稳定制造换出；首次不直接使用完整大规模 BFS 代替可控测试。
 
@@ -204,8 +209,122 @@ sudo grep -w rswap_identity_scan_mm /proc/kallsyms
 
 ## 8. 新 Codex 对话从哪里继续
 
+本节保留首次交接时的工作顺序；运行内核和实机进展以第 9、10 节的新记录为准。
+
 先读本文、`stage1-identity.md`、`test_stage1_identity.py` 和对应生产代码；需要追溯旧机制时再读 `task_summary/` 与 Patch 8–11 的说明。用户后续的明确需求优先于历史文档。
 
 开始时检查当前提交和工作区、`uname -v`、Client 版本、swap/Server 实际状态。当前优先事项是**确认已重启新内核并完成第一阶段实机测试**，随后向用户汇报，再按用户指示进入第二阶段。不要因文档列出了 EWMA 和放置需求就直接开始同时改写第二、三阶段。
 
 此前 Codex 会话的可写工作区只包含 `NPB3.4.4` 和 `/tmp`，Hermit 仓库修改需要额外的沙箱授权；Linux 目录权限本身允许用户写入。新会话应在 VS Code 中打开或添加本仓库，并选择 `hermit` 为对话工作目录，避免把 `chmod` 当作工作区权限问题的解决办法。
+
+## 9. 2026-11-28 双节点核心实机结果
+
+**核心冒烟 PASS；不等同于完整实机矩阵通过。** 操作者执行两台 Server 启动及 Client
+root 控制器，助手复核原始逐页记录、I/O 计数、内核日志和远端退出状态。
+控制器从接入准备到恢复原设置耗时 **45.81 秒**，不含 Server 启动、脚本准备和人工复核。
+
+- Client：Optane / `10.0.0.11`，`#9 SMP Sat Nov 28 00:02:37 CST 2026`，Client 1.17，CPU 0–47。
+- Server 0：node04 / `10.0.0.13`，DRAM node 0 / 16 GiB，PMem node 1 / 32 GiB。
+- Server 1：server02 / `10.0.0.20`，DRAM node 0 / 16 GiB，PMem node 2 / 32 GiB。
+- 总池 96 GiB；两台各 6 个数据 MR、144 个 QP；四个 Tier 的 NUMA 检查均 `misplaced=0`。
+- 测试沿用 8 GiB `/swap.img`，目标 32 MiB / 8192 个普通匿名页，独立非目标进程 4 MiB / 1024 页。
+  只对测试映射使用 `MADV_NOHUGEPAGE`，以 `MADV_PAGEOUT` 控制换出；不依赖 cgroup。
+
+| 项目 | 实际结果 |
+| --- | --- |
+| bind 前补扫 | A 区先换出，再 bind；4096 个 swap PTE 的 type、原始 offset、VPN、VA 和 aliases 全部正确。 |
+| bind 后新增关联 | B 区在同一次绑定后换出，目标全部 8192 页查询正确，无需重绑或额外扫描。 |
+| 非目标隔离 | 独立进程的 1024 个 entry 查询均 found=0，未进入目标关联表。 |
+| 多轮关联与内容 | 目标三代各 8192 页逐 word 校验通过；后两代各 8192 页的身份查询也全部正确。 |
+| PFN 改变 | 三次读回后各 8192 页的 PFN 均与换出前不同；后续换出仍关联到原 VPN。第三次读回由活进程 swapoff 完成。 |
+| 分配与 I/O 错误 | 各检查点 alloc_errors=0；WC、submit 和 unrouted 错误均为 0。 |
+| 生命周期 | 保留已换出页执行活进程 swapoff，旧 fd attached=0，identity bound/entries/aliases 全清零，四池 live=retired=0、free=capacity；最终内容仍正确。 |
+| 收尾 | 关闭 fd、正常卸载 Client，恢复全部临时 HMT/预读设置与原 `/swap.img`，Client 配置不变；两台 Server 均记录资源释放并退出。 |
+
+累计成功 Write 和同步 Read 各 **25600 页 / 100 MiB**，对应目标三代加独立进程一代：
+
+| Server / Tier | Write 页数 | 同步 Read 页数 |
+| --- | ---: | ---: |
+| node04 / DRAM | 6398 | 6398 |
+| node04 / PMem | 6400 | 6400 |
+| server02 / DRAM | 6401 | 6401 |
+| server02 / PMem | 6401 | 6401 |
+
+原始逐页表共复核 28672 次正查询、1024 次负查询，未出现不匹配或 pagemap 重试。
+新增内核日志无 BUG、WARNING、Oops 或相关 I/O 错误；加载时有内核既有 `trace_printk`
+首次使用的调试 NOTICE。测试期间关闭 Hermit 优化，没有证明 Hermit 专用回收路径命中。
+
+本轮未覆盖：entry 最终释放后的 offset 复用专项、线程/别名和并发压力专项、exec/旧 fd
+所有权专项、Hermit 回收路径、异步 Read；未运行 BFS、EWMA 或新放置策略测试。
+第二阶段尚未开始，后续工作等待用户指示。
+
+可复用程序为 `stage1_core_pattern.c` 和 `stage1_core_host.py`。原始证据归档到
+`remoteswap/tests/artifacts/patch12-core-20261128/`（沿用 artifacts 忽略规则），包括
+`results.json`、`independent-review.json`、逐页 TSV、内容响应、状态快照、内核增量日志、
+两台 Server 日志及本次使用的脚本和产物 hash。临时副本位于 `/tmp/hermit-p12-core-20261128/`。
+
+## 10. 2026-11-28 补充专项与真实 BFS 结果
+
+**本轮授权的补充专项及真实 BFS 验证 PASS。** 延续第 9 节的 #9 内核、Client 1.17、
+双节点各 16 GiB DRAM＋32 GiB PMem，总池 96 GiB；没有修改生产内核、Client、Server 或 BFS 代码。
+第二阶段 VPN 热度、EWMA 和新放置规则尚未开始，后续工作等待用户指示。
+
+### 工作集与执行条件
+
+- 原样执行 `/mnt/sdb2/yxr/K_R_benchmarks/ligra/scripts/cgroup_run_bfs.sh`。
+  实际命令为 `OMP_NUM_THREADS=16`、非对称 `rMat_64G.adj`、`-rounds 3`，即一次预热加三次计时。
+  脚本旧注释中的 40 线程不是本次实际参数；观测到 16 个线程。
+- BFS 使用 24 GiB 本地 memory cgroup、swappiness=100、无限 memsw，以及既有
+  `/mnt/sdb4/yxr/swapfile/swap_64g.img`。控制器在工作负载 cgroup 外运行。
+- 禁用 THP，BFS 阶段关闭 HMT 优化；确认 BFS 完成 exec 后暂停、bind，再恢复运行，
+  控制 fd 全程保持打开。没有运行旧热度采样器或上传新热度。
+- 补充专项另用新建的 128 MiB 临时 swap，不重新格式化现有 swap。
+  Hermit 专项为 32 MiB 普通匿名页、16 MiB 本地限额，仅开启 `vaddr_swapout`，由真实回收触发换页。
+
+### 实际结果
+
+| 项目 | 实际结果 |
+| --- | --- |
+| entry 最终释放与复用 | 两个不同 VA 区域各 8192 页查询正确；实际观察到 7725 个相同 type/offset 被新 VPN 复用，均无旧 VPN 或旧别名残留；逐 word 校验通过。 |
+| Hermit 回收路径 | 两轮分别核对 4170、4181 个 swap PTE，全部对应正确，内容校验通过；记录到测试 PID 14007 的 `hermit_try_to_unmap_one` 命中 10492 条。此 Trace 仅证明函数命中，不是完整调用次数认证。 |
+| fd 与 exec | 关闭 fd 撤销、重新绑定、exec 后仍绑定旧 mm、旧 fd 重绑返回 ESTALE、新 mm 重新绑定、swapoff 撤销及旧 fd 不影响新绑定均通过；每个阶段检查 1024 页，内容正确。 |
+| BFS 进程与身份 | 退出码 0，三次计时完整。三个检查点各随机核对 2048 个稳定匿名 swap PTE，共 6144 条全部正确，无不匹配或 pagemap 变化重试。 |
+| BFS 规模 | 222 次运行中快照；观测远端最高占用 42.5157 GiB，身份表最高 11145245 个 entry。 |
+| 错误检查 | 所有检查点与运行中快照 alloc_errors=0；WC、submit、unrouted 错误均为 0，无新增相关内核错误、BUG、WARNING 或 Oops。 |
+| 收尾 | BFS 退出后 cgroup 无进程、RSS 为 0；正常 swapoff 后 identity 清零、四池 live=retired=0、free=capacity。Client 卸载，两台 Server 均释放资源并退出，测试 cgroup/Trace/探针清理，原设置和 8 GiB `/swap.img` 恢复，临时 swap 文件删除。 |
+
+BFS 端到端 **231.46 秒**；三次算法计时为 **0.363、0.340、0.343 秒**，算法计时不含完整读图、
+解析和换页过程。三次抽查暂停合计 **2.807 秒**。从最后一次恢复开始至全部收尾为 **273.38 秒**，
+不包含 Server 启动、脚本准备、前两次控制器故障调查及等待人工命令的时间。
+
+BFS 阶段成功 RDMA 载荷累计 Write **18434908 页 / 70.3236 GiB**，同步 Read
+**14758155 页 / 56.2979 GiB**；异步 Read 为 0。按 BFS 启动前后的原始累计计数独立对账：
+
+| Server / Tier | BFS Write 页数 | BFS 同步 Read 页数 |
+| --- | ---: | ---: |
+| node04 / DRAM | 4608666 | 3689146 |
+| node04 / PMem | 4608716 | 3689279 |
+| server02 / DRAM | 4608763 | 3689614 |
+| server02 / PMem | 4608763 | 3690116 |
+
+### 解释边界和控制器故障
+
+- BFS 三个检查点的样本各来自一个 VMA，符合跨地址抽查，但没有覆盖所有 VMA 或所有页面。
+  只有可控工作集做了逐 word 内容校验；BFS 本身没有正确性 checksum 输出，本轮不认证算法结果。
+- `memory.stat` 的 swap/total_swap 在 BFS 退出后仍残留 104216137728 字节。这属于项目已有的
+  cgroup swap 记账排除项，见 `patch3-smoke.md`；本轮未修复，也不据此判断远端泄漏。
+  实际 swap、远端 Slot 和卸载后的状态另行检查并通过。
+- 未覆盖长时间压力、全部别名与并发交错、容量耗尽、故障注入、异步 Read、性能 A/B，
+  以及第二、三阶段的新热度与放置功能。
+- 此前两次失败发生在测试控制器：Python 追加打开 tracefs 隐含 SEEK_END 导致 EINVAL，
+  以及把子进程启动时间误用于父控制器的 PID 检查。两次均停止保留现场；后者发生在发出清理信号前。
+  修复后保留同一 RDMA Session 和已通过的复用结果，从 Hermit 专项继续，最终全部通过。
+- 复查另修复了收尾变量作用域问题，固定私有 Trace 输出格式，并补充 BFS 出错暂停和正常退出竞态处理。
+  使用 sudo 对应的 `/usr/bin/python3` 完成 119 项本地回归，其中新增 14 项控制器检查；
+  C 严格编译与 Clang 静态分析通过。这些本地验证与实机结果分开记录。
+
+最终证据：`remoteswap/tests/artifacts/patch12-extended-20261128/`，包含 `results.json`、
+`independent-review.json`、原始逐页表、运行中快照、计数、Trace、内核及两台 Server 日志和源文件。
+`attempts.json` 区分先前控制器失败与最终 PASS，旧异常保留为
+`failure.previous-controller-check.txt`，不能把它当作本次最终失败。
+控制器复查证据另存 `remoteswap/tests/artifacts/patch12-controller-review-20261128/`。
