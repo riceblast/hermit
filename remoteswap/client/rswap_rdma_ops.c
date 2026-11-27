@@ -10,6 +10,7 @@
 #include "rswap_mapping.h"
 #include "rswap_placement.h"
 #include "rswap_app.h"
+#include "rswap_identity.h"
 
 #define CREATE_TRACE_POINTS
 #include "rswap_trace.h"
@@ -549,6 +550,7 @@ static void rswap_invalidate_area(unsigned int type)
 	spin_lock_irqsave(&area_lock, flags);
 	area_active = false;
 	spin_unlock_irqrestore(&area_lock, flags);
+	rswap_identity_area(false, type);
 	rswap_placement_area(false);
 	rswap_app_area(false);
 	/* No submitter can reserve a WR after the drain has passed its queue. */
@@ -563,6 +565,7 @@ static void rswap_frontswap_init(unsigned int type)
 {
 	unsigned long flags;
 
+	rswap_identity_area(true, type);
 	rswap_placement_area(true);
 	rswap_app_area(true);
 	spin_lock_irqsave(&area_lock, flags);
@@ -662,6 +665,9 @@ int rswap_client_init(const struct rswap_client_config *config)
 	ret = rswap_mapping_init(&pool_layout);
 	if (ret)
 		goto fail;
+	ret = rswap_identity_init(pool_layout.total_pages);
+	if (ret)
+		goto fail;
 	rswap_placement_init(&pool_layout);
 	rswap_app_init(pool_layout.nr_servers);
 	ret = rswap_stats_init(active_servers);
@@ -685,6 +691,7 @@ void rswap_client_exit(void)
 
 	/* Remove the interface before any Session storage is released. */
 	rswap_stats_exit();
+	rswap_identity_exit();
 	rswap_placement_exit();
 	rswap_app_area(false);
 	/* Stop every selected session before reverse-order destruction. */

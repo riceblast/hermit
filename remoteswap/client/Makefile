@@ -11,6 +11,7 @@ else
 	rswap-client-y += rswap_mapping.o
 	rswap-client-y += rswap_placement.o
 	rswap-client-y += rswap_app.o
+	rswap-client-y += rswap_identity.o
 endif
 
 OFA_DIR ?= /usr/src/ofa_kernel/default

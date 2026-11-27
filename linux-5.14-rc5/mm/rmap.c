@@ -70,6 +70,8 @@
 #include <linux/huge_mm.h>
 #include <linux/backing-dev.h>
 #include <linux/page_idle.h>
+#include <linux/pagewalk.h>
+#include <linux/rswap_identity.h>
 #include <linux/memremap.h>
 #include <linux/userfaultfd_k.h>
 
@@ -1623,6 +1625,9 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 			if (pte_uffd_wp(pteval))
 				swp_pte = pte_swp_mkuffd_wp(swp_pte);
 			set_pte_at(mm, address, pvmw.pte, swp_pte);
+			if (!PageCompound(subpage))
+				trace_rswap_swap_bind(mm, address, swp_type(entry),
+						      swp_offset(entry));
 			/* Invalidate as we cleared the pte */
 			mmu_notifier_invalidate_range(mm, address,
 						      address + PAGE_SIZE);
@@ -1920,6 +1925,9 @@ bool hermit_try_to_unmap_one(struct vpage *vpage, struct page *page,
 		if (pte_uffd_wp(pteval))
 			swp_pte = pte_swp_mkuffd_wp(swp_pte);
 		set_pte_at(mm, address, pte, swp_pte);
+		if (!PageCompound(subpage))
+			trace_rswap_swap_bind(mm, address, swp_type(entry),
+					      swp_offset(entry));
 		/* Invalidate as we cleared the pte */
 		mmu_notifier_invalidate_range(mm, address,
 					      address + PAGE_SIZE);
@@ -2721,3 +2729,72 @@ void hugepage_add_new_anon_rmap(struct page *page,
 	__page_set_anon_rmap(page, vma, address, 1);
 }
 #endif /* CONFIG_HUGETLB_PAGE */
+
+/* Optional rswap identity bridge. In-kernel probes run synchronously and do
+ * not require a trace buffer or userspace collector.
+ */
+DEFINE_TRACE(rswap_swap_bind,
+	TP_PROTO(struct mm_struct *mm, unsigned long address,
+		 unsigned int type, unsigned long offset),
+	TP_ARGS(mm, address, type, offset));
+EXPORT_TRACEPOINT_SYMBOL_GPL(rswap_swap_bind);
+
+DEFINE_TRACE(rswap_swap_free,
+	TP_PROTO(unsigned int type, unsigned long offset),
+	TP_ARGS(type, offset));
+EXPORT_TRACEPOINT_SYMBOL_GPL(rswap_swap_free);
+
+static int rswap_identity_scan_test(unsigned long start, unsigned long end,
+				    struct mm_walk *walk)
+{
+	/* Anonymous swap PTEs can also live in a private file VMA after COW. */
+	return !walk->vma->anon_vma ||
+		(walk->vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP));
+}
+
+static int rswap_identity_scan_pmd(pmd_t *pmd, unsigned long start,
+				   unsigned long end, struct mm_walk *walk)
+{
+	/* Observation must not split a THP to find base-page identities. */
+	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd) || is_swap_pmd(*pmd))
+		walk->action = ACTION_CONTINUE;
+	return 0;
+}
+
+static int rswap_identity_scan_pte(pte_t *ptep, unsigned long start,
+				   unsigned long end, struct mm_walk *walk)
+{
+	pte_t pte = READ_ONCE(*ptep);
+	swp_entry_t entry;
+
+	/* The walker holds the PTE lock, preventing offset release/reuse between
+	 * observing this swap reference and notifying the subscribed probes.
+	 */
+	if (!is_swap_pte(pte))
+		return 0;
+	entry = pte_to_swp_entry(pte);
+	if (!non_swap_entry(entry))
+		trace_rswap_swap_bind(walk->mm, start, swp_type(entry), swp_offset(entry));
+	return 0;
+}
+
+int rswap_identity_scan_mm(struct mm_struct *mm)
+{
+	static const struct mm_walk_ops ops = {
+		.test_walk = rswap_identity_scan_test,
+		.pmd_entry = rswap_identity_scan_pmd,
+		.pte_entry = rswap_identity_scan_pte,
+	};
+	int ret;
+
+	if (!mm)
+		return -EINVAL;
+	ret = mmap_read_lock_killable(mm);
+	if (ret)
+		return ret;
+	ret = mm->highest_vm_end ?
+		walk_page_range(mm, 0, mm->highest_vm_end, &ops, NULL) : 0;
+	mmap_read_unlock(mm);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rswap_identity_scan_mm);

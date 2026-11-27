@@ -1,6 +1,15 @@
 # Remoteswap
 
-**Development stage: Client 1.16 unified placement-choice output.**
+**Development stage: Client 1.17, stage 1 of VPN-based heat tracking.**
+The paired kernel now notifies the Client of anonymous-page swap-entry/VPN
+associations and entry release, with an initial scan for an attached process.
+This stage adds the identity bridge and debugfs validation controls; the current
+heat algorithm, upload ABI and placement behavior are unchanged. Client 1.17
+requires the rebuilt kernel exporting `rswap_identity_scan_mm` and the two
+identity tracepoints. Kernel/Client builds and 105 local checks passed; hardware
+acceptance is pending. See [installation and stage-1 validation](tests/stage1-identity.md).
+
+Client 1.16 added unified placement-choice output.
 The new `tools/rswap_run.py` launches a command in an existing, empty cgroup-v1
 memory group and registers its policy before exec. Each application has its own
 Server round-robin, with same-Tier capacity fallback before crossing Tiers.

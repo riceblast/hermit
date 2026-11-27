@@ -53,6 +53,7 @@ typedef atomic_llong atomic64_t;
 #include "rswap_mapping.h"
 #include "rswap_placement.h"
 #include "rswap_app.h"
+#define rswap_identity_area(active, type) ((void)0)
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 4096ULL
 #define CHUNK_SHIFT 33
