@@ -36,6 +36,9 @@
 #define ELIGIBLE 4
 #define ARMED 8
 #define WAS_ARMED 16
+/* /proc/PID/stat field 9, paired kernel include/linux/sched.h PF_EXITING.
+ * exit_mm() can clear task->mm long before the task becomes a zombie. */
+#define TASK_EXITING UINT64_C(0x00000004)
 
 /* A missing/empty PTE leaves the record in the history with flags=0. */
 struct hot_page {
@@ -409,24 +412,44 @@ static int identity(pid_t pid, uint64_t *start)
 	char path[80], *line = NULL, *save, *token, state = 0;
 	size_t size = 0;
 	int ret = -1;
+	uint64_t flags = 0;
 	snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
 	FILE *f = fopen(path, "r");
 	if (!f) return errno == ENOENT || errno == ESRCH ? 0 : -1;
 	if (getline(&line, &size, f) < 0) { if (!ferror(f)) errno = EPROTO; goto out; }
 	char *end = strrchr(line, ')');
 	if (!end || end[1] != ' ') { errno = EPROTO; goto out; }
+	errno = EPROTO;
 	for (int field = 3; (token = strtok_r(field == 3 ? end + 2 : NULL, " \n", &save)); field++) {
 		if (field == 3) state = token[0];
+		if (field == 9) {
+			char *tail;
+			errno = 0; flags = strtoull(token, &tail, 10);
+			if (errno || *tail || *token == '-') { errno = EPROTO; goto out; }
+		}
 		if (field == 22) {
 			char *tail;
 			errno = 0; *start = strtoull(token, &tail, 10);
-			if (!errno && !*tail) ret = state == 'Z' || state == 'X' ? 0 : 1;
+			if (!errno && !*tail && *token != '-')
+				ret = state == 'Z' || state == 'X' || (flags & TASK_EXITING) ? 0 : 1;
 			else errno = EPROTO;
 			break;
 		}
 	}
  out:
+	if (ret < 0 && !errno) errno = EPROTO;
 	fclose(f); free(line); return ret;
+}
+/* Recheck only lifecycle errors, preserving the original diagnostic. A live
+ * target with a new mm (exec), revoked binding or swapoff is still an error.
+ * Never follow a replacement PID or turn an unfinished group into output.
+ */
+static bool target_finished(pid_t pid, uint64_t token)
+{
+	uint64_t current = 0;
+	int saved = errno, alive = identity(pid, &current);
+	errno = saved;
+	return !alive || (alive > 0 && current != token);
 }
 static pid_t launch(char **command)
 {
@@ -489,6 +512,7 @@ int main(int argc, char **argv)
 	uint64_t token = 0, baseline = 0, window = 0;
 	unsigned int rounds = 0;
 	char path[PATH_MAX];
+	bool observing = false;
 	while ((option = getopt_long(argc, argv, "+", options, NULL)) != -1) {
 		long n;
 		switch (option) {
@@ -518,13 +542,17 @@ int main(int argc, char **argv)
 	int alive = identity(c.pid, &token);
 	if (alive < 0) goto fail;
 	if (!alive) { if (child > 0) { ret = 0; goto out; } errno = ESRCH; goto fail; }
+	observing = true;
 	/* Bind after successful exec, then hold the same mm's proc fds throughout. */
 	if (c.publish && publisher_start(&p, c.pid)) goto fail;
 	snprintf(path, sizeof(path), "/proc/%ld/maps", (long)c.pid);
 	maps = fopen(path, "re");
 	snprintf(path, sizeof(path), "/proc/%ld/pagemap", (long)c.pid);
 	pm = open(path, O_RDONLY | O_CLOEXEC);
-	if (!maps || pm < 0) goto fail;
+	if (!maps || pm < 0) {
+		if ((errno == ENOENT || errno == ESRCH) && target_finished(c.pid, token)) { ret = 0; goto out; }
+		goto fail;
+	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	printf("START pid=%ld a_bit_window=%.3f EWMA_window=%u publish=%u\n",
 		(long)c.pid, c.interval, c.window, c.publish);
@@ -564,6 +592,10 @@ int main(int argc, char **argv)
 bad:
 	usage(stderr); return 2;
 fail:
+	if (observing && (errno == ESTALE || errno == ESRCH) && target_finished(c.pid, token)) {
+		ret = 0;
+		goto out;
+	}
 	perror("rswap hotness");
 out:
 	if (p.heat_fd >= 0) close(p.heat_fd);
