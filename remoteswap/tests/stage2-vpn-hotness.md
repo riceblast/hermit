@@ -3,8 +3,9 @@
 2026-11-28，Client **1.18**。第一阶段已完成双节点与真实 BFS 验证，
 见 [Patch 12](patch12-kernel-swap.md)。本文记录第二阶段实现与本地检查；
 初次本地验证后已进行双节点核心和原始 BFS 测试：受控专项通过，
-BFS 完成三次遍历计时和三组 EWMA，但采样器在目标退出时误报 ESTALE，
-因此整轮实机验收尚未通过，现场保留。退出修复及本地验证见文末。
+BFS 完成三次遍历计时和三组 EWMA，但采样器在目标退出时误报 ESTALE。
+退出修复已通过本地验证，用户确认不再复测；保留该次实机记录，随后仅恢复测试环境。
+退出修复及本地验证见文末。
 
 ## 范围与统计口径
 
@@ -191,3 +192,15 @@ PFN 变化会重新建立采样基线，三组 EWMA 也尚未收敛。
 日志和校验值见 [退出修复验证记录](artifacts/stage2-exit-fix-20261128/README.md)。
 本次仅修改用户态采样器和测试工具，无须重编或重载 Client/内核；
 尚未重跑 BFS 或清理保留现场，不能把本地修复验证说成实机复测通过。
+
+用户随后明确确认“不用复测了”，因此不再安排 BFS/负载复跑。
+`stage2_cleanup.py` 仅负责停止已识别的本轮控制器/子进程，关闭测试 swap、卸载 Client，
+恢复原 `/swap.img`、THP、readahead、Hermit 和 cgroup 设置；全部日志保留。
+它通过模块实例、进程父子关系、启动时间与 pidfd 约束清理范围，sudo 由用户执行：
+
+```bash
+sudo /usr/bin/python3 /mnt/sdb3/data/yxr/projects/hermit/remoteswap/tests/stage2_cleanup.py \
+  /tmp/hermit-stage2-core-bfs-20261128
+```
+
+完成后输出 `cleanup.complete.json`，不创建测试 `SUCCESS`，不更改原始失败结论。

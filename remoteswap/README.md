@@ -6,7 +6,10 @@ updates EWMA after nonoverlapping groups (defaults: wait 5 seconds after each sc
 4 rounds per group), and writes only `summary.tsv`. Optional `--publish` sends
 atomic VPN snapshots to the Client for observation; existing placement behavior
 and the old PFN upload ABI remain unchanged. See [stage-2 semantics, commands and
-local checks](tests/stage2-vpn-hotness.md). Stage-2 hardware acceptance is pending.
+local checks](tests/stage2-vpn-hotness.md). Controlled hardware checks passed;
+the real BFS finished three timed rounds and three EWMA updates before an exit
+handling error. The fix passed 156 local checks; the user declined a hardware
+retest. Cleanup restores the original swap and settings without another workload.
 
 The paired kernel exports `rswap_identity_scan_mm` and the two identity
 tracepoints. The stage-1 identity bridge passed dual-node core, lifecycle,
