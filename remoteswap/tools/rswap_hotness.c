@@ -52,8 +52,8 @@ struct totals { uint64_t pages, sum, hot, cold, bins[5]; };
 struct publisher { int identity_fd, heat_fd; uint64_t binding; };
 struct config { pid_t pid; double interval; unsigned int window; const char *out; bool publish, placement; };
 static volatile sig_atomic_t interrupted;
-#define REPORT_PREFIX "%-12s\t%-24s\t%-12s\t%-8s"
-#define REPORT_BIN "\t%-18s"
+#define REPORT_PREFIX "%-12s\t%-12s\t%-12s\t%-8s"
+#define REPORT_BIN "\t%-14s"
 #define REPORT_CLASS "\t%-32s\n"
 
 static int output_header(FILE *out, bool distribution)
