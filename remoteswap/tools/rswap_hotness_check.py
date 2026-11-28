@@ -92,6 +92,12 @@ def _read_vpn_statistics(path, headers, *, limit=None):
                     not 0 <= mean <= 1 or window != len(result) or seconds <= elapsed or
                     (window == 0 and (seconds != 0 or mean != 0)) or (not pages and mean != 0)):
                 raise ValueError('invalid summary identity, sequence or mean')
+            if header == VPN_HEADER and row['hot/cold'] == '-/-':
+                if mean != 0:
+                    raise ValueError('hot/cold placeholder requires zero mean')
+                result.append(row)
+                pid, elapsed = current_pid, seconds
+                continue
             counts = []
             cells = row['hot/cold'].split('/') if header == VPN_HEADER else [row[key] for key in header[4:]]
             if header == VPN_HEADER and len(cells) != 2:

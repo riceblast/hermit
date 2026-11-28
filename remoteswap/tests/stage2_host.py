@@ -232,13 +232,16 @@ class Sampler:
             require(int(row['pages']) == a['pages'], 'Summary/Client pages mismatch')
             mean = a['sum_heat'] / SCALE / a['pages'] if a['pages'] else 0
             require(abs(float(row['mean_hotness']) - mean) <= .000050001, 'Summary/Client mean mismatch')
-            counts = [int(cell.split('(')[0]) for cell in row['hot/cold'].split('/')]
-            require(counts == [a['hot_pages'], a['cold_pages']], 'Summary/Client hot/cold mismatch')
+            if row['hot/cold'] == '-/-':
+                require(a['sum_heat'] == 0, 'Hot/cold placeholder for nonzero exact mean')
+            else:
+                counts = [int(cell.split('(')[0]) for cell in row['hot/cold'].split('/')]
+                require(counts == [a['hot_pages'], a['cold_pages']], 'Summary/Client hot/cold mismatch')
             bins = distribution[i]
             for key, count in zip(list(bins)[4:], a['bins']):
                 require(int(bins[key].split('(')[0]) == count, 'Distribution/wire heat-bin mismatch')
         text = (self.out / 'summary.tsv').read_text().lower()
-        require('unknown' not in text and '\tnan' not in text and '\t-' not in text,
+        require('unknown' not in text and '\tnan' not in text,
                 'Unknown/invalid heat text in new summary')
         require({p.name for p in self.out.iterdir()} == {'summary.tsv', 'hot_distribute.tsv'},
                 'Unexpected production sampler output files')

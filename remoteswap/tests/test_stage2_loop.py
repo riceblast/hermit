@@ -116,7 +116,7 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(len(rows), 3)
             self.assertEqual(len(bins), 3)
             self.assertEqual([r['mean_hotness'] for r in rows], ['0.0000', '0.1000', '0.1800'])
-            self.assertEqual(rows[0]['hot/cold'], '2(100.00%)/0(0.00%)')
+            self.assertEqual(rows[0]['hot/cold'], '-/-')
             self.assertEqual(rows[1]['hot/cold'], '1(50.00%)/1(50.00%)')
             self.assertEqual([r['pages'] for r in rows], ['2','2','2'])
             self.assertEqual(rows[1]['EWMA_window'], '1(84.000s)')

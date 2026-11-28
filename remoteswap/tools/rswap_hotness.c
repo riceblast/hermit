@@ -343,11 +343,13 @@ static int snapshot(FILE *summary, FILE *distribution, pid_t pid, uint64_t windo
 	/* Flush distribution first: a newly visible summary row has its matching
 	 * histogram already available to readers following the live files. */
 	if (fputc('\n', distribution) == EOF || fflush(distribution)) return -1;
-	if (fprintf(summary, "%-8ld\t%-22s\t%-12.4Lf\t%-12" PRIu64 "\t"
-		    "%" PRIu64 "(%.2Lf%%)/%" PRIu64 "(%.2Lf%%)\n",
-		    (long)pid, label, mean, t->pages,
-		    t->hot, t->pages ? (long double)t->hot * 100 / t->pages : 0,
-		    t->cold, t->pages ? (long double)t->cold * 100 / t->pages : 0) < 0) return -1;
+	if (fprintf(summary, "%-8ld\t%-22s\t%-12.4Lf\t%-12" PRIu64 "\t",
+		    (long)pid, label, mean, t->pages) < 0) return -1;
+	if (!t->sum) {
+		if (fputs("-/-\n", summary) == EOF) return -1;
+	} else if (fprintf(summary, "%" PRIu64 "(%.2Lf%%)/%" PRIu64 "(%.2Lf%%)\n",
+			   t->hot, (long double)t->hot * 100 / t->pages,
+			   t->cold, (long double)t->cold * 100 / t->pages) < 0) return -1;
 	return fflush(summary) ? -1 : 0;
 }
 
