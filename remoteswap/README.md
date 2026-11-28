@@ -1,15 +1,21 @@
 # Remoteswap
 
-**Development stage: Client 1.18, stage 2 of VPN-based heat tracking.**
-The sampler retains VPN histories across swap, empty PTEs and address reuse,
-updates EWMA after nonoverlapping groups (defaults: wait 5 seconds after each scan,
-4 rounds per group), and writes only `summary.tsv`. Optional `--publish` sends
-atomic VPN snapshots to the Client for observation; existing placement behavior
-and the old PFN upload ABI remain unchanged. See [stage-2 semantics, commands and
-local checks](tests/stage2-vpn-hotness.md). Controlled hardware checks passed;
-the real BFS finished three timed rounds and three EWMA updates before an exit
-handling error. The fix passed 156 local checks; the user declined a hardware
-retest. Cleanup restores the original swap and settings without another workload.
+**Development stage: Client 1.19, stage 3 of VPN-based placement.**
+`tools/rswap_hotness --placement` enables PMem-first Warmup until five completed
+EWMA groups commit, then DRAM for H >= current mean and PMem otherwise.
+Stores use swap-entry-to-VPN identity and the maximum H across target VPN aliases;
+exact Q32 comparisons include zero heat. Fixed application policies retain priority,
+capacity fallback is unchanged, and Loads follow their existing mappings.
+The sampler still writes only `summary.tsv`. `--publish` remains observation-only;
+without either flag it only samples. See [Patch 14 implementation and local
+validation](tests/patch14-vpn-placement.md). Stage-3 hardware acceptance is pending.
+
+VPN histories persist across swap, empty PTEs and address reuse. EWMA updates use
+nonoverlapping groups (defaults: wait 5 seconds after each scan, 4 rounds per group).
+See [stage-2 semantics](tests/stage2-vpn-hotness.md) and [Patch 13 results](tests/patch13-hotness.md).
+Stage-2 controlled hardware checks passed; real BFS completed three timed rounds
+and three EWMA updates before an exit-handling error. That fix passed local checks;
+the user declined a hardware retest.
 
 The paired kernel exports `rswap_identity_scan_mm` and the two identity
 tracepoints. The stage-1 identity bridge passed dual-node core, lifecycle,
@@ -85,8 +91,9 @@ for interpretation and a minimal connection-only check.
 
 The current independent `tools/rswap_hotness` sampler observes a fixed target mm,
 or launches a target executable, and exports VPN EWMA summary statistics.
-Use the [stage-2 guide](tests/stage2-vpn-hotness.md); the former `--placement`,
-`--pages` and `--raw-logs` options are no longer supported by this sampler.
+Use the [stage-3 guide](tests/patch14-vpn-placement.md) for `--placement` or the
+[stage-2 guide](tests/stage2-vpn-hotness.md) for observation. `--pages` and
+`--raw-logs` remain unsupported by this sampler.
 The disabled-by-default `rswap:store_sample` event and historical offline checker
 remain available for archived PFN logs. The following describes the retained
 legacy PFN placement implementation, which is not activated by `--publish`:
@@ -115,7 +122,7 @@ plan for this version.
 Use the matching Hermit kernel exporting `frontswap_register_managed_ops_v2`.
 The Patch 9 review fix also changes swap-fault error/PTE validation in the kernel:
 its fixed kernel must be deployed before hardware acceptance. The current Client
-already runs the stage-1 #9 build; stage 2 does not change the kernel core.
+already runs the stage-1 #9 build; stages 2 and 3 do not change the kernel core.
 See the [minimal core acceptance and kernel handoff](tests/patch9-core-smoke.md).
 The kernel release string is unchanged, so `uname -r` alone does not identify this build.
 See the [Patch 3 summary](tests/patch3_summary.md) for changes and verification limits.

@@ -308,18 +308,25 @@ static int rswap_rdma_submit_active(int cpu, pgoff_t offset, struct page *page,
 			trace_app_decision((u64)offset, page_to_pfn(page), &app, &location, ret);
 			if (!ret)
 				trace_decision(page_to_pfn(page), RSWAP_INACTIVE,
-					app.policy, app.tier, &location);
+					app.policy, app.tier, &location, NULL);
 		} else {
-			ret = rswap_placement_choose(offset, page_to_pfn(page), &decision);
+			ret = rswap_vpn_placement_choose(READ_ONCE(area_type), offset, &pool_layout, &decision);
+			if (!ret)
+				ret = rswap_placement_choose(offset, page_to_pfn(page), &decision);
+			else if (ret > 0)
+				ret = 0;
 			if (!ret) {
 				ret = rswap_mapping_alloc_preferred(offset, decision.server,
 					decision.tier, &location);
 				rswap_policy_record_alloc(&decision, &location, ret);
 				/* Decision does not imply post acceptance or WC success. */
-				trace_decision_raw((u64)offset, page_to_pfn(page), &decision, &location, ret);
+				if (decision.vpn_policy)
+					trace_vpn_decision((u64)offset, page_to_pfn(page), &decision, &location, ret);
+				else
+					trace_decision_raw((u64)offset, page_to_pfn(page), &decision, &location, ret);
 				if (!ret)
 					trace_decision(page_to_pfn(page), decision.state,
-						0, decision.tier, &location);
+						0, decision.tier, &location, decision.vpn_policy ? &decision : NULL);
 			}
 		}
 	} else {

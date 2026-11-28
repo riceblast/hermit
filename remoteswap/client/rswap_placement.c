@@ -12,6 +12,7 @@
 #include <linux/vmalloc.h>
 
 #include "rswap_placement.h"
+#include "rswap_vpn_heat.h"
 
 struct rswap_heat_snapshot {
 	u64 generation, publish_ns, count, known;
@@ -42,6 +43,30 @@ static struct rswap_uploader *policy_owner;
 static struct rswap_pool_layout policy_layout;
 static u64 policy_next_id;
 static bool policy_area;
+static u64 vpn_policy_binding;
+
+int rswap_policy_claim_vpn(u64 binding_id)
+{
+	int ret = 0;
+
+	mutex_lock(&policy_mutex);
+	if (!policy_area)
+		ret = -ENODEV;
+	else if (rcu_access_pointer(policy_run) || vpn_policy_binding)
+		ret = -EBUSY;
+	else
+		vpn_policy_binding = binding_id;
+	mutex_unlock(&policy_mutex);
+	return ret;
+}
+
+void rswap_policy_release_vpn(u64 binding_id)
+{
+	mutex_lock(&policy_mutex);
+	if (vpn_policy_binding == binding_id)
+		vpn_policy_binding = 0;
+	mutex_unlock(&policy_mutex);
+}
 
 /* Module-lifetime counters, deliberately independent of run/snapshot storage.
  * Stop may retire a run before an old Store WC arrives. Never retain its pointer.
@@ -305,7 +330,7 @@ static int rswap_upload_start(struct rswap_uploader *u,
 		return -EINVAL;
 	if (!policy_area)
 		return -ENODEV;
-	if (rcu_access_pointer(policy_run))
+	if (rcu_access_pointer(policy_run) || vpn_policy_binding)
 		return -EBUSY;
 	/* One run per fd: delayed commands on an old descriptor can never join a
 	 * later Start, even if another thread retained that descriptor.
@@ -493,6 +518,9 @@ static ssize_t rswap_control_write(struct file *file, const char __user *buf,
 	if (copy_from_user(command, buf, len))
 		return -EFAULT;
 	command[len] = 0;
+	/* VPN writer order is vpn_heat_mutex -> policy_mutex. Never reverse it. */
+	if (sysfs_streq(command, "stop"))
+		rswap_vpn_placement_stop();
 	mutex_lock(&policy_mutex);
 	run = rcu_dereference_protected(policy_run, 1);
 	if (sysfs_streq(command, "stop")) {
@@ -532,6 +560,8 @@ static int rswap_policy_show_common(struct seq_file *m, void *unused, bool raw)
 	struct rswap_heat_snapshot *snap;
 	u64 now = ktime_get_ns();
 	static const char *const states[] = { "inactive", "warmup", "adaptive" };
+	if (rswap_vpn_placement_show(m, raw))
+		return 0;
 
 	mutex_lock(&policy_mutex);
 	run = rcu_dereference_protected(policy_run, 1);

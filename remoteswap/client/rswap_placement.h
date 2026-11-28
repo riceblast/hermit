@@ -21,6 +21,9 @@ struct rswap_decision {
 	u64 threshold_generation;
 	unsigned int policy, threshold_source, threshold_status;
 	unsigned int state, reason, server, tier;
+	/* VPN decisions keep exact Q32 inputs, independent of legacy ppm fields. */
+	bool vpn_policy;
+	u64 binding_id, vpn, aliases, heat_q32, pages, sum_heat;
 };
 
 struct dentry;
@@ -34,5 +37,8 @@ void rswap_policy_record_alloc(const struct rswap_decision *d,
 		const struct rswap_location *loc, int status);
 void rswap_policy_record_submit(unsigned int reason, int status);
 void rswap_policy_record_wc(unsigned int reason, int status);
+/* Serializes exclusive legacy/VPN policy ownership. Called in writer context. */
+int rswap_policy_claim_vpn(u64 binding_id);
+void rswap_policy_release_vpn(u64 binding_id);
 
 #endif

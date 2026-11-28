@@ -162,6 +162,41 @@ bool rswap_identity_binding_valid(u64 binding_id)
 	return valid;
 }
 
+int rswap_identity_visit(unsigned int type, u64 offset, u64 expected_binding,
+		void (*visit)(void *arg, u64 vpn), void *arg,
+		struct rswap_identity_result *result)
+{
+	struct rswap_identity_context *c;
+	struct rswap_vpn_link *p;
+	unsigned long flags;
+	int ret = -ENOENT;
+
+	memset(result, 0, sizeof(*result));
+	if (offset >= identity_max_pages)
+		return -ERANGE;
+	rcu_read_lock();
+	c = rcu_dereference(identity_target);
+	if (!c || c->id != expected_binding || c->type != type ||
+	    !rswap_identity_binding_valid(expected_binding))
+		goto out;
+	xa_lock_irqsave(&c->entries, flags);
+	for (p = xa_load(&c->entries, (unsigned long)offset); p; p = p->next) {
+		visit(arg, p->vpn);
+		if (!result->aliases || p->vpn < result->vpn)
+			result->vpn = p->vpn;
+		result->aliases++;
+	}
+	if (result->aliases) {
+		result->binding_id = c->id;
+		result->pid = c->pid;
+		ret = 0;
+	}
+	xa_unlock_irqrestore(&c->entries, flags);
+out:
+	rcu_read_unlock();
+	return ret;
+}
+
 /* identity_mutex held. Stop publishing first; free only after every probe and
  * lookup has copied its result. No mmap_lock is held during the RCU wait.
  */

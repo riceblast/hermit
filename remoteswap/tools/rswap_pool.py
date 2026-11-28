@@ -134,6 +134,7 @@ def policy_summary(counts):
     return dict(reasons=reasons, decisions=sum(r['decisions'] for r in reasons.values()),
                 adaptive_decisions=adaptive, known_decisions=known, classified_decisions=classified,
                 positive_heat_coverage=(classified/adaptive if adaptive else None) if ('reason', 7) in counts else None,
+                classified_heat_coverage=classified/adaptive if adaptive else None,
                 adaptive_heat_coverage=known/adaptive if adaptive else None,
                 available_snapshot_pfn_hit_ratio=known/lookup if lookup else None,
                 pools={str(s)+'/'+TIERS[t]: dict(preferred=v[0], allocated=v[1])
@@ -172,6 +173,10 @@ def display_state(state):
 
 def status(raw):
     b = parse_bundle(raw)
+    choices = policy_summary(b['policy']['counters'])
+    if b['state'].get('source') == 'vpn':
+        choices['positive_heat_coverage'] = None  # zero H is a valid hot/cold input
+        choices['available_snapshot_pfn_hit_ratio'] = None
     topology = {}
     for s in range(b['policy']['header']['nr_servers']):
         dram = b['pools'][s, 'dram']['capacity']
@@ -184,7 +189,7 @@ def status(raw):
                 capacity_bytes=sum(p['capacity'] for p in b['pools'].values()) * b['stats'].page_size,
                 io_counts={str(s)+'/'+t+'/'+op: dict(zip(('ok','wc_error','submit_error'), v))
                            for (s,t,op),v in b['stats'].rows.items()},
-                policy=policy_summary(b['policy']['counters']),
+                policy=choices,
                 note='Module cumulative counters; used=live+retired, not exact Frontswap valid pages.')
 
 
@@ -194,7 +199,10 @@ def window(first, last):
     choices = policy_summary(counter_delta(a['policy'], b['policy']))
     wc = {str(s)+'/'+t+'/'+op: b['stats'].rows[s, t, op][0]-value[0]
           for (s, t, op), value in a['stats'].rows.items()}
-    stable = all(a['state'].get(k) == b['state'].get(k) for k in ('state', 'run_id'))
+    stable = all(a['state'].get(k) == b['state'].get(k) for k in ('state', 'run_id', 'source'))
+    if a['state'].get('source') == 'vpn' or b['state'].get('source') == 'vpn':
+        choices['positive_heat_coverage'] = None
+        choices['available_snapshot_pfn_hit_ratio'] = None
     return dict(instance_ns=a['stats'].instance_ns, seconds=seconds,
                 endpoint_state=a['state']['state'] if stable else 'mixed', policy=choices,
                 current=status(last),

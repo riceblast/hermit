@@ -14,6 +14,10 @@ EXTRA = r'''
 #define U32_MAX UINT32_MAX
 #define RCU_INIT_POINTER(p,v) rcu_assign_pointer(p,v)
 #include "rswap_vpn_heat.h"
+#include "rswap_placement.h"
+/* Observer-only fixture. Real placement integration is tested by stage 3. */
+int rswap_policy_claim_vpn(u64 binding) { return -EOPNOTSUPP; }
+void rswap_policy_release_vpn(u64 binding) {}
 '''
 BRIDGE = r'''
 static ssize_t sampler_write(int,const void *,size_t);

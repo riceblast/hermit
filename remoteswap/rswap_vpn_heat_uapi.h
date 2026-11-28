@@ -11,10 +11,13 @@
 enum rswap_vpn_heat_op {
 	RSWAP_VPN_HEAT_BIND = 1, RSWAP_VPN_HEAT_BEGIN,
 	RSWAP_VPN_HEAT_DATA, RSWAP_VPN_HEAT_COMMIT, RSWAP_VPN_HEAT_QUERY,
+	RSWAP_VPN_HEAT_BIND_POLICY, /* opt in to VPN Store placement, otherwise BIND */
 };
 
 /* Native-endian local ABI; one complete command per write.
- * BIND: binding_id from the held identity fd; other values zero.
+ * BIND/BIND_POLICY: binding_id from the held identity fd; other values zero.
+ * BIND_POLICY additionally enables placement: baseline 0, then consecutive
+ * completed groups; Adaptive begins at committed window 5. BIND observes only.
  * BEGIN: window is the completed EWMA group (zero is the initial baseline),
  * count is retained VPN histories, pages/sum_heat cover only in-scope records.
  * DATA: count records immediately follow; only binding_id/window/count set.

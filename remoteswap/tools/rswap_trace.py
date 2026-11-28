@@ -186,6 +186,57 @@ def check_dynamic_trace(lines, layout, require_empty=False, decisions=None):
                                  require_empty, decisions)
 
 
+def vpn_decision(line, layout, tickets):
+    """Validate exact Q32 inputs and preferences, including all-zero equality."""
+    keys = {'version','alloc_seq','offset','pfn','binding','vpn','aliases','window','publish_ns',
+            'decision_ns','heat_q32','pages','sum_heat','rr','state','reason','preferred_server',
+            'preferred_tier','server','tier','slot','fallback','alloc_ret'}
+    fields = line.split('vpn_decision:', 1)[1].split()
+    if len(fields) != len(keys) or any(not re.fullmatch(r'\w+=-?\d+', f) for f in fields):
+        raise ValueError('malformed VPN decision')
+    d = {k:int(v) for k,v in (f.split('=',1) for f in fields)}
+    scale = 1 << 32
+    if (set(d) != keys or any(v < 0 for k,v in d.items() if k != 'alloc_ret') or
+            d['version'] != 1 or d['alloc_ret'] > 0 or not d['pfn'] or not d['decision_ns'] or
+            d['publish_ns'] > d['decision_ns'] or d['heat_q32'] > scale or
+            d['pages'] > (1 << 32)-1 or d['sum_heat'] > d['pages']*scale):
+        raise ValueError('invalid VPN decision inputs')
+    target = bool(d['aliases'])
+    if target:
+        if not d['binding'] or (d['window'] and not d['publish_ns']):
+            raise ValueError('invalid VPN binding/window')
+        if not d['publish_ns'] and any(d[k] for k in ('heat_q32','pages','sum_heat')):
+            raise ValueError('VPN heat without a committed snapshot')
+        state = 2 if d['window'] >= 5 else 1
+        hot = d['heat_q32']*d['pages'] >= d['sum_heat']
+        reason = (5 if hot else 6) if state == 2 else 1
+        tier = 0 if state == 2 and hot else 1
+        expected = d['rr'] % len(layout), tier
+        if (d['state'], d['reason']) != (state, reason):
+            raise ValueError('VPN phase or exact heat comparison mismatch')
+        ticket = 'vpn', d['binding'], tier, d['rr']
+        if ticket in tickets:
+            raise ValueError('duplicate VPN RR ticket')
+        tickets.add(ticket)
+    else:
+        if any(d[k] for k in ('binding','vpn','window','publish_ns','heat_q32','pages','sum_heat','rr','state','reason')):
+            raise ValueError('non-target VPN decision consumed heat or RR')
+        server,tier = expected_location(layout,d['offset'])
+        expected = server, TIERS.index(tier)
+    if (d['preferred_server'],d['preferred_tier']) != expected:
+        raise ValueError('wrong VPN preference')
+    expected_location(layout,d['offset'])
+    if d['alloc_ret']:
+        if d['alloc_seq'] or d['fallback']:
+            raise ValueError('failed VPN allocation has a mapping identity')
+    elif (not d['alloc_seq'] or d['server'] >= len(layout) or d['tier'] not in (0,1) or
+          d['slot'] >= layout[d['server']][d['tier']]*GIB_PAGES or d['fallback'] not in range(4) or
+          (d['server'],d['tier']) != (expected[0] ^ (d['fallback'] & 1), expected[1] ^ (d['fallback'] >> 1))):
+        raise ValueError('invalid VPN allocation/fallback')
+    d.update(placement_rule=2,run=d['binding'],generation=d['window'])
+    return d
+
+
 def read_decisions(lines, layout, summary=None):
     """Short-window policy checks; successful records join allocator sequence IDs.
 
@@ -199,6 +250,20 @@ def read_decisions(lines, layout, summary=None):
     for number, line in enumerate(lines, 1):
         if "LOST" in line and "EVENT" in line:
             raise ValueError("ftrace reports lost events")
+        if 'vpn_decision:' in line:
+            d = vpn_decision(line,layout,tickets)
+            if summary is not None:
+                summary['decisions'] += 1
+                summary['vpn_decisions'] += 1
+                summary['reason_'+str(d['reason'])] += 1
+                summary['allocation_error' if d['alloc_ret'] else 'allocation_ok'] += 1
+                if not d['alloc_ret']:
+                    summary['fallback_'+str(d['fallback'])] += 1
+            if not d['alloc_ret']:
+                if d['alloc_seq'] in result:
+                    raise ValueError('duplicate decision identity')
+                result[d['alloc_seq']] = d
+            continue
         if "decision_raw:" in line:
             payload = line.split("decision_raw:", 1)[1].split()
         elif "decision:" in line:
@@ -294,7 +359,7 @@ def read_decisions(lines, layout, summary=None):
             raise ValueError("missing/duplicate decision identity")
         result[d["alloc_seq"]] = d
     if not result:
-        raise ValueError("no detailed allocation decisions; enable rswap:decision_raw for full validation")
+        raise ValueError("no detailed allocation decisions; enable rswap:decision_raw or rswap:vpn_decision for full validation")
     return result
 
 
@@ -336,8 +401,13 @@ def main():
             report['decisions'] = dict(summary)
             from rswap_analysis import check_heat, check_store_results, hotness_summary
             if args.heat_dir:
-                report['heat'] = check_heat(decisions, args.heat_dir, args.detail)
                 report['sampling'] = hotness_summary(args.heat_dir)
+                if any(d.get('placement_rule') == 2 for d in decisions.values()):
+                    if args.detail:
+                        raise ValueError('VPN summary has no per-page PFN detail')
+                    report['heat'] = {'basis':'vpn','note':'Exact recorded comparison checked; summary cannot certify per-page snapshot contents.'}
+                else:
+                    report['heat'] = check_heat(decisions, args.heat_dir, args.detail)
             if args.store_results:
                 with args.trace.open() as stream:
                     report['store_results'] = check_store_results(stream, decisions)

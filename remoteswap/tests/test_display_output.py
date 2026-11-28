@@ -182,7 +182,7 @@ int main(void) {
 static int displayed, app_detailed;
 static char last_text[192];
 static void trace_decision(u64 pfn,unsigned int state,unsigned int app_policy,
-                          unsigned int preferred_tier,const struct rswap_location *loc) {
+                          unsigned int preferred_tier,const struct rswap_location *loc, const struct rswap_decision *vpn) {
     assert(app_policy>=1 && app_policy<=2 && preferred_tier==app_policy-1);
     rswap_format_decision(last_text,sizeof(last_text),pfn,state,app_policy,preferred_tier,loc);
     displayed++;
@@ -255,7 +255,7 @@ int main(void) {
         code = code.replace(definition(code,'trace_decision'), '''
 static int displayed, detailed;
 static void trace_decision(u64 pfn,unsigned int state,unsigned int app_policy,
-                          unsigned int preferred_tier,const struct rswap_location *loc) {
+                          unsigned int preferred_tier,const struct rswap_location *loc, const struct rswap_decision *vpn) {
     displayed++;
 }
 ''')

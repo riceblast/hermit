@@ -115,7 +115,10 @@ static struct dentry *debugfs_create_file(const char *name, int mode, struct den
 
 def production():
     source = (ROOT / "client/rswap_placement.c").read_text()
-    return '#include "rswap_placement.h"\n' + "\n".join(
+    return ('#include "rswap_placement.h"\n#include "rswap_vpn_heat.h"\n'
+            '/* Legacy PFN fixture: VPN policy is disabled; stage-3 tests use both real modules. */\n'
+            'void rswap_vpn_placement_stop(void) {}\n'
+            'bool rswap_vpn_placement_show(struct seq_file *m, bool raw) { return false; }\n') + "\n".join(
         line for line in source.splitlines() if not line.startswith("#include"))
 
 

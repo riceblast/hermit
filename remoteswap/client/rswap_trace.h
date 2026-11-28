@@ -8,6 +8,7 @@
 #include <linux/tracepoint.h>
 #include "rswap_placement.h"
 #include "rswap_app.h"
+#include "../rswap_vpn_heat_uapi.h"
 
 /* Detailed fixed-policy evidence remains independent of the adaptive raw
  * format. Both policies also use the shared human-readable decision event.
@@ -84,6 +85,34 @@ static inline void rswap_format_decision(char *buf, size_t size, u64 pfn,
 		"req_type: store, pfn: 0x%llx, placement_policy: %s, reason: %s, server: %u, target_mem: %s,",
 		(unsigned long long)pfn, policy, reason, loc->server, tier);
 }
+
+static inline void rswap_format_vpn_decision(char *buf, size_t size, u64 pfn,
+		const struct rswap_decision *d, const struct rswap_location *loc)
+{
+	u64 heat = (d->heat_q32 * 100 + RSWAP_VPN_HEAT_SCALE / 2) / RSWAP_VPN_HEAT_SCALE;
+	u64 mean = d->pages ? ((d->sum_heat / d->pages) * 100 +
+		RSWAP_VPN_HEAT_SCALE / 2) / RSWAP_VPN_HEAT_SCALE : 0;
+	char reason[96];
+	bool fallback = loc->server != d->server || loc->tier != d->tier;
+
+	if (d->state == RSWAP_INACTIVE) {
+		rswap_format_decision(buf, size, pfn, RSWAP_INACTIVE, 0, d->tier, loc);
+		return;
+	}
+	if (d->state == RSWAP_WARMUP)
+		scnprintf(reason, sizeof(reason), "warmup%s", fallback ? "; capacity_fallback" : "");
+	else
+		scnprintf(reason, sizeof(reason), "%s(%llu.%02llu %s %llu.%02llu)%s",
+			d->reason == RSWAP_REASON_HOT ? "hot" : "cold",
+			(unsigned long long)(heat / 100), (unsigned long long)(heat % 100),
+			d->reason == RSWAP_REASON_HOT ? ">=" : "<",
+			(unsigned long long)(mean / 100), (unsigned long long)(mean % 100),
+			fallback ? "; capacity_fallback" : "");
+	scnprintf(buf, size,
+		"req_type: store, pfn: 0x%llx, placement_policy: %s, reason: %s, server: %u, target_mem: %s,",
+		(unsigned long long)pfn, d->state == RSWAP_WARMUP ? "adaptive(warmup)" : "adaptive",
+		reason, loc->server, loc->tier == RSWAP_TIER_DRAM ? "dram" : "pmem");
+}
 #endif
 
 /* Display only: successful Store allocation, not post/WC success. Never Load.
@@ -92,12 +121,54 @@ static inline void rswap_format_decision(char *buf, size_t size, u64 pfn,
  */
 TRACE_EVENT(decision,
 	TP_PROTO(u64 pfn, unsigned int state, unsigned int app_policy,
-		 unsigned int preferred_tier, const struct rswap_location *loc),
-	TP_ARGS(pfn, state, app_policy, preferred_tier, loc),
-	TP_STRUCT__entry(__array(char, text, 192)),
-	TP_fast_assign(rswap_format_decision(__entry->text, sizeof(__entry->text),
-		pfn, state, app_policy, preferred_tier, loc);),
+		 unsigned int preferred_tier, const struct rswap_location *loc,
+		 const struct rswap_decision *vpn),
+	TP_ARGS(pfn, state, app_policy, preferred_tier, loc, vpn),
+	TP_STRUCT__entry(__array(char, text, 256)),
+	TP_fast_assign(
+		if (vpn)
+			rswap_format_vpn_decision(__entry->text, sizeof(__entry->text), pfn, vpn, loc);
+		else
+			rswap_format_decision(__entry->text, sizeof(__entry->text),
+				pfn, state, app_policy, preferred_tier, loc);
+	),
 	TP_printk("%s", __entry->text)
+);
+
+/* Exact VPN evidence. Never interpret Q32 decisions as rounded legacy ppm. */
+TRACE_EVENT(vpn_decision,
+	TP_PROTO(u64 offset, u64 pfn, const struct rswap_decision *d,
+		 const struct rswap_location *loc, int ret),
+	TP_ARGS(offset, pfn, d, loc, ret),
+	TP_STRUCT__entry(
+		__field(u64, offset) __field(u64, pfn) __field(u64, alloc_seq)
+		__field(u64, binding) __field(u64, vpn) __field(u64, aliases)
+		__field(u64, window) __field(u64, publish_ns) __field(u64, decision_ns)
+		__field(u64, heat_q32) __field(u64, pages) __field(u64, sum_heat) __field(u64, rr)
+		__field(unsigned int, state) __field(unsigned int, reason)
+		__field(unsigned int, preferred_server) __field(unsigned int, preferred_tier)
+		__field(unsigned int, server) __field(unsigned int, tier)
+		__field(u64, slot) __field(unsigned int, fallback) __field(int, ret)
+	),
+	TP_fast_assign(
+		__entry->offset = offset; __entry->pfn = pfn;
+		__entry->alloc_seq = ret ? 0 : loc->alloc_seq;
+		__entry->binding = d->binding_id; __entry->vpn = d->vpn; __entry->aliases = d->aliases;
+		__entry->window = d->generation; __entry->publish_ns = d->publish_ns;
+		__entry->decision_ns = d->decision_ns; __entry->heat_q32 = d->heat_q32;
+		__entry->pages = d->pages; __entry->sum_heat = d->sum_heat; __entry->rr = d->rr;
+		__entry->state = d->state; __entry->reason = d->reason;
+		__entry->preferred_server = d->server; __entry->preferred_tier = d->tier;
+		__entry->server = loc->server; __entry->tier = loc->tier; __entry->slot = loc->slot;
+		__entry->fallback = ret ? 0 : (loc->server ^ d->server) + 2 * (loc->tier ^ d->tier);
+		__entry->ret = ret;
+	),
+	TP_printk("version=1 alloc_seq=%llu offset=%llu pfn=%llu binding=%llu vpn=%llu aliases=%llu window=%llu publish_ns=%llu decision_ns=%llu heat_q32=%llu pages=%llu sum_heat=%llu rr=%llu state=%u reason=%u preferred_server=%u preferred_tier=%u server=%u tier=%u slot=%llu fallback=%u alloc_ret=%d",
+		__entry->alloc_seq, __entry->offset, __entry->pfn, __entry->binding, __entry->vpn, __entry->aliases,
+		__entry->window, __entry->publish_ns, __entry->decision_ns, __entry->heat_q32,
+		__entry->pages, __entry->sum_heat, __entry->rr, __entry->state, __entry->reason,
+		__entry->preferred_server, __entry->preferred_tier, __entry->server, __entry->tier,
+		__entry->slot, __entry->fallback, __entry->ret)
 );
 
 /* Emitted immediately after the allocation attempt. alloc_seq joins the

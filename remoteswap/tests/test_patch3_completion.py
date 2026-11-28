@@ -55,6 +55,8 @@ typedef atomic_llong atomic64_t;
 #include "rswap_app.h"
 #define rswap_identity_area(active, type) ((void)0)
 #define rswap_vpn_heat_area(active) ((void)0)
+#define rswap_vpn_placement_choose(...) 0
+#define trace_vpn_decision(...) ((void)0)
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 4096ULL
 #define CHUNK_SHIFT 33
@@ -197,7 +199,7 @@ void rswap_policy_record_wc(unsigned int reason, int status) {}
 static void trace_store_result(u64 seq, u64 offset, unsigned int s, unsigned int t,
                                unsigned int stage, int status) {}
 static void trace_decision(u64 pfn, unsigned int state, unsigned int app_policy,
-                          unsigned int preferred_tier, const struct rswap_location *loc) {}
+                          unsigned int preferred_tier, const struct rswap_location *loc, const struct rswap_decision *vpn) {}
 static void trace_decision_raw(u64 offset, u64 pfn, const struct rswap_decision *d,
                               const struct rswap_location *loc, int ret) {}
 static unsigned int active_servers = 2, area_type;

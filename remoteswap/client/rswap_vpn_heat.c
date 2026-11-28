@@ -7,11 +7,13 @@
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
+#include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
 #include "rswap_identity.h"
 #include "rswap_vpn_heat.h"
+#include "rswap_placement.h"
 
 struct vpn_snapshot {
 	u64 window, publish_ns, count, pages, sum_heat;
@@ -21,6 +23,9 @@ struct vpn_snapshot {
 struct vpn_uploader {
 	u64 binding_id, received, received_pages, received_sum, query_vpn;
 	bool used, queried;
+	bool placement;
+	u64 start_ns;
+	atomic64_t rr[RSWAP_NR_TIERS];
 	struct vpn_snapshot __rcu *snapshot;
 	struct vpn_snapshot *staging;
 };
@@ -37,6 +42,10 @@ static void vpn_retire(void)
 
 	if (!u)
 		return;
+	if (u->placement) {
+		WRITE_ONCE(u->placement, false);
+		rswap_policy_release_vpn(u->binding_id);
+	}
 	rcu_assign_pointer(vpn_heat_owner, NULL);
 	synchronize_rcu();
 	s = rcu_dereference_protected(u->snapshot, 1);
@@ -44,6 +53,149 @@ static void vpn_retire(void)
 	kvfree(s);
 	kvfree(u->staging);
 	u->staging = NULL;
+}
+
+static u64 vpn_heat_at(const struct vpn_snapshot *s, u64 vpn)
+{
+	u64 lo = 0, hi = s ? s->count : 0;
+
+	while (lo < hi) {
+		u64 mid = lo + (hi - lo) / 2;
+		const struct rswap_vpn_heat_record *r = &s->records[mid];
+
+		if (r->vpn < vpn)
+			lo = mid + 1;
+		else if (r->vpn > vpn)
+			hi = mid;
+		else
+			return r->heat;
+	}
+	return 0;
+}
+
+struct vpn_reduction {
+	const struct vpn_snapshot *snapshot;
+	u64 heat, vpn;
+	bool seen;
+};
+
+/* Identity entry lock held. Only binary searches in one immutable snapshot. */
+static void vpn_max_alias(void *arg, u64 vpn)
+{
+	struct vpn_reduction *r = arg;
+	u64 heat = vpn_heat_at(r->snapshot, vpn);
+
+	if (!r->seen || heat > r->heat || (heat == r->heat && vpn < r->vpn)) {
+		r->seen = true;
+		r->heat = heat;
+		r->vpn = vpn;
+	}
+}
+
+int rswap_vpn_placement_choose(unsigned int type, __u64 offset,
+		const struct rswap_pool_layout *layout, struct rswap_decision *d)
+{
+	struct vpn_uploader *u;
+	struct vpn_snapshot *s;
+	struct rswap_identity_result id;
+	struct vpn_reduction reduction = {};
+	u64 ignored;
+	int ret = 0;
+
+	rcu_read_lock();
+	u = rcu_dereference(vpn_heat_owner);
+	if (!u || !READ_ONCE(u->placement))
+		goto out;
+	memset(d, 0, sizeof(*d));
+	d->vpn_policy = true;
+	d->decision_ns = ktime_get_ns();
+	ret = rswap_map_page(layout, offset, &d->server, &d->tier, &ignored);
+	if (ret)
+		goto out;
+	ret = 1;
+	/* Unmatched/invalid bindings keep normal Interleave. They are not cold
+	 * target pages and must never fall through to legacy PFN unknown rules. */
+	if (!rswap_identity_binding_valid(u->binding_id))
+		goto out;
+	s = rcu_dereference(u->snapshot);
+	reduction.snapshot = s;
+	if (rswap_identity_visit(type, offset, u->binding_id, vpn_max_alias, &reduction, &id))
+		goto out;
+	d->run_id = d->binding_id = id.binding_id;
+	d->vpn = reduction.vpn;
+	d->aliases = id.aliases;
+	d->heat_q32 = reduction.heat;
+	d->generation = s ? s->window : 0;
+	d->publish_ns = s ? s->publish_ns : 0;
+	d->decision_ns = ktime_get_ns();
+	d->pages = s ? s->pages : 0;
+	d->sum_heat = s ? s->sum_heat : 0;
+	d->state = s && s->window >= 5 ? RSWAP_ADAPTIVE : RSWAP_WARMUP;
+	d->reason = RSWAP_REASON_WARMUP;
+	d->tier = RSWAP_TIER_PMEM;
+	if (d->state == RSWAP_ADAPTIVE) {
+		/* BEGIN bounds pages to U32_MAX, so this Q32 product fits u64.
+		 * Empty population has mean=0, consistent with summary.tsv. */
+		bool hot = d->heat_q32 * d->pages >= d->sum_heat;
+
+		d->reason = hot ? RSWAP_REASON_HOT : RSWAP_REASON_COLD;
+		d->tier = hot ? RSWAP_TIER_DRAM : RSWAP_TIER_PMEM;
+	}
+	d->rr = (u64)atomic64_inc_return(&u->rr[d->tier]) - 1;
+	d->server = d->rr % layout->nr_servers;
+out:
+	rcu_read_unlock();
+	return ret;
+}
+
+void rswap_vpn_placement_stop(void)
+{
+	struct vpn_uploader *u;
+
+	mutex_lock(&vpn_heat_mutex);
+	u = rcu_dereference_protected(vpn_heat_owner, 1);
+	if (u && u->placement) {
+		WRITE_ONCE(u->placement, false);
+		rswap_policy_release_vpn(u->binding_id);
+	}
+	mutex_unlock(&vpn_heat_mutex);
+}
+
+bool rswap_vpn_placement_show(struct seq_file *m, bool raw)
+{
+	struct vpn_uploader *u;
+	struct vpn_snapshot *s;
+	u64 now, pages, sum, mean;
+	bool shown = false;
+
+	mutex_lock(&vpn_heat_mutex);
+	u = rcu_dereference_protected(vpn_heat_owner, 1);
+	if (!u || !u->placement || !rswap_identity_binding_valid(u->binding_id))
+		goto out;
+	s = rcu_dereference_protected(u->snapshot, 1);
+	now = ktime_get_ns();
+	pages = s ? s->pages : 0;
+	sum = s ? s->sum_heat : 0;
+	/* This human/status ppm value is never used in a Store comparison. */
+	mean = pages ? (sum / pages) * 1000000 / RSWAP_VPN_HEAT_SCALE : 0;
+	seq_printf(m, "version=%u state=%s area_active=1 sample_ns=%llu placement_rule=2 source=vpn\n",
+		raw ? 1 : 2, s && s->window >= 5 ? "adaptive" : "warmup", now);
+	seq_printf(m, "run_id=%llu binding_id=%llu start_ns=%llu warmup_windows=5 completed_windows=%llu\n",
+		u->binding_id, u->binding_id, u->start_ns, s ? s->window : 0);
+	seq_printf(m, "generation=%llu publish_ns=%llu age_ns=%llu records=%llu known=%llu pages=%llu sum_heat=%llu ",
+		s ? s->window : 0, s ? s->publish_ns : 0, s ? now - s->publish_ns : 0,
+		s ? s->count : 0, pages, pages, sum);
+	if (raw)
+		seq_printf(m, "mean_ppm=%llu\n", mean);
+	else {
+		u64 hundredths = pages ? ((sum / pages) * 100 + RSWAP_VPN_HEAT_SCALE / 2) / RSWAP_VPN_HEAT_SCALE : 0;
+
+		seq_printf(m, "mean=%llu.%02llu\n", hundredths / 100, hundredths % 100);
+	}
+	shown = true;
+out:
+	mutex_unlock(&vpn_heat_mutex);
+	return shown;
 }
 
 void rswap_vpn_heat_area(bool active)
@@ -139,7 +291,7 @@ static int vpn_command(struct vpn_uploader *u,
 		return -ENODEV;
 	if (!cmd->binding_id || !rswap_identity_binding_valid(cmd->binding_id))
 		return -ESTALE;
-	if (cmd->op == RSWAP_VPN_HEAT_BIND) {
+	if (cmd->op == RSWAP_VPN_HEAT_BIND || cmd->op == RSWAP_VPN_HEAT_BIND_POLICY) {
 		if (cmd->window || cmd->count || cmd->pages || cmd->sum_heat || cmd->vpn)
 			return -EINVAL;
 		if (u->used)
@@ -150,6 +302,16 @@ static int vpn_command(struct vpn_uploader *u,
 		}
 		if (owner)
 			return -EBUSY;
+		if (cmd->op == RSWAP_VPN_HEAT_BIND_POLICY) {
+			int ret = rswap_policy_claim_vpn(cmd->binding_id);
+
+			if (ret)
+				return ret;
+			u->placement = true;
+			u->start_ns = ktime_get_ns();
+			atomic64_set(&u->rr[0], 0);
+			atomic64_set(&u->rr[1], 0);
+		}
 		u->binding_id = cmd->binding_id;
 		u->used = true;
 		rcu_assign_pointer(vpn_heat_owner, u);
@@ -172,6 +334,8 @@ static int vpn_command(struct vpn_uploader *u,
 	if (cmd->op == RSWAP_VPN_HEAT_BEGIN) {
 		if (u->staging)
 			return -EBUSY;
+		if (u->placement && cmd->window != (old ? old->window + 1 : 0))
+			return -EINVAL;
 		/* Q32 heat sums fit u64 for at most U32_MAX current pages. */
 		if (cmd->pages > U32_MAX || cmd->pages > cmd->count ||
 		    cmd->count > (SIZE_MAX - sizeof(*s)) / sizeof(s->records[0]) ||
@@ -244,7 +408,7 @@ static ssize_t vpn_write(struct file *file, const char __user *buf,
 		goto out;
 	ret = -EINVAL;
 	if (cmd.version != RSWAP_VPN_HEAT_VERSION || cmd.op < RSWAP_VPN_HEAT_BIND ||
-	    cmd.op > RSWAP_VPN_HEAT_QUERY)
+	    cmd.op > RSWAP_VPN_HEAT_BIND_POLICY)
 		goto out;
 	if (cmd.op == RSWAP_VPN_HEAT_DATA) {
 		if (!cmd.count || cmd.count > RSWAP_VPN_HEAT_BATCH)

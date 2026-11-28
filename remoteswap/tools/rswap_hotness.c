@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* VPN histories for one fixed mm. Observation only unless --publish is set.
- * No swap/cgroup configuration or placement-policy changes are performed.
+/* VPN histories for one fixed mm. --publish observes in the Client;
+ * --placement opts into VPN Store placement. No swap/cgroup configuration.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -50,7 +50,7 @@ struct page_list { struct hot_page *v; size_t n, capacity; };
 struct pfn_ref { uint64_t pfn; size_t index; };
 struct totals { uint64_t pages, sum, bins[5]; };
 struct publisher { int identity_fd, heat_fd; uint64_t binding; };
-struct config { pid_t pid; double interval; unsigned int window; const char *out; bool publish; };
+struct config { pid_t pid; double interval; unsigned int window; const char *out; bool publish, placement; };
 static volatile sig_atomic_t interrupted;
 static const char summary_header[] =
 	"pid\tEWMA_window\tmean_hotness\tpages\tdist[0 - 0.2]\tdist[0.2 - 0.4]\t"
@@ -359,7 +359,7 @@ static int publisher_current(const struct publisher *p)
 	    !strstr(status, "attached=1") || !strstr(status, "mm_current=1")) { errno = ESTALE; return -1; }
 	return 0;
 }
-static int publisher_start(struct publisher *p, pid_t pid)
+static int publisher_start_mode(struct publisher *p, pid_t pid, bool placement)
 {
 	char bind[80], status[512];
 	p->identity_fd = open("/sys/kernel/debug/rswap/identity", O_RDWR | O_CLOEXEC);
@@ -376,7 +376,7 @@ static int publisher_start(struct publisher *p, pid_t pid)
 	p->heat_fd = open("/sys/kernel/debug/rswap/vpn_heat", O_RDWR | O_CLOEXEC);
 	if (p->heat_fd < 0) return -1;
 	struct rswap_vpn_heat_command cmd = {.version = RSWAP_VPN_HEAT_VERSION,
-		.op = RSWAP_VPN_HEAT_BIND, .binding_id = p->binding};
+		.op = placement ? RSWAP_VPN_HEAT_BIND_POLICY : RSWAP_VPN_HEAT_BIND, .binding_id = p->binding};
 	return command_write(p->heat_fd, &cmd, NULL);
 }
 static int publish_snapshot(const struct publisher *p, const struct page_list *pages,
@@ -490,10 +490,11 @@ static long integer_value(const char *s, long max)
 static void usage(FILE *f)
 {
 	fputs("Usage: rswap_hotness --out NEW_DIR [--a-bit-window SECONDS] [--ewma-window N]\n"
-	      "                     [--publish] (--pid PID | -- COMMAND...)\n"
+	      "                     [--publish | --placement] (--pid PID | -- COMMAND...)\n"
 	      "Defaults: wait 5 seconds AFTER each scan; EWMA every 4 completed rounds.\n"
-	      "--interval/--window are aliases. --publish needs Client 1.18 identity/vpn_heat.\n"
-	      "Only summary.tsv is written. This phase does not enable placement policy.\n", f);
+	      "--publish observes in Client; --placement enables VPN Store placement (Client 1.19).\n"
+	      "Warmup: PMem first until five EWMA groups commit; Adaptive: H >= mean uses DRAM.\n"
+	      "--interval/--window are aliases. Only summary.tsv is written.\n", f);
 }
 
 int main(int argc, char **argv)
@@ -521,7 +522,7 @@ int main(int argc, char **argv)
 		case 'i': c.interval = seconds_value(optarg); if (c.interval < 0) goto bad; break;
 		case 'w': n = integer_value(optarg, 64); if (n < 0) goto bad; c.window = n; break;
 		case 'U': c.publish = true; break;
-		case 'A': fputs("--placement belongs to the previous PFN policy; use --publish for VPN observation.\n", stderr); goto bad;
+		case 'A': c.placement = true; c.publish = true; break;
 		case 'h': usage(stdout); return 0;
 		default: goto bad;
 		}
@@ -544,7 +545,7 @@ int main(int argc, char **argv)
 	if (!alive) { if (child > 0) { ret = 0; goto out; } errno = ESRCH; goto fail; }
 	observing = true;
 	/* Bind after successful exec, then hold the same mm's proc fds throughout. */
-	if (c.publish && publisher_start(&p, c.pid)) goto fail;
+	if (c.publish && publisher_start_mode(&p, c.pid, c.placement)) goto fail;
 	snprintf(path, sizeof(path), "/proc/%ld/maps", (long)c.pid);
 	maps = fopen(path, "re");
 	snprintf(path, sizeof(path), "/proc/%ld/pagemap", (long)c.pid);
@@ -554,8 +555,8 @@ int main(int argc, char **argv)
 		goto fail;
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	printf("START pid=%ld a_bit_window=%.3f EWMA_window=%u publish=%u\n",
-		(long)c.pid, c.interval, c.window, c.publish);
+	printf("START pid=%ld a_bit_window=%.3f EWMA_window=%u publish=%u placement=%u\n",
+		(long)c.pid, c.interval, c.window, c.publish, c.placement);
 	while (!interrupted) {
 		uint64_t current;
 		alive = identity(c.pid, &current);

@@ -22,5 +22,10 @@ int rswap_identity_debugfs(struct dentry *root);
 int rswap_identity_lookup(unsigned int type, u64 offset,
 			  struct rswap_identity_result *result);
 bool rswap_identity_binding_valid(u64 binding_id);
+/* Callback runs under RCU and the IRQ-safe entry lock: no sleep/allocation.
+ * expected_binding prevents an old heat snapshot from joining a new mm. */
+int rswap_identity_visit(unsigned int type, u64 offset, u64 expected_binding,
+		void (*visit)(void *arg, u64 vpn), void *arg,
+		struct rswap_identity_result *result);
 
 #endif
