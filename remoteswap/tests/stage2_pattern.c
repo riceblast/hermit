@@ -63,6 +63,15 @@ int main(void)
 			pthread_mutex_lock(&access_lock);
 			if (madvise(data, PAGES / 2 * 4096, MADV_PAGEOUT)) { perror("pageout"); return 1; }
 			pthread_mutex_unlock(&access_lock);
+		} else if (!strcmp(command, "dirty")) {
+			/* A read-only swap-in can retain a valid clean swap copy. Force
+			 * the next pageout through Store, without changing any contents. */
+			pthread_mutex_lock(&access_lock);
+			for (size_t p = 0; p < PAGES; p++)
+				((volatile uint64_t *)data)[p * 512] = discarded && p < PAGES / 2 ? 0 : value(p * 512);
+			pthread_mutex_unlock(&access_lock);
+		} else if (!strcmp(command, "outcold")) {
+			if (madvise(data + PAGES * 256, PAGES / 2 * 4096, MADV_PAGEOUT)) { perror("pageout cold"); return 1; }
 		} else if (!strcmp(command, "in")) {
 			verify(); /* swap-in must preserve every word */
 			atomic_store(&active, 1);

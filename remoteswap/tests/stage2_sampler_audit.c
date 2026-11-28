@@ -28,6 +28,7 @@ static pid_t target_pid;
 static uint64_t target_token;
 static bool transaction;
 static uint64_t range_begin, range_count, range_pages, range_records, range_sum, bins[5];
+static uint64_t hot_pages, cold_pages, zero_pages;
 static void fail(const char *reason)
 {
 	printf("AUDIT_ERROR %s errno=%d\n", reason, errno); fflush(stdout);
@@ -79,15 +80,16 @@ static ssize_t audited_write(int fd, const void *buffer, size_t size)
 		return write(fd,buffer,size);
 	}
 	memcpy(&c,buffer,sizeof(c));
-	if (c.version!=RSWAP_VPN_HEAT_VERSION || c.op<1 || c.op>5) return write(fd,buffer,size);
+	if (c.version!=RSWAP_VPN_HEAT_VERSION || c.op<1 || c.op>RSWAP_VPN_HEAT_BIND_POLICY) return write(fd,buffer,size);
 	ssize_t ret=write(fd,buffer,size);
 	if (ret!=(ssize_t)size) return ret; /* production CLI reports syscall errors */
-	if (c.op==RSWAP_VPN_HEAT_BIND) {
+	if (c.op==RSWAP_VPN_HEAT_BIND || c.op==RSWAP_VPN_HEAT_BIND_POLICY) {
 		heat_owner=fd; heat_hold=dup(fd); check(heat_hold>=0,"dup-owner");
 	} else if (c.op==RSWAP_VPN_HEAT_BEGIN) {
 		begun=c; seen=current_pages=heat_sum=previous_vpn=0;
 		selected_count=watched_count=watch_cursor=0; transaction=true;
 		range_pages=range_records=range_sum=0; memset(bins,0,sizeof(bins));
+		hot_pages=cold_pages=zero_pages=0;
 	} else if (c.op==RSWAP_VPN_HEAT_DATA) {
 		check(transaction && c.window==begun.window && size==sizeof(c)+c.count*sizeof(struct rswap_vpn_heat_record),"data-frame");
 		const struct rswap_vpn_heat_record *records=(const void *)((const char *)buffer+sizeof(c));
@@ -95,7 +97,11 @@ static ssize_t audited_write(int fd, const void *buffer, size_t size)
 			const struct rswap_vpn_heat_record *r=&records[i];
 			check(!r->reserved && r->in_scope<=1 && r->heat<=RSWAP_VPN_HEAT_SCALE &&
 			      (!seen || r->vpn>previous_vpn),"invalid-heat-record");
-			if (r->in_scope) { current_pages++; heat_sum+=r->heat; bins[heat_bin(r->heat)]++; }
+			if (r->in_scope) {
+				current_pages++; heat_sum+=r->heat; bins[heat_bin(r->heat)]++;
+				if (r->heat*begun.pages>=begun.sum_heat) hot_pages++; else cold_pages++;
+				if (!r->heat) zero_pages++;
+			}
 			if (r->vpn>=range_begin && r->vpn-range_begin<range_count) {
 				range_records++; if (r->in_scope) { range_pages++; range_sum+=r->heat; }
 			}
@@ -129,9 +135,10 @@ static ssize_t audited_write(int fd, const void *buffer, size_t size)
 		printf("AUDIT {\"window\":%llu,\"records\":%llu,\"pages\":%llu,\"sum_heat\":%llu,"
 		       "\"checked_queries\":%zu,\"watched\":%zu,\"unknown\":0,\"binding_id\":%llu,\"mono_ns\":%" PRIu64 ","
 		       "\"range_records\":%" PRIu64 ",\"range_pages\":%" PRIu64 ",\"range_sum\":%" PRIu64 ","
+		       "\"hot_pages\":%" PRIu64 ",\"cold_pages\":%" PRIu64 ",\"zero_pages\":%" PRIu64 ","
 		       "\"bins\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]}\n",
 		       c.window,begun.count,begun.pages,begun.sum_heat,selected_count+watched_count,watched_count,c.binding_id,monotonic_ns(),
-		       range_records,range_pages,range_sum,bins[0],bins[1],bins[2],bins[3],bins[4]);
+		       range_records,range_pages,range_sum,hot_pages,cold_pages,zero_pages,bins[0],bins[1],bins[2],bins[3],bins[4]);
 		fflush(stdout); transaction=false;
 	}
 	return ret;
