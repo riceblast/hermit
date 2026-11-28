@@ -128,7 +128,7 @@ inline unsigned hmt_get_sthd_cnt(struct mem_cgroup *memcg,
 			return thd_cnt;
 		}
 	} else if (mode == 1) {
-		if (nr_avail_pgs < 2048)
+		if (nr_avail_pgs < (1UL << (30 - PAGE_SHIFT)))
 			return MAX_THD_CNT;
 		else
 			return 0;
