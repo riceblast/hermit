@@ -7,7 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'tools'))
-from rswap_hotness_check import read_vpn_summary
+from rswap_hotness_check import read_vpn_reports
 
 HARNESS = r'''
 #define _GNU_SOURCE
@@ -161,8 +161,9 @@ class ExitTests(unittest.TestCase):
             out=Path(tmp)/'heat'
             run=subprocess.run([str(self.binary),str(out),str(mode)],check=True,
                                capture_output=True,text=True,timeout=10)
-            rows=read_vpn_summary(out/'summary.tsv')
+            rows, distribution=read_vpn_reports(out/'summary.tsv')
             self.assertEqual(len(rows),1,'unfinished observations must not add a summary row')
+            self.assertEqual(len(distribution),1)
             self.assertEqual(rows[0]['EWMA_window'],'0(0s)')
             if error:
                 self.assertIn(error,run.stderr)

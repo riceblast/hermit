@@ -7,7 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
-from rswap_hotness_check import read_vpn_summary
+from rswap_hotness_check import read_vpn_summary, read_vpn_reports, LEGACY_VPN_HEADER
 from rswap_analysis import hotness_summary, publications
 
 HARNESS = r'''
@@ -105,14 +105,42 @@ static void denominator_case(void) {
 static void output_case(const char *dir) {
     char path[PATH_MAX]; snprintf(path,sizeof(path),"%s/summary.tsv",dir);
     FILE *f=fopen(path,"wx"); assert(f); fputs(summary_header,f);
+    snprintf(path,sizeof(path),"%s/hot_distribute.tsv",dir);
+    FILE *d=fopen(path,"wx"); assert(d); fputs(distribution_header,d);
     struct hot_page v[6]={0}; struct page_list p={.v=v,.n=6}; struct totals t;
     for(int i=0;i<6;i++) v[i].flags=IN_SCOPE;
-    assert(!count_pages(&p,&t)); assert(!snapshot(f,42,0,0,&t));
+    assert(!count_pages(&p,&t)); assert(!snapshot(f,d,42,0,0,&t));
     for(int i=0;i<6;i++) v[i].heat=((uint64_t)i*RSWAP_VPN_HEAT_SCALE+2)/5;
     assert(!count_pages(&p,&t));
     assert(t.bins[0]==1 && t.bins[1]==1 && t.bins[2]==1 && t.bins[3]==1 && t.bins[4]==2);
-    assert(!snapshot(f,42,1,84012345678ULL,&t));
-    memset(&t,0,sizeof(t)); assert(!snapshot(f,42,2,168000000000ULL,&t)); fclose(f);
+    assert(!snapshot(f,d,42,1,84012345678ULL,&t));
+    memset(&t,0,sizeof(t)); assert(!snapshot(f,d,42,2,168000000000ULL,&t));
+    /* A displayed mean of 0.0000 must not change the exact classification. */
+    p.n=3; for(int i=0;i<3;i++) v[i].heat=i;
+    assert(!count_pages(&p,&t)); assert(t.hot==2 && t.cold==1);
+    assert(!snapshot(f,d,42,3,252000000000ULL,&t)); fclose(f); fclose(d);
+}
+static void classification_case(void) {
+    struct hot_page v[4]={0}; struct page_list p={.v=v,.n=4}; struct totals t;
+    for(int i=0;i<4;i++) v[i].flags=IN_SCOPE;
+    assert(!count_pages(&p,&t) && t.hot==4 && !t.cold);
+    for(int i=0;i<4;i++) v[i].heat=RSWAP_VPN_HEAT_SCALE;
+    assert(!count_pages(&p,&t) && t.hot==4 && !t.cold);
+    v[0].heat=v[1].heat=0;
+    assert(!count_pages(&p,&t) && t.hot==2 && t.cold==2);
+    v[0].heat=0; v[1].heat=1; v[2].heat=2; v[3].flags=0;
+    assert(!count_pages(&p,&t) && t.pages==3 && t.sum==3 && t.hot==2 && t.cold==1);
+    p.n=0; assert(!count_pages(&p,&t) && !t.pages && !t.hot && !t.cold);
+}
+static void output_failure_case(void) {
+    struct totals t={0}; FILE *good=tmpfile(), *bad=fopen("/dev/full","w");
+    assert(good && bad);
+    assert(snapshot(good,bad,42,0,0,&t)==-1);
+    assert(ftell(good)==0); /* Failed histogram must not emit a summary row. */
+    fclose(good); fclose(bad);
+    good=tmpfile(); bad=fopen("/dev/full","w"); assert(good && bad);
+    assert(snapshot(bad,good,42,0,0,&t)==-1);
+    fclose(good); fclose(bad);
 }
 static void math_case(void) {
     uint64_t h=0; h=heat_update(h,4,4);
@@ -132,7 +160,8 @@ int main(int argc,char **argv) {
     switch(atoi(argv[1])) {
     case 0: history_case(); break; case 1: race_case(); break;
     case 2: denominator_case(); break; case 3: assert(argc==3); output_case(argv[2]); break;
-    case 4: math_case(); break; case 5: launch_case(); break; default: abort();
+    case 4: math_case(); break; case 5: launch_case(); break;
+    case 6: classification_case(); break; case 7: output_failure_case(); break; default: abort();
     }
     return 0;
 }
@@ -169,16 +198,21 @@ class HotnessTests(unittest.TestCase):
     def test_new_page_uses_whole_group_denominator(self):
         self.run_case(2)
 
-    def test_single_summary_boundaries_actual_elapsed_and_zero_pages(self):
+    def test_paired_reports_boundaries_actual_elapsed_and_zero_pages(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.run_case(3, tmp)
-            self.assertEqual([p.name for p in Path(tmp).iterdir()], ['summary.tsv'])
-            rows = read_vpn_summary(Path(tmp) / 'summary.tsv')
+            self.assertEqual({p.name for p in Path(tmp).iterdir()}, {'summary.tsv', 'hot_distribute.tsv'})
+            rows, bins = read_vpn_reports(Path(tmp) / 'summary.tsv')
             self.assertEqual(rows[1]['EWMA_window'], '1(84.012s)')
-            self.assertEqual(rows[1]['mean_hotness'], '0.50')
-            self.assertEqual(rows[1]['dist[0.8 - 1.0]'], '2(33.3%)')
+            self.assertEqual(rows[1]['mean_hotness'], '0.5000')
+            self.assertEqual(rows[0]['hot/cold'], '6(100.00%)/0(0.00%)')
+            self.assertEqual(rows[1]['hot/cold'], '3(50.00%)/3(50.00%)')
+            self.assertEqual(bins[1]['[0.8-1.0]'], '2(33.33%)')
             self.assertEqual(rows[2]['pages'], '0')
-            self.assertEqual(hotness_summary(tmp)['completed_ewma_windows'], 2)
+            self.assertEqual(rows[2]['hot/cold'], '0(0.00%)/0(0.00%)')
+            self.assertEqual(rows[3]['mean_hotness'], '0.0000')
+            self.assertEqual(rows[3]['hot/cold'], '2(66.67%)/1(33.33%)')
+            self.assertEqual(hotness_summary(tmp)['completed_ewma_windows'], 3)
             with self.assertRaisesRegex(ValueError, 'VPN observation'):
                 publications(tmp)
             result = subprocess.run([sys.executable, str(ROOT/'tools/rswap_hotness_check.py'),
@@ -187,6 +221,12 @@ class HotnessTests(unittest.TestCase):
 
     def test_ewma_fixed_precision_and_bin_boundaries(self):
         self.run_case(4)
+
+    def test_hot_cold_equality_zero_mean_and_excluded_history(self):
+        self.run_case(6)
+
+    def test_either_output_io_failure_is_reported(self):
+        self.run_case(7)
 
     def test_launcher_waits_for_exec_and_propagates_exec_failure(self):
         self.run_case(5)
@@ -206,12 +246,50 @@ class HotnessTests(unittest.TestCase):
             self.run_case(3, tmp)
             p = Path(tmp)/'summary.tsv'
             original = p.read_text()
-            for text in (original.replace('2(33.3%)', '3(33.3%)'),
+            for text in (original.replace('3(50.00%)/3(50.00%)', '4(50.00%)/3(50.00%)'),
+                         original.replace('3(50.00%)', '3(50.01%)'),
+                         original.replace('0.5000', '0.50'),
                          original.replace('1(84.012s)', '3(84.012s)'),
                          original.replace('2(168.000s)', '2(1.000s)')):
                 p.write_text(text)
                 with self.assertRaises(ValueError):
                     read_vpn_summary(p)
+
+    def test_reports_reject_mismatched_metadata_or_incomplete_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_case(3, tmp)
+            summary, distribution = Path(tmp)/'summary.tsv', Path(tmp)/'hot_distribute.tsv'
+            original = distribution.read_text()
+            for text in (original.replace('0.5000', '0.5001'),
+                         '\n'.join(original.splitlines()[:-1])+'\n',
+                         original.replace('2(33.33%)', '3(33.33%)')):
+                distribution.write_text(text)
+                with self.assertRaises(ValueError):
+                    read_vpn_reports(summary)
+            distribution.write_text(original)
+            distribution.unlink()
+            with self.assertRaises(OSError):
+                read_vpn_reports(summary)
+
+    def test_live_reader_uses_only_the_visible_summary_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_case(3, tmp)
+            summary = Path(tmp)/'summary.tsv'
+            summary.write_text('\n'.join(summary.read_text().splitlines()[:-1])+'\n')
+            with self.assertRaises(ValueError):
+                read_vpn_reports(summary)
+            rows, bins = read_vpn_reports(summary, allow_pending=True)
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(len(bins), 3)
+
+    def test_archived_single_file_histogram_remains_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'summary.tsv'
+            path.write_text('\t'.join(LEGACY_VPN_HEADER)+'\n'+
+                            '42\t0(0s)\t0.00\t2\t2(100.0%)\t0(0.0%)\t0(0.0%)\t0(0.0%)\t0(0.0%)\n')
+            rows, bins = read_vpn_reports(path)
+            self.assertEqual(rows, bins)
+            self.assertEqual(hotness_summary(tmp)['format'], 'vpn-ewma-v1')
 
 
 if __name__ == '__main__':

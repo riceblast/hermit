@@ -139,7 +139,7 @@ class HelperTests(unittest.TestCase):
                             '-I',str(ROOT/'tools'),str(source),'-o',str(binary)],check=True)
             out=root/'controlled.heat'
             subprocess.run([str(binary),str(out),'0'],check=True,capture_output=True,timeout=15)
-            self.assertEqual([p.name for p in out.iterdir()],['summary.tsv'])
+            self.assertEqual({p.name for p in out.iterdir()},{'summary.tsv','hot_distribute.tsv'})
             self.assertGreater(len((out/'summary.tsv').read_text().splitlines()),1)
 
     def test_resume_to_fresh_directory_preserves_prior_evidence_and_only_stops_known_jobs(self):

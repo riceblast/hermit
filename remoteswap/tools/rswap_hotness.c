@@ -48,13 +48,15 @@ struct hot_page {
 };
 struct page_list { struct hot_page *v; size_t n, capacity; };
 struct pfn_ref { uint64_t pfn; size_t index; };
-struct totals { uint64_t pages, sum, bins[5]; };
+struct totals { uint64_t pages, sum, hot, cold, bins[5]; };
 struct publisher { int identity_fd, heat_fd; uint64_t binding; };
 struct config { pid_t pid; double interval; unsigned int window; const char *out; bool publish, placement; };
 static volatile sig_atomic_t interrupted;
 static const char summary_header[] =
-	"pid\tEWMA_window\tmean_hotness\tpages\tdist[0 - 0.2]\tdist[0.2 - 0.4]\t"
-	"dist[0.4 - 0.6]\tdist[0.6 - 0.8]\tdist[0.8 - 1.0]\n";
+	"pid\tEWMA_window\tmean_hotness\tpages\thot/cold\n";
+static const char distribution_header[] =
+	"pid\tEWMA_window\tmean_hotness\tpages\t[0-0.2)\t[0.2-0.4)\t"
+	"[0.4-0.6)\t[0.6-0.8)\t[0.8-1.0]\n";
 
 static void on_signal(int sig) { interrupted = sig; }
 static uint64_t monotonic_ns(void)
@@ -315,23 +317,38 @@ static int count_pages(const struct page_list *pages, struct totals *t)
 		t->pages++; t->sum += pages->v[i].heat;
 		t->bins[heat_bin(pages->v[i].heat)]++;
 	}
+	/* Compare with the exact mean, including equality and mean=0. The
+	 * UINT32_MAX page bound above keeps the Q32 multiplication in uint64_t. */
+	for (size_t i = 0; i < pages->n; i++) if (pages->v[i].flags & IN_SCOPE) {
+		if (pages->v[i].heat * t->pages >= t->sum) t->hot++;
+		else t->cold++;
+	}
 	return 0;
 }
-static int snapshot(FILE *out, pid_t pid, uint64_t window, uint64_t elapsed_ns,
+static int snapshot(FILE *summary, FILE *distribution, pid_t pid, uint64_t window, uint64_t elapsed_ns,
 		const struct totals *t)
 {
 	char label[80];
 	if (!window) snprintf(label, sizeof(label), "0(0s)");
 	else snprintf(label, sizeof(label), "%" PRIu64 "(%.3fs)", window, elapsed_ns / 1e9);
 	long double mean = t->pages ? (long double)t->sum / RSWAP_VPN_HEAT_SCALE / t->pages : 0;
-	if (fprintf(out, "%-8ld\t%-22s\t%-12.2Lf\t%-12" PRIu64, (long)pid, label, mean, t->pages) < 0) return -1;
+	if (fprintf(distribution, "%-8ld\t%-22s\t%-12.4Lf\t%-12" PRIu64,
+		    (long)pid, label, mean, t->pages) < 0) return -1;
 	for (unsigned int i = 0; i < 5; i++) {
 		char cell[80];
-		snprintf(cell, sizeof(cell), "%" PRIu64 "(%.1Lf%%)", t->bins[i],
+		snprintf(cell, sizeof(cell), "%" PRIu64 "(%.2Lf%%)", t->bins[i],
 			t->pages ? (long double)t->bins[i] * 100 / t->pages : 0);
-		if (fprintf(out, "\t%-18s", cell) < 0) return -1;
+		if (fprintf(distribution, "\t%-18s", cell) < 0) return -1;
 	}
-	return fputc('\n', out) == EOF || fflush(out) ? -1 : 0;
+	/* Flush distribution first: a newly visible summary row has its matching
+	 * histogram already available to readers following the live files. */
+	if (fputc('\n', distribution) == EOF || fflush(distribution)) return -1;
+	if (fprintf(summary, "%-8ld\t%-22s\t%-12.4Lf\t%-12" PRIu64 "\t"
+		    "%" PRIu64 "(%.2Lf%%)/%" PRIu64 "(%.2Lf%%)\n",
+		    (long)pid, label, mean, t->pages,
+		    t->hot, t->pages ? (long double)t->hot * 100 / t->pages : 0,
+		    t->cold, t->pages ? (long double)t->cold * 100 / t->pages : 0) < 0) return -1;
+	return fflush(summary) ? -1 : 0;
 }
 
 static int command_write(int fd, const struct rswap_vpn_heat_command *cmd,
@@ -494,7 +511,7 @@ static void usage(FILE *f)
 	      "Defaults: wait 5 seconds AFTER each scan; EWMA every 4 completed rounds.\n"
 	      "--publish observes in Client; --placement enables VPN Store placement (Client 1.19).\n"
 	      "Warmup: PMem first until five EWMA groups commit; Adaptive: H >= mean uses DRAM.\n"
-	      "--interval/--window are aliases. Only summary.tsv is written.\n", f);
+	      "--interval/--window are aliases. Outputs: summary.tsv and hot_distribute.tsv.\n", f);
 }
 
 int main(int argc, char **argv)
@@ -509,7 +526,7 @@ int main(int argc, char **argv)
 	struct page_list old = {0};
 	int option, flags_fd = -1, idle_fd = -1, pm = -1, ret = 1, status = 0;
 	pid_t child = -1;
-	FILE *maps = NULL, *summary = NULL;
+	FILE *maps = NULL, *summary = NULL, *distribution = NULL;
 	uint64_t token = 0, baseline = 0, window = 0;
 	unsigned int rounds = 0;
 	char path[PATH_MAX];
@@ -536,6 +553,9 @@ int main(int argc, char **argv)
 	if (snprintf(path, sizeof(path), "%s/summary.tsv", c.out) >= (int)sizeof(path)) { errno = ENAMETOOLONG; goto fail; }
 	summary = fopen(path, "wxe");
 	if (!summary || fputs(summary_header, summary) == EOF || fflush(summary)) goto fail;
+	if (snprintf(path, sizeof(path), "%s/hot_distribute.tsv", c.out) >= (int)sizeof(path)) { errno = ENAMETOOLONG; goto fail; }
+	distribution = fopen(path, "wxe");
+	if (!distribution || fputs(distribution_header, distribution) == EOF || fflush(distribution)) goto fail;
 	struct sigaction action = {.sa_handler = on_signal};
 	sigemptyset(&action.sa_mask);
 	sigaction(SIGINT, &action, NULL); sigaction(SIGTERM, &action, NULL); signal(SIGPIPE, SIG_IGN);
@@ -555,8 +575,7 @@ int main(int argc, char **argv)
 		goto fail;
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	printf("START pid=%ld a_bit_window=%.3f EWMA_window=%u publish=%u placement=%u\n",
-		(long)c.pid, c.interval, c.window, c.publish, c.placement);
+	printf("START a_bit_window=%.3f EWMA_window=%u\n", c.interval, c.window);
 	while (!interrupted) {
 		uint64_t current;
 		alive = identity(c.pid, &current);
@@ -580,7 +599,7 @@ int main(int argc, char **argv)
 		if (output) {
 			struct totals t;
 			if (count_pages(&old, &t) || (c.publish && publish_snapshot(&p, &old, window, &t)) ||
-			    snapshot(summary, c.pid, window, monotonic_ns() - baseline, &t)) goto fail;
+			    snapshot(summary, distribution, c.pid, window, monotonic_ns() - baseline, &t)) goto fail;
 		}
 		/* KISS: scan/output finish, then wait. Never manufacture missed rounds. */
 		struct timespec wait = {.tv_sec = (time_t)c.interval,
@@ -606,6 +625,7 @@ out:
 	if (flags_fd >= 0) close(flags_fd);
 	if (idle_fd >= 0) close(idle_fd);
 	if (summary && fclose(summary)) ret = 1;
+	if (distribution && fclose(distribution)) ret = 1;
 	free(old.v);
 	if (child > 0) {
 		if (ret || interrupted) kill(child, interrupted ? interrupted : SIGTERM);

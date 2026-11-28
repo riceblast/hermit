@@ -7,7 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'tools'))
-from rswap_hotness_check import read_vpn_summary
+from rswap_hotness_check import read_vpn_reports
 
 HARNESS = r'''
 #define _GNU_SOURCE
@@ -108,11 +108,16 @@ class LoopTests(unittest.TestCase):
     def test_scan_then_sleep_and_nonoverlapping_groups_with_slow_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)/'out'
-            subprocess.run([str(self.binary), str(out), '0'], check=True, capture_output=True, timeout=10)
-            self.assertEqual([p.name for p in out.iterdir()], ['summary.tsv'])
-            rows = read_vpn_summary(out/'summary.tsv')
+            result = subprocess.run([str(self.binary), str(out), '0'], check=True,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.stdout.strip(), 'START a_bit_window=5.000 EWMA_window=4')
+            self.assertEqual({p.name for p in out.iterdir()}, {'summary.tsv', 'hot_distribute.tsv'})
+            rows, bins = read_vpn_reports(out/'summary.tsv')
             self.assertEqual(len(rows), 3)
-            self.assertEqual([r['mean_hotness'] for r in rows], ['0.00', '0.10', '0.18'])
+            self.assertEqual(len(bins), 3)
+            self.assertEqual([r['mean_hotness'] for r in rows], ['0.0000', '0.1000', '0.1800'])
+            self.assertEqual(rows[0]['hot/cold'], '2(100.00%)/0(0.00%)')
+            self.assertEqual(rows[1]['hot/cold'], '1(50.00%)/1(50.00%)')
             self.assertEqual([r['pages'] for r in rows], ['2','2','2'])
             self.assertEqual(rows[1]['EWMA_window'], '1(84.000s)')
             self.assertEqual(rows[2]['EWMA_window'], '2(168.000s)')
@@ -123,7 +128,7 @@ class LoopTests(unittest.TestCase):
             result = subprocess.run([str(self.binary), str(out), '1'], check=True,
                                     capture_output=True, text=True, timeout=10)
             self.assertIn('Stale file handle', result.stderr)
-            self.assertEqual(len(read_vpn_summary(out/'summary.tsv')), 1)
+            self.assertEqual(len(read_vpn_reports(out/'summary.tsv')[0]), 1)
 
 
 if __name__ == '__main__':

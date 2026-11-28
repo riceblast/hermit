@@ -24,7 +24,7 @@ sys.dont_write_bytecode = True
 import stage1_core_host as core
 import stage1_extended_host as previous
 sys.path.insert(0, str(core.REPO / 'remoteswap/tools'))
-from rswap_hotness_check import read_vpn_summary
+from rswap_hotness_check import read_vpn_reports
 from rswap_pool import parse_bundle, collect, validate_settled
 
 REPO, RS, HMT = core.REPO, core.RS, core.HMT
@@ -221,9 +221,9 @@ class Sampler:
     def watched(self, window):
         return {r['vpn']: r for r in self.records('WATCH') if r['window'] == window}
 
-    def validate(self):
+    def validate(self, final=False):
         audits = self.records('AUDIT')
-        rows = read_vpn_summary(self.out / 'summary.tsv')
+        rows, distribution = read_vpn_reports(self.out / 'summary.tsv', allow_pending=not final)
         require(len(rows) <= len(audits), 'Summary has no matching committed audit')
         for i, row in enumerate(rows):
             a = audits[i]
@@ -231,13 +231,17 @@ class Sampler:
                     'Missing snapshot, wrong window or unknown VPN')
             require(int(row['pages']) == a['pages'], 'Summary/Client pages mismatch')
             mean = a['sum_heat'] / SCALE / a['pages'] if a['pages'] else 0
-            require(abs(float(row['mean_hotness']) - mean) <= .005001, 'Summary/Client mean mismatch')
-            for key, count in zip(list(row)[4:], a['bins']):
-                require(int(row[key].split('(')[0]) == count, 'Summary/wire heat-bin mismatch')
+            require(abs(float(row['mean_hotness']) - mean) <= .000050001, 'Summary/Client mean mismatch')
+            counts = [int(cell.split('(')[0]) for cell in row['hot/cold'].split('/')]
+            require(counts == [a['hot_pages'], a['cold_pages']], 'Summary/Client hot/cold mismatch')
+            bins = distribution[i]
+            for key, count in zip(list(bins)[4:], a['bins']):
+                require(int(bins[key].split('(')[0]) == count, 'Distribution/wire heat-bin mismatch')
         text = (self.out / 'summary.tsv').read_text().lower()
         require('unknown' not in text and '\tnan' not in text and '\t-' not in text,
                 'Unknown/invalid heat text in new summary')
-        require([p.name for p in self.out.iterdir()] == ['summary.tsv'], 'Unexpected production sampler output files')
+        require({p.name for p in self.out.iterdir()} == {'summary.tsv', 'hot_distribute.tsv'},
+                'Unexpected production sampler output files')
         return audits, rows
 
     def stop(self):
@@ -250,7 +254,7 @@ class Sampler:
     def finished(self):
         require(self.stderr.read_text() == '', f'{self.label} sampler reported an error: ' + self.stderr.read_text())
         require('LIFECYCLE closed_identity_rejected=1' in self.stdout.read_text(), 'Old binding did not become stale')
-        audits, rows = self.validate()
+        audits, rows = self.validate(final=True)
         result(self.label + '.results.json', dict(snapshots=audits, summaries=rows, unknown=0,
                                                old_binding_rejected=True))
         require(core.fields((RS / 'identity_status').read_text())['bound'] == '0', 'Binding remained after sampler exit')

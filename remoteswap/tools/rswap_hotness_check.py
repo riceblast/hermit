@@ -5,6 +5,7 @@ from collections import Counter
 import csv
 from dataclasses import dataclass
 import json
+from itertools import islice
 from pathlib import Path
 import re
 import sys
@@ -46,26 +47,43 @@ def raw_log_directory(directory):
     return raw if (raw / 'summary.tsv').is_file() else directory
 
 
-VPN_HEADER = ['pid', 'EWMA_window', 'mean_hotness', 'pages',
-              'dist[0 - 0.2]', 'dist[0.2 - 0.4]', 'dist[0.4 - 0.6]',
-              'dist[0.6 - 0.8]', 'dist[0.8 - 1.0]']
+VPN_HEADER = ['pid', 'EWMA_window', 'mean_hotness', 'pages', 'hot/cold']
+DISTRIBUTION_HEADER = ['pid', 'EWMA_window', 'mean_hotness', 'pages',
+                       '[0-0.2)', '[0.2-0.4)', '[0.4-0.6)', '[0.6-0.8)', '[0.8-1.0]']
+LEGACY_VPN_HEADER = ['pid', 'EWMA_window', 'mean_hotness', 'pages',
+                     'dist[0 - 0.2]', 'dist[0.2 - 0.4]', 'dist[0.4 - 0.6]',
+                     'dist[0.6 - 0.8]', 'dist[0.8 - 1.0]']
+VPN_HEADERS = (VPN_HEADER, LEGACY_VPN_HEADER)
 
 
 def read_vpn_summary(path):
-    """Validate phase-2 display statistics, without claiming PFN/Store matches."""
+    """Validate current hot/cold or archived histogram display statistics."""
+    return _read_vpn_statistics(path, VPN_HEADERS)
+
+
+def read_vpn_distribution(path, *, limit=None):
+    """Read histogram rows, optionally just a committed live-summary prefix."""
+    return _read_vpn_statistics(path, (DISTRIBUTION_HEADER,), limit=limit)
+
+
+def _read_vpn_statistics(path, headers, *, limit=None):
     result = []
     pid = None
     elapsed = -1.0
     with Path(path).open() as stream:
         reader = csv.reader(stream, delimiter='\t')
-        if next(reader, None) != VPN_HEADER:
-            raise ValueError('expected phase-2 VPN summary header')
-        for fields in reader:
-            if len(fields) != 9:
-                raise ValueError('expected nine summary columns')
-            row = dict(zip(VPN_HEADER, (f.strip() for f in fields)))
+        header = next(reader, None)
+        if header not in headers:
+            raise ValueError('expected VPN statistics header')
+        legacy = header == LEGACY_VPN_HEADER
+        for fields in islice(reader, limit):
+            if len(fields) != len(header):
+                raise ValueError('unexpected statistics column count')
+            row = dict(zip(header, (f.strip() for f in fields)))
             current_pid, pages = int(row['pid']), int(row['pages'])
             mean = float(row['mean_hotness'])
+            if not legacy and not re.fullmatch(r'\d+\.\d{4}', row['mean_hotness']):
+                raise ValueError('mean_hotness requires four decimal places')
             label = re.fullmatch(r'(\d+)\((\d+(?:\.\d+)?)s\)', row['EWMA_window'])
             if not label:
                 raise ValueError('invalid EWMA window/time')
@@ -75,22 +93,41 @@ def read_vpn_summary(path):
                     (window == 0 and (seconds != 0 or mean != 0)) or (not pages and mean != 0)):
                 raise ValueError('invalid summary identity, sequence or mean')
             counts = []
-            for key in VPN_HEADER[4:]:
-                cell = re.fullmatch(r'(\d+)\((\d+\.\d)%\)', row[key])
+            cells = row['hot/cold'].split('/') if header == VPN_HEADER else [row[key] for key in header[4:]]
+            if header == VPN_HEADER and len(cells) != 2:
+                raise ValueError('expected one hot/cold count pair')
+            for text in cells:
+                cell = re.fullmatch(r'(\d+)\((\d+\.\d)%\)' if legacy else
+                                    r'(\d+)\((\d+\.\d{2})%\)', text)
                 if not cell:
-                    raise ValueError('invalid heat distribution cell')
+                    raise ValueError('invalid heat count/percentage cell')
                 count, percent = int(cell[1]), float(cell[2])
                 expected = count * 100 / pages if pages else 0
-                if count > pages or abs(percent - expected) > .050001:
-                    raise ValueError('heat distribution percentage mismatch')
+                if count > pages or abs(percent - expected) > (.050001 if legacy else .005001):
+                    raise ValueError('heat percentage mismatch')
                 counts.append(count)
             if sum(counts) != pages or (window == 0 and counts[0] != pages):
-                raise ValueError('heat distribution population mismatch')
+                raise ValueError('heat population mismatch')
             result.append(row)
             pid, elapsed = current_pid, seconds
     if not result:
         raise ValueError('no completed VPN snapshots')
     return result
+
+
+def read_vpn_reports(summary, *, allow_pending=False):
+    """Cross-check both files; archives retain their single histogram file."""
+    rows = read_vpn_summary(summary)
+    if 'hot/cold' not in rows[0]:
+        return rows, rows
+    distribution = read_vpn_distribution(Path(summary).with_name('hot_distribute.tsv'),
+                                         limit=len(rows) if allow_pending else None)
+    if len(rows) != len(distribution):
+        raise ValueError('summary/distribution snapshot count mismatch')
+    for row, bins in zip(rows, distribution):
+        if any(row[key] != bins[key] for key in VPN_HEADER[:4]):
+            raise ValueError('summary/distribution snapshot metadata mismatch')
+    return rows, distribution
 
 
 def read_summary(path):
@@ -276,11 +313,11 @@ def main():
     args = parser.parse_args()
     try:
         with args.summary.open() as stream:
-            vpn = stream.readline().rstrip('\n').split('\t') == VPN_HEADER
+            vpn = stream.readline().rstrip('\n').split('\t') in VPN_HEADERS
         if vpn:
             if args.trace or args.detail or args.require_match or args.buffer_stats:
                 raise ValueError('VPN summary has no PFN/Store correlation; omit legacy trace options')
-            rows = read_vpn_summary(args.summary)
+            rows, _ = read_vpn_reports(args.summary)
             print(json.dumps({'snapshots': len(rows), 'last': rows[-1]}, indent=2))
             return 0
         if args.trace is None:

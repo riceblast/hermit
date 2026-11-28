@@ -5,12 +5,12 @@ import csv
 import math
 from pathlib import Path
 
-from rswap_hotness_check import read_pages, read_summary, raw_log_directory, read_vpn_summary, VPN_HEADER
+from rswap_hotness_check import read_pages, read_summary, raw_log_directory, read_vpn_reports, VPN_HEADERS
 
 
 def vpn_format(directory):
     with (Path(directory) / 'summary.tsv').open() as stream:
-        return stream.readline().rstrip('\n').split('\t') == VPN_HEADER
+        return stream.readline().rstrip('\n').split('\t') in VPN_HEADERS
 
 
 def tsv(path):
@@ -88,8 +88,9 @@ def display_threshold(row):
 
 def hotness_summary(directory):
     if vpn_format(directory):
-        rows = read_vpn_summary(Path(directory) / 'summary.tsv')
-        return dict(format='vpn-ewma-v1', snapshots=len(rows), completed_ewma_windows=len(rows)-1,
+        rows, _ = read_vpn_reports(Path(directory) / 'summary.tsv')
+        return dict(format='vpn-ewma-v2' if 'hot/cold' in rows[-1] else 'vpn-ewma-v1',
+                    snapshots=len(rows), completed_ewma_windows=len(rows)-1,
                     pid=int(rows[-1]['pid']), last=rows[-1],
                     note='VPN observation only; no Store placement or PFN-match validation.')
     run, summaries, pubs = publications(directory)
