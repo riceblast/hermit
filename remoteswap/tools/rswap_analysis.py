@@ -10,7 +10,7 @@ from rswap_hotness_check import read_pages, read_summary, raw_log_directory, rea
 
 def vpn_format(directory):
     with (Path(directory) / 'summary.tsv').open() as stream:
-        return stream.readline().rstrip('\n').split('\t') in VPN_HEADERS
+        return [field.strip() for field in stream.readline().rstrip('\n').split('\t')] in VPN_HEADERS
 
 
 def tsv(path):

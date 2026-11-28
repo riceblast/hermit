@@ -24,7 +24,7 @@ sys.dont_write_bytecode = True
 import stage1_core_host as core
 import stage1_extended_host as previous
 sys.path.insert(0, str(core.REPO / 'remoteswap/tools'))
-from rswap_hotness_check import read_vpn_reports
+from rswap_hotness_check import read_vpn_reports, format_page_count
 from rswap_pool import parse_bundle, collect, validate_settled
 
 REPO, RS, HMT = core.REPO, core.RS, core.HMT
@@ -229,17 +229,18 @@ class Sampler:
             a = audits[i]
             require(a['window'] == i and a['unknown'] == 0 and a['checked_queries'] > 0,
                     'Missing snapshot, wrong window or unknown VPN')
-            require(int(row['pages']) == a['pages'], 'Summary/Client pages mismatch')
+            require(row['pages'] == format_page_count(a['pages']), 'Summary/Client pages mismatch')
             mean = a['sum_heat'] / SCALE / a['pages'] if a['pages'] else 0
             require(abs(float(row['mean_hotness']) - mean) <= .000050001, 'Summary/Client mean mismatch')
             if row['hot/cold'] == '-/-':
                 require(a['sum_heat'] == 0, 'Hot/cold placeholder for nonzero exact mean')
             else:
-                counts = [int(cell.split('(')[0]) for cell in row['hot/cold'].split('/')]
-                require(counts == [a['hot_pages'], a['cold_pages']], 'Summary/Client hot/cold mismatch')
+                counts = [cell.split('(')[0] for cell in row['hot/cold'].split('/')]
+                require(counts == [format_page_count(a['hot_pages']), format_page_count(a['cold_pages'])],
+                        'Summary/Client hot/cold mismatch')
             bins = distribution[i]
             for key, count in zip(list(bins)[4:], a['bins']):
-                require(int(bins[key].split('(')[0]) == count, 'Distribution/wire heat-bin mismatch')
+                require(bins[key].split('(')[0] == format_page_count(count), 'Distribution/wire heat-bin mismatch')
         text = (self.out / 'summary.tsv').read_text().lower()
         require('unknown' not in text and '\tnan' not in text,
                 'Unknown/invalid heat text in new summary')

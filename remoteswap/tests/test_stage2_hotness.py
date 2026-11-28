@@ -104,9 +104,9 @@ static void denominator_case(void) {
 }
 static void output_case(const char *dir) {
     char path[PATH_MAX]; snprintf(path,sizeof(path),"%s/summary.tsv",dir);
-    FILE *f=fopen(path,"wx"); assert(f); fputs(summary_header,f);
+    FILE *f=fopen(path,"wx"); assert(f); assert(!output_header(f,false));
     snprintf(path,sizeof(path),"%s/hot_distribute.tsv",dir);
-    FILE *d=fopen(path,"wx"); assert(d); fputs(distribution_header,d);
+    FILE *d=fopen(path,"wx"); assert(d); assert(!output_header(d,true));
     struct hot_page v[6]={0}; struct page_list p={.v=v,.n=6}; struct totals t;
     for(int i=0;i<6;i++) v[i].flags=IN_SCOPE;
     assert(!count_pages(&p,&t)); assert(!snapshot(f,d,42,0,0,&t));

@@ -54,6 +54,42 @@ LEGACY_VPN_HEADER = ['pid', 'EWMA_window', 'mean_hotness', 'pages',
                      'dist[0 - 0.2]', 'dist[0.2 - 0.4]', 'dist[0.4 - 0.6]',
                      'dist[0.6 - 0.8]', 'dist[0.8 - 1.0]']
 VPN_HEADERS = (VPN_HEADER, LEGACY_VPN_HEADER)
+PAGE_COUNT_PATTERN = r'(?:\d+|[1-9]\.\de(?:[5-9]|1[0-9]))'
+
+
+def format_page_count(count):
+    """Match the producer's two-significant-digit, nearest-even display."""
+    if count < 100000:
+        return str(count)
+    exponent = len(str(count)) - 1
+    divisor = 10 ** (exponent - 1)
+    coefficient, remainder = divmod(count, divisor)
+    if 2 * remainder > divisor or (2 * remainder == divisor and coefficient % 2):
+        coefficient += 1
+    if coefficient == 100:
+        coefficient = 10
+        exponent += 1
+    return f'{coefficient // 10}.{coefficient % 10}e{exponent}'
+
+
+def page_count_bounds(text):
+    """Integer counts represented by an exact integer or rounded display."""
+    if re.fullmatch(r'\d+', text):
+        value = int(text)
+        return value, value
+    match = re.fullmatch(r'([1-9])\.(\d)e([5-9]|1[0-9])', text)
+    if not match:
+        raise ValueError('invalid page count')
+    coefficient = 10 * int(match[1]) + int(match[2])
+    step = 10 ** (int(match[3]) - 1)
+    value = coefficient * step
+    # 1.0eN can also be a carry from 9.95e(N-1), whose spacing is smaller.
+    lower = value - step // (20 if coefficient == 10 else 2)
+    upper = value + step // 2
+    if coefficient % 2:  # Midpoint ties round toward the even coefficient.
+        lower += 1
+        upper -= 1
+    return max(100000, lower), upper
 
 
 def read_vpn_summary(path):
@@ -72,7 +108,8 @@ def _read_vpn_statistics(path, headers, *, limit=None):
     elapsed = -1.0
     with Path(path).open() as stream:
         reader = csv.reader(stream, delimiter='\t')
-        header = next(reader, None)
+        raw_header = next(reader, None)
+        header = [field.strip() for field in raw_header] if raw_header is not None else None
         if header not in headers:
             raise ValueError('expected VPN statistics header')
         legacy = header == LEGACY_VPN_HEADER
@@ -80,7 +117,8 @@ def _read_vpn_statistics(path, headers, *, limit=None):
             if len(fields) != len(header):
                 raise ValueError('unexpected statistics column count')
             row = dict(zip(header, (f.strip() for f in fields)))
-            current_pid, pages = int(row['pid']), int(row['pages'])
+            current_pid = int(row['pid'])
+            page_lower, page_upper = page_count_bounds(row['pages'])
             mean = float(row['mean_hotness'])
             if not legacy and not re.fullmatch(r'\d+\.\d{4}', row['mean_hotness']):
                 raise ValueError('mean_hotness requires four decimal places')
@@ -88,9 +126,9 @@ def _read_vpn_statistics(path, headers, *, limit=None):
             if not label:
                 raise ValueError('invalid EWMA window/time')
             window, seconds = int(label[1]), float(label[2])
-            if (current_pid <= 0 or (pid is not None and pid != current_pid) or pages < 0 or
+            if (current_pid <= 0 or (pid is not None and pid != current_pid) or
                     not 0 <= mean <= 1 or window != len(result) or seconds <= elapsed or
-                    (window == 0 and (seconds != 0 or mean != 0)) or (not pages and mean != 0)):
+                    (window == 0 and (seconds != 0 or mean != 0)) or (not page_upper and mean != 0)):
                 raise ValueError('invalid summary identity, sequence or mean')
             if header == VPN_HEADER and row['hot/cold'] == '-/-':
                 if mean != 0:
@@ -104,15 +142,24 @@ def _read_vpn_statistics(path, headers, *, limit=None):
                 raise ValueError('expected one hot/cold count pair')
             for text in cells:
                 cell = re.fullmatch(r'(\d+)\((\d+\.\d)%\)' if legacy else
-                                    r'(\d+)\((\d+\.\d{2})%\)', text)
+                                    rf'({PAGE_COUNT_PATTERN})\((\d+\.\d{{2}})%\)', text)
                 if not cell:
                     raise ValueError('invalid heat count/percentage cell')
-                count, percent = int(cell[1]), float(cell[2])
-                expected = count * 100 / pages if pages else 0
-                if count > pages or abs(percent - expected) > (.050001 if legacy else .005001):
+                lower, upper = page_count_bounds(cell[1])
+                percent = float(cell[2])
+                if lower > page_upper:
+                    raise ValueError('heat count exceeds population')
+                upper = min(upper, page_upper)
+                minimum = lower * 100 / page_upper if page_upper else 0
+                maximum = min(100, upper * 100 / max(1, page_lower)) if page_upper else 0
+                tolerance = .050001 if legacy else .005001
+                if not 0 <= percent <= 100 or not minimum - tolerance <= percent <= maximum + tolerance:
                     raise ValueError('heat percentage mismatch')
-                counts.append(count)
-            if sum(counts) != pages or (window == 0 and counts[0] != pages):
+                counts.append((lower, upper))
+            if (max(page_lower, sum(low for low, _ in counts)) >
+                    min(page_upper, sum(high for _, high in counts)) or
+                    (window == 0 and (max(counts[0][0], page_lower) > min(counts[0][1], page_upper) or
+                                      any(low != 0 for low, _ in counts[1:])))):
                 raise ValueError('heat population mismatch')
             result.append(row)
             pid, elapsed = current_pid, seconds
@@ -319,7 +366,7 @@ def main():
     args = parser.parse_args()
     try:
         with args.summary.open() as stream:
-            vpn = stream.readline().rstrip('\n').split('\t') in VPN_HEADERS
+            vpn = [field.strip() for field in stream.readline().rstrip('\n').split('\t')] in VPN_HEADERS
         if vpn:
             if args.trace or args.detail or args.require_match or args.buffer_stats:
                 raise ValueError('VPN summary has no PFN/Store correlation; omit legacy trace options')

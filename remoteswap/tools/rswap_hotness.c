@@ -52,11 +52,23 @@ struct totals { uint64_t pages, sum, hot, cold, bins[5]; };
 struct publisher { int identity_fd, heat_fd; uint64_t binding; };
 struct config { pid_t pid; double interval; unsigned int window; const char *out; bool publish, placement; };
 static volatile sig_atomic_t interrupted;
-static const char summary_header[] =
-	"pid\tEWMA_window\tmean_hotness\tpages\thot/cold\n";
-static const char distribution_header[] =
-	"pid\tEWMA_window\tmean_hotness\tpages\t[0-0.2)\t[0.2-0.4)\t"
-	"[0.4-0.6)\t[0.6-0.8)\t[0.8-1.0]\n";
+#define REPORT_PREFIX "%-12s\t%-24s\t%-12s\t%-8s"
+#define REPORT_BIN "\t%-18s"
+#define REPORT_CLASS "\t%-32s\n"
+
+static int output_header(FILE *out, bool distribution)
+{
+	static const char *const bins[] = {
+		"[0-0.2)", "[0.2-0.4)", "[0.4-0.6)", "[0.6-0.8)", "[0.8-1.0]"
+	};
+	if (fprintf(out, REPORT_PREFIX, "pid", "EWMA_window", "mean_hotness", "pages") < 0) return -1;
+	if (distribution) {
+		for (unsigned int i = 0; i < 5; i++)
+			if (fprintf(out, REPORT_BIN, bins[i]) < 0) return -1;
+		if (fputc('\n', out) == EOF) return -1;
+	} else if (fprintf(out, REPORT_CLASS, "hot/cold") < 0) return -1;
+	return fflush(out) ? -1 : 0;
+}
 
 static void on_signal(int sig) { interrupted = sig; }
 static uint64_t monotonic_ns(void)
@@ -325,31 +337,53 @@ static int count_pages(const struct page_list *pages, struct totals *t)
 	}
 	return 0;
 }
+static void format_page_count(char *out, size_t size, uint64_t count)
+{
+	if (count < UINT64_C(100000)) {
+		snprintf(out, size, "%" PRIu64, count);
+	} else {
+		char scientific[64];
+		snprintf(scientific, sizeof(scientific), "%.1Le", (long double)count);
+		char *exponent = strchr(scientific, 'e');
+		unsigned long power = strtoul(exponent + 1, NULL, 10);
+		*exponent = '\0';
+		snprintf(out, size, "%.3se%lu", scientific, power);
+	}
+}
+static void format_count_cell(char *out, size_t size, uint64_t count, uint64_t pages)
+{
+	char number[32];
+	format_page_count(number, sizeof(number), count);
+	snprintf(out, size, "%s(%.2Lf%%)", number, pages ? (long double)count * 100 / pages : 0);
+}
 static int snapshot(FILE *summary, FILE *distribution, pid_t pid, uint64_t window, uint64_t elapsed_ns,
 		const struct totals *t)
 {
-	char label[80];
+	char label[80], pid_text[32], mean_text[32], pages_text[32];
 	if (!window) snprintf(label, sizeof(label), "0(0s)");
 	else snprintf(label, sizeof(label), "%" PRIu64 "(%.3fs)", window, elapsed_ns / 1e9);
 	long double mean = t->pages ? (long double)t->sum / RSWAP_VPN_HEAT_SCALE / t->pages : 0;
-	if (fprintf(distribution, "%-8ld\t%-22s\t%-12.4Lf\t%-12" PRIu64,
-		    (long)pid, label, mean, t->pages) < 0) return -1;
+	snprintf(pid_text, sizeof(pid_text), "%ld", (long)pid);
+	snprintf(mean_text, sizeof(mean_text), "%.4Lf", mean);
+	format_page_count(pages_text, sizeof(pages_text), t->pages);
+	if (fprintf(distribution, REPORT_PREFIX, pid_text, label, mean_text, pages_text) < 0) return -1;
 	for (unsigned int i = 0; i < 5; i++) {
 		char cell[80];
-		snprintf(cell, sizeof(cell), "%" PRIu64 "(%.2Lf%%)", t->bins[i],
-			t->pages ? (long double)t->bins[i] * 100 / t->pages : 0);
-		if (fprintf(distribution, "\t%-18s", cell) < 0) return -1;
+		format_count_cell(cell, sizeof(cell), t->bins[i], t->pages);
+		if (fprintf(distribution, REPORT_BIN, cell) < 0) return -1;
 	}
 	/* Flush distribution first: a newly visible summary row has its matching
 	 * histogram already available to readers following the live files. */
 	if (fputc('\n', distribution) == EOF || fflush(distribution)) return -1;
-	if (fprintf(summary, "%-8ld\t%-22s\t%-12.4Lf\t%-12" PRIu64 "\t",
-		    (long)pid, label, mean, t->pages) < 0) return -1;
-	if (!t->sum) {
-		if (fputs("-/-\n", summary) == EOF) return -1;
-	} else if (fprintf(summary, "%" PRIu64 "(%.2Lf%%)/%" PRIu64 "(%.2Lf%%)\n",
-			   t->hot, (long double)t->hot * 100 / t->pages,
-			   t->cold, (long double)t->cold * 100 / t->pages) < 0) return -1;
+	if (fprintf(summary, REPORT_PREFIX, pid_text, label, mean_text, pages_text) < 0) return -1;
+	char hot_cold[160] = "-/-";
+	if (t->sum) {
+		char hot[64], cold[64];
+		format_count_cell(hot, sizeof(hot), t->hot, t->pages);
+		format_count_cell(cold, sizeof(cold), t->cold, t->pages);
+		snprintf(hot_cold, sizeof(hot_cold), "%s/%s", hot, cold);
+	}
+	if (fprintf(summary, REPORT_CLASS, hot_cold) < 0) return -1;
 	return fflush(summary) ? -1 : 0;
 }
 
@@ -554,10 +588,10 @@ int main(int argc, char **argv)
 	if (mkdir(c.out, 0700)) { perror("create output directory (must be new)"); goto out; }
 	if (snprintf(path, sizeof(path), "%s/summary.tsv", c.out) >= (int)sizeof(path)) { errno = ENAMETOOLONG; goto fail; }
 	summary = fopen(path, "wxe");
-	if (!summary || fputs(summary_header, summary) == EOF || fflush(summary)) goto fail;
+	if (!summary || output_header(summary, false)) goto fail;
 	if (snprintf(path, sizeof(path), "%s/hot_distribute.tsv", c.out) >= (int)sizeof(path)) { errno = ENAMETOOLONG; goto fail; }
 	distribution = fopen(path, "wxe");
-	if (!distribution || fputs(distribution_header, distribution) == EOF || fflush(distribution)) goto fail;
+	if (!distribution || output_header(distribution, true)) goto fail;
 	struct sigaction action = {.sa_handler = on_signal};
 	sigemptyset(&action.sa_mask);
 	sigaction(SIGINT, &action, NULL); sigaction(SIGTERM, &action, NULL); signal(SIGPIPE, SIG_IGN);
